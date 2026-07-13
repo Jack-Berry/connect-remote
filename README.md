@@ -11,6 +11,12 @@ backend/       FastAPI wrapper around Hyundai/Kia/Genesis Connected Services
 glasses-app/   EvenHub G2 web app (Vite + TS + @evenrealities/even_hub_sdk)
 ```
 
+## Privacy
+
+The developer collects nothing: no analytics, no accounts, no developer-run server. Your Connected Services credentials live only in the backend you deploy, and the glasses app talks only to that backend.
+
+Full policy: **https://jack-berry.github.io/connect-remote/privacy/** (source: [PRIVACY.md](PRIVACY.md))
+
 ## Backend
 
 ### Deploy to Render (recommended)

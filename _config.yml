@@ -1,0 +1,19 @@
+# GitHub Pages site — serves the privacy policy at /privacy/.
+# Source: main branch, / (root). Nothing else in the repo is published.
+title: Connect Remote
+description: Remote status + control for Genesis, Kia and Hyundai vehicles on Even Realities G2 glasses
+theme: jekyll-theme-minimal
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+exclude:
+  - backend/
+  - glasses-app/
+  - scripts/
+  - docs-internal/
+  - render.yaml
+  - .claude/
