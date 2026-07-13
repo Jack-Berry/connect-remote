@@ -1,0 +1,25 @@
+[project]
+name = "genesis-g2-backend"
+version = "0.1.0"
+description = "Thin REST backend wrapping Genesis Connected Services for the G2 glasses app and Siri Shortcuts"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    # Genesis EU login fixed in 4.8.1 (Apr 2026) — do not go below this.
+    # 4.23.2 crashes at import on Python 3.13 (bad annotation in ApiImplType1).
+    # Pinned to 4.15.0 as the known-good version; bump deliberately and
+    # re-test the Genesis EU login flow when you do.
+    "hyundai_kia_connect_api==4.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

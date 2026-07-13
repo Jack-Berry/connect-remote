@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no" />
+    <!-- Placeholder: replaced at boot from the build-time brand (src/brand.ts). -->
+    <title>Genesis Remote</title>
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        /* ER brand dark-theme surface (#232323) + Neutral-200 text (#E5E5E5). */
+        background: #232323;
+        color: #E5E5E5;
+        font: 14px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+        /* Kill WebView zoom + iOS auto-sizing + rubber-band scroll. */
+        touch-action: manipulation;
+        -webkit-text-size-adjust: 100%;
+        overscroll-behavior: none;
+      }
+      #app {
+        max-width: 420px;
+        margin: 0 auto;
+        padding: 24px 20px;
+        box-sizing: border-box;
+      }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      p.hint { color: #9a9a9a; margin: 0 0 20px; }
+      label { display: block; margin: 14px 0 4px; color: #bdbdbd; }
+      input[type="url"], input[type="password"], input[type="number"] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 10px;
+        border: 1px solid #444;
+        border-radius: 6px;
+        background: #2e2e2e;
+        color: #E5E5E5;
+        font-size: 16px; /* prevents iOS focus zoom */
+      }
+      select {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 10px;
+        border: 1px solid #444;
+        border-radius: 6px;
+        background: #2e2e2e;
+        color: #E5E5E5;
+        font-size: 16px;
+      }
+      .row { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+      .cols { display: flex; gap: 12px; }
+      .cols > div { flex: 1; }
+      h2 {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #9a9a9a;
+        border-bottom: 1px solid #3a3a3a;
+        padding-bottom: 6px;
+        margin: 28px 0 4px;
+      }
+      button {
+        margin-top: 22px;
+        width: 100%;
+        padding: 12px;
+        border: 0;
+        border-radius: 6px;
+        background: #4d7c4d;
+        color: #fff;
+        font-size: 16px;
+      }
+      button.secondary {
+        margin-top: 16px;
+        background: #3a3a3a;
+        color: #e5e5e5;
+        border: 1px solid #555;
+      }
+      button:disabled { opacity: 0.5; }
+      .status { margin-top: 10px; min-height: 1.4em; color: #8fbc8f; }
+      .status.err { color: #e0a3a3; }
+      details {
+        border: 1px solid #3a3a3a;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin-bottom: 8px;
+        background: #282828;
+      }
+      summary { cursor: pointer; color: #bdbdbd; font-weight: 600; }
+      details ol { padding-left: 20px; margin: 10px 0; }
+      details li { margin: 6px 0; }
+      details p { margin: 10px 0; color: #bdbdbd; }
+      details a { color: #8fbc8f; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <h1><span data-brand="appName">Genesis Remote</span> — settings</h1>
+      <p class="hint">Status and controls are on the glasses. Configure the backend and car preferences here; they are saved to the Even app.</p>
+
+      <details id="setup-guide">
+        <summary>Setup guide</summary>
+        <p>This app needs a small self-hosted backend that talks to <span data-brand="serviceName">Genesis Connected Services</span> — your credentials stay on your server, never in this app.</p>
+        <ol>
+          <li>Open the project's GitHub page (link below) and click <strong>Deploy to Render</strong>.</li>
+          <li>Enter your <span data-brand="name">Genesis</span> username, password and PIN when Render asks.</li>
+          <li>If your <span data-brand="name">Genesis</span> account isn't registered in the EU, set <code>CONNECT_REMOTE_REGION</code> in Render's Environment tab to match its region.</li>
+          <li>After the first deploy, copy the service's HTTPS URL and the generated <code>CONNECT_REMOTE_API_TOKEN</code> from Render's Environment tab.</li>
+          <li>Paste both below, then hit <strong>Test connection</strong>. First contact can take a minute while the free tier wakes.</li>
+        </ol>
+        <p><a href="https://github.com/jack-berry/connect-remote#readme" target="_blank" rel="noopener">Full documentation on GitHub &rarr;</a></p>
+      </details>
+
+      <h2>Backend</h2>
+
+      <label for="backend-url">Backend URL</label>
+      <input id="backend-url" type="url" placeholder="https://your-service.onrender.com" autocapitalize="off" autocorrect="off" />
+
+      <label for="api-token">API token</label>
+      <input id="api-token" type="password" placeholder="bearer token" autocapitalize="off" autocorrect="off" />
+
+      <button id="test-btn" type="button" class="secondary">Test connection</button>
+      <p id="test-status" class="status"></p>
+
+      <h2>Car</h2>
+
+      <label for="climate-temp">Climate target temperature (&deg;C)</label>
+      <input id="climate-temp" type="number" min="14" max="30" step="0.5" />
+
+      <div class="row">
+        <input id="climate-defrost" type="checkbox" />
+        <label for="climate-defrost" style="margin:0">Defrost on with climate</label>
+      </div>
+
+      <div class="row">
+        <input id="climate-heating" type="checkbox" />
+        <label for="climate-heating" style="margin:0">Steering wheel + rear window heat with climate</label>
+      </div>
+
+      <div class="cols" style="margin-top:14px">
+        <div>
+          <label for="charge-limit-ac" style="margin-top:0">AC charge limit</label>
+          <select id="charge-limit-ac"></select>
+        </div>
+        <div>
+          <label for="charge-limit-dc" style="margin-top:0">DC charge limit</label>
+          <select id="charge-limit-dc"></select>
+        </div>
+      </div>
+
+      <button id="limits-btn" type="button" class="secondary">Send limits to car</button>
+      <p id="limits-status" class="status"></p>
+
+      <button id="save-btn" type="button">Save</button>
+      <p id="save-status" class="status"></p>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
