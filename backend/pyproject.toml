@@ -1,7 +1,7 @@
 [project]
-name = "genesis-g2-backend"
+name = "connect-remote-backend"
 version = "0.1.0"
-description = "Thin REST backend wrapping Genesis Connected Services for the G2 glasses app and Siri Shortcuts"
+description = "Thin REST backend wrapping Genesis/Kia/Hyundai Connected Services for the G2 glasses app and Siri Shortcuts"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111",

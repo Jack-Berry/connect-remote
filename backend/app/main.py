@@ -80,7 +80,7 @@ def _warm_up() -> None:
         )
 
 
-app = FastAPI(title="genesis-g2-backend", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="connect-remote-backend", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

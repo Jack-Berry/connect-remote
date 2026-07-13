@@ -7,9 +7,9 @@
 
 services:
   - type: web
-    name: genesis-g2-backend
+    name: connect-remote-backend
     runtime: python
-    region: frankfurt # Genesis Connected Services EU — keep latency low
+    region: frankfurt # matches the default EU account region — keep latency low
     plan: free # free tier sleeps after ~15 min idle; first request then takes ~1 min
     rootDir: backend
     buildCommand: pip install .
