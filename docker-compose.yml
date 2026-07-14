@@ -1,0 +1,35 @@
+# Production stack for car-proxy.berrydev.co.uk — see deploy/README.md.
+#
+# Deploy (on the VPS, from the repo root):
+#   git pull
+#   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account state — must persist across restarts
+      # or Let's Encrypt gets re-asked for certs (and will rate-limit).
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - proxy
+
+  proxy:
+    build:
+      context: ./backend
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    restart: unless-stopped
+    # Deliberately no ports: — the proxy is reachable only from Caddy over
+    # the internal compose network. TLS terminates at Caddy; credentials in
+    # request bodies never traverse the host un-encrypted.
+
+volumes:
+  caddy-data:
+  caddy-config:

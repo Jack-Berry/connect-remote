@@ -1,0 +1,15 @@
+# Caddy v2 config for the hosted proxy.
+#
+# Auto-HTTPS: Caddy obtains and renews the Let's Encrypt certificate for the
+# site address by itself — the only prerequisites are the DNS A record
+# pointing here and ports 80/443 open.
+#
+# Access logs are deliberately NOT enabled (no `log` directive): request logs
+# would record client IPs and request lines for an app whose every request
+# carries car credentials in the body. Caddy 2 only writes per-site access
+# logs when explicitly configured, so leaving `log` out keeps them off.
+
+car-proxy.berrydev.co.uk {
+	# "proxy" is the app service name on the internal compose network.
+	reverse_proxy proxy:8000
+}
