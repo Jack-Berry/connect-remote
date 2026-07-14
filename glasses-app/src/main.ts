@@ -15,7 +15,7 @@ import {
   TimeoutError,
   type VehicleStatus,
 } from "./api";
-import { applyBrand } from "./brand";
+import { BRAND, applyBrand } from "./brand";
 import {
   CONNECTING_TEXT,
   CONNECT_CONTAINER,
@@ -44,6 +44,7 @@ import {
   type AppSettings,
   type Bridge,
   DEFAULT_SETTINGS,
+  REGIONS,
   isConfigured,
   loadSettings,
   saveSettings,
@@ -75,9 +76,20 @@ let backgrounded = false;
 // attempt, or backgrounded mid-flight); a stale attempt must not render.
 let connectGen = 0;
 
+function credentialsFrom(s: AppSettings) {
+  return {
+    username: s.username.trim(),
+    password: s.password,
+    pin: s.pin.trim(),
+    region: s.region,
+    // Brand is build-time (one packed app per brand), not a setting.
+    brand: BRAND.apiBrandCode,
+  };
+}
+
 function rebuildClient() {
   client = isConfigured(settings)
-    ? new BackendClient(settings.backendUrl, settings.token)
+    ? new BackendClient(credentialsFrom(settings))
     : null;
 }
 rebuildClient();
@@ -328,20 +340,20 @@ function showMenu(note = "") {
 
 function describeError(err: unknown): string {
   if (err instanceof ApiError) {
-    if (err.status === 401) return "Auth failed: check token in phone app";
-    if (err.status === 502) return "Genesis unreachable";
-    // Backend reached Genesis but couldn't parse the reply — our bug, not
-    // a connectivity problem, so don't send the user chasing credentials.
+    if (err.status === 401)
+      return "Login rejected: check account in phone app";
+    if (err.status === 502) return `${BRAND.name} unreachable`;
+    if (err.status === 429) return "Rate limited — wait a minute";
+    // Proxy reached the car service but couldn't parse the reply — our bug,
+    // not a connectivity problem, so don't send the user chasing credentials.
     if (err.status === 500) return "Backend parse bug — please report";
     return `Backend error ${err.status}`;
   }
-  if (err instanceof TimeoutError)
-    return "Backend timeout — waking? retry in 1 min";
-  return "Backend unreachable: check URL/network";
+  if (err instanceof TimeoutError) return "Timed out — retry in 1 min";
+  return "Proxy unreachable: check phone internet";
 }
 
-const NOT_CONFIGURED =
-  "Not configured — open app on phone,\nenter backend URL + token";
+const NOT_CONFIGURED = `Not configured — open app on phone,\nenter your ${BRAND.name} account`;
 
 // Re-render the current view from lastStatus. Menu items are rebuilt only
 // when the context-aware set actually changed (rebuild flickers; the info
@@ -417,11 +429,9 @@ async function connectToBackend() {
   await upgradeText(CONNECT_SPIN_CONTAINER, spinnerFrame(0));
   startSpinner();
   try {
-    // Same wake-aware probe as the phone app's Test connection: /healthz
-    // with backoff until the backend answers, and only then /status. A
-    // single launch /status was one dropped request during a Render cold
-    // start away from never waking the backend at all.
-    await client.wake();
+    // One straight /status: the hosted proxy has no cold start (the Render
+    // wake loop is gone), and the generous request timeout already covers a
+    // session-cache-miss login on the proxy side.
     const status = await client.getStatus();
     if (gen !== connectGen) return; // superseded or backgrounded mid-flight
     lastStatus = status;
@@ -640,8 +650,10 @@ function bindPhoneUi() {
   applyBrand();
 
   const guideEl = document.getElementById("setup-guide") as HTMLDetailsElement;
-  const urlEl = document.getElementById("backend-url") as HTMLInputElement;
-  const tokenEl = document.getElementById("api-token") as HTMLInputElement;
+  const usernameEl = document.getElementById("acct-username") as HTMLInputElement;
+  const passwordEl = document.getElementById("acct-password") as HTMLInputElement;
+  const pinEl = document.getElementById("acct-pin") as HTMLInputElement;
+  const regionEl = document.getElementById("acct-region") as HTMLSelectElement;
   const testBtn = document.getElementById("test-btn") as HTMLButtonElement;
   const testStatus = document.getElementById(
     "test-status",
@@ -664,6 +676,9 @@ function bindPhoneUi() {
     "save-status",
   ) as HTMLParagraphElement;
 
+  for (const region of REGIONS) {
+    regionEl.add(new Option(region.label, String(region.code)));
+  }
   for (const el of [acEl, dcEl]) {
     for (let pct = 50; pct <= 100; pct += 10) {
       el.add(new Option(`${pct}%`, String(pct)));
@@ -672,37 +687,48 @@ function bindPhoneUi() {
 
   // First run: walk the user through setup. Once configured, collapse it.
   guideEl.open = !isConfigured(settings);
-  urlEl.value = settings.backendUrl;
-  tokenEl.value = settings.token;
+  usernameEl.value = settings.username;
+  passwordEl.value = settings.password;
+  pinEl.value = settings.pin;
+  regionEl.value = String(settings.region);
   tempEl.value = String(settings.climateTemp);
   defrostEl.checked = settings.climateDefrost;
   heatingEl.checked = settings.climateHeating;
   acEl.value = String(settings.chargeLimitAc);
   dcEl.value = String(settings.chargeLimitDc);
 
-  // Probe with the current field values (not saved state) so users can test
-  // before saving. healthz first isolates reachability from auth problems.
+  // Client built from the current field values (not saved state) so users
+  // can test before saving. Null until username + password are filled in.
+  function formClient(): BackendClient | null {
+    if (!usernameEl.value.trim() || !passwordEl.value) return null;
+    return new BackendClient({
+      username: usernameEl.value.trim(),
+      password: passwordEl.value,
+      pin: pinEl.value.trim(),
+      region: Number(regionEl.value),
+      brand: BRAND.apiBrandCode,
+    });
+  }
+
+  // healthz first isolates "proxy/internet down" from credential problems.
   testBtn.addEventListener("click", async () => {
-    const url = urlEl.value.trim();
-    if (!url) {
-      setStatus(testStatus, "Enter a backend URL first.", true);
+    const probe = formClient();
+    if (!probe) {
+      setStatus(testStatus, "Enter your username and password first.", true);
       return;
     }
-    const probe = new BackendClient(url, tokenEl.value.trim());
     testBtn.disabled = true;
     setStatus(
       testStatus,
-      "Testing… (can take up to a minute if the backend is waking)",
+      "Testing… (the first sign-in can take up to a minute)",
     );
     try {
       try {
-        await probe.healthz();
-      } catch (err) {
+        await probe.healthz(15_000);
+      } catch {
         setStatus(
           testStatus,
-          err instanceof TimeoutError
-            ? "Timed out — a free-tier backend may still be waking. Try again in a minute."
-            : "Backend unreachable — check the URL.",
+          "Proxy unreachable — check your internet connection.",
           true,
         );
         return;
@@ -717,33 +743,35 @@ function bindPhoneUi() {
         if (err instanceof ApiError && err.status === 401) {
           setStatus(
             testStatus,
-            "Backend OK, but the token was rejected — check the API token.",
+            `${BRAND.serviceName} rejected the sign-in — check username, password, PIN and region.`,
             true,
           );
         } else if (err instanceof ApiError && err.status === 502) {
           setStatus(
             testStatus,
-            "Backend OK, but it could not reach Genesis — check the Genesis credentials in its environment.",
+            `Proxy OK, but ${BRAND.serviceName} could not be reached — try again in a minute.`,
             true,
           );
         } else if (err instanceof ApiError && err.status === 500) {
           setStatus(
             testStatus,
-            "Backend OK and Genesis reachable, but the car data could not be parsed — a backend bug, please report it.",
+            "Signed in, but the car data could not be parsed — a backend bug, please report it.",
+            true,
+          );
+        } else if (err instanceof ApiError && err.status === 429) {
+          setStatus(
+            testStatus,
+            "Rate limited — wait a minute and try again.",
             true,
           );
         } else if (err instanceof TimeoutError) {
           setStatus(
             testStatus,
-            "Backend OK, but the car status timed out — try again in a minute.",
+            "The car status timed out — try again in a minute.",
             true,
           );
         } else {
-          setStatus(
-            testStatus,
-            "Backend OK, but the status check failed.",
-            true,
-          );
+          setStatus(testStatus, "The status check failed.", true);
         }
       }
     } finally {
@@ -752,19 +780,15 @@ function bindPhoneUi() {
   });
 
   limitsBtn.addEventListener("click", async () => {
-    const url = urlEl.value.trim();
-    const token = tokenEl.value.trim();
-    if (!url || !token) {
-      setStatus(limitsStatus, "Configure the backend first.", true);
+    const limitsClient = formClient();
+    if (!limitsClient) {
+      setStatus(limitsStatus, "Enter your account details first.", true);
       return;
     }
     limitsBtn.disabled = true;
     setStatus(limitsStatus, "Sending…");
     try {
-      await new BackendClient(url, token).setChargeLimits(
-        Number(acEl.value),
-        Number(dcEl.value),
-      );
+      await limitsClient.setChargeLimits(Number(acEl.value), Number(dcEl.value));
       setStatus(limitsStatus, "Limits sent — the car applies them in 30–90 s.");
     } catch (err) {
       setStatus(limitsStatus, describeError(err), true);
@@ -776,8 +800,10 @@ function bindPhoneUi() {
   saveBtn.addEventListener("click", async () => {
     const temp = parseFloat(tempEl.value);
     settings = {
-      backendUrl: urlEl.value.trim(),
-      token: tokenEl.value.trim(),
+      username: usernameEl.value.trim(),
+      password: passwordEl.value,
+      pin: pinEl.value.trim(),
+      region: Number(regionEl.value),
       climateTemp: isNaN(temp) ? 21 : Math.min(30, Math.max(14, temp)),
       climateDefrost: defrostEl.checked,
       climateHeating: heatingEl.checked,
@@ -788,9 +814,9 @@ function bindPhoneUi() {
     const ok = await enqueue(() => saveSettings(bridge as Bridge, settings));
     setStatus(saveStatus, ok ? "Saved." : "Save failed — try again.", !ok);
     if (ok) guideEl.open = !isConfigured(settings);
-    // Still on the connect page (first run: user just typed the URL/token
-    // the connect attempt was missing) → restart the connect with the new
-    // values; the generation guard supersedes any attempt still in flight.
+    // Still on the connect page (first run: user just typed the account
+    // details the connect attempt was missing) → restart the connect with the
+    // new values; the generation guard supersedes any attempt still in flight.
     // After first connect, a plain re-poll updates the HUD/menu in place.
     if (view === "connect") {
       void connectToBackend();

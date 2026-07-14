@@ -16,6 +16,22 @@ export interface VehicleStatus {
   stale: boolean
 }
 
+/** Sent in every request body. The proxy is stateless: it holds no account
+ * config, so username/password/PIN/region/brand ride along each time. */
+export interface Credentials {
+  username: string
+  password: string
+  pin: string
+  region: number
+  brand: number
+}
+
+// The one and only backend: the hosted proxy, matching the single domain in
+// app.json's network whitelist. VITE_BACKEND_URL is a dev-only override for
+// the simulator + fake backend — never set it when packing a distributable.
+export const PROXY_URL: string =
+  import.meta.env.VITE_BACKEND_URL ?? 'https://car-proxy.berrydev.co.uk'
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -25,20 +41,18 @@ export class ApiError extends Error {
   }
 }
 
-// Long enough to ride out a Render free-tier cold start (up to ~60 s wake
-// before the request is even processed).
+// Generous because a session-cache miss makes the proxy do a full Connected
+// Services login, which retries transient EU-endpoint rejections with up to
+// ~10 s of backoff before answering.
 const TIMEOUT_MS = 65_000
 
 export class TimeoutError extends Error {}
 
 // Force refresh (/refresh) is deliberately absent: it must never be
 // triggerable from the glasses. It remains reachable via the API directly
-// (Siri Shortcuts, curl) per the HUD design rules.
+// per the HUD design rules.
 export class BackendClient {
-  constructor(
-    private baseUrl: string,
-    private token: string,
-  ) {}
+  constructor(private credentials: Credentials) {}
 
   private async request<T>(
     path: string,
@@ -49,12 +63,9 @@ export class BackendClient {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
-      const res = await fetch(this.baseUrl.replace(/\/$/, '') + path, {
+      const res = await fetch(PROXY_URL.replace(/\/$/, '') + path, {
         method,
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-        },
+        headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       })
@@ -72,58 +83,38 @@ export class BackendClient {
     }
   }
 
+  /** Every car endpoint is a POST with the credentials in the body. */
+  private post<T>(path: string, extra: Record<string, unknown> = {}): Promise<T> {
+    return this.request(path, 'POST', { credentials: this.credentials, ...extra })
+  }
+
   getStatus(): Promise<VehicleStatus> {
-    return this.request('/status', 'GET')
+    return this.post('/status')
   }
 
   lock(): Promise<void> {
-    return this.request('/lock', 'POST')
+    return this.post('/lock')
   }
 
   unlock(): Promise<void> {
-    return this.request('/unlock', 'POST')
+    return this.post('/unlock')
   }
 
   climate(on: boolean, temp: number, defrost: boolean, heating: boolean): Promise<void> {
-    return this.request('/climate', 'POST', { on, temp, defrost, heating })
+    return this.post('/climate', { on, temp, defrost, heating })
   }
 
   charge(on: boolean): Promise<void> {
-    return this.request('/charge', 'POST', { on })
+    return this.post('/charge', { on })
   }
 
   setChargeLimits(ac: number, dc: number): Promise<void> {
-    return this.request('/charge-limits', 'POST', { ac, dc })
+    return this.post('/charge-limits', { ac, dc })
   }
 
-  // Unauthenticated liveness probe — distinguishes "backend down/URL wrong"
-  // from "token wrong" in the settings Test connection flow. The wake loop
-  // passes a short timeout so a dropped request during a Render cold start
-  // fails fast and the next probe re-triggers the wake.
+  // Unauthenticated liveness probe — distinguishes "proxy down/no internet"
+  // from "credentials wrong" in the settings Test connection flow.
   healthz(timeoutMs?: number): Promise<void> {
     return this.request('/healthz', 'GET', undefined, timeoutMs)
-  }
-
-  // Render free tier drops/refuses the first request(s) while the instance
-  // boots, so one launch-time /status fetch never reliably wakes it. Probe
-  // /healthz with backoff until it answers — same idea as the phone app's
-  // Test connection — before asking for real data.
-  async wake(): Promise<void> {
-    const delaysMs = [0, 2_000, 4_000, 8_000, 8_000]
-    let lastErr: unknown = new TimeoutError('backend did not wake')
-    for (const delayMs of delaysMs) {
-      if (delayMs) await new Promise(r => setTimeout(r, delayMs))
-      try {
-        await this.healthz(15_000)
-        return
-      } catch (err) {
-        // 5xx during a cold start is Render's edge, not our app — keep
-        // probing. 4xx is a definitive answer (bad URL/no such service)
-        // that more waiting won't fix.
-        if (err instanceof ApiError && err.status < 500) throw err
-        lastErr = err
-      }
-    }
-    throw lastErr
   }
 }

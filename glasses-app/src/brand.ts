@@ -12,10 +12,10 @@
  * from this object at boot (see applyBrand), so adding a new brand-specific
  * string needs no code change here.
  *
- * NOTE: this drives *copy only*. The numeric brand code that the vehicle API
- * needs lives in the backend (`CONNECT_REMOTE_BRAND`) alongside the
- * credentials it authenticates with — deliberately not duplicated here, so the
- * two can't drift.
+ * Besides copy, this carries the numeric brand code the proxy passes to
+ * hyundai_kia_connect_api — the proxy is stateless, so the code must ride
+ * along with the credentials in every request. Verified against lib 4.15.0:
+ * 1=Kia 2=Hyundai 3=Genesis.
  */
 
 export type BrandId = 'genesis' | 'kia' | 'hyundai'
@@ -28,6 +28,8 @@ export interface Brand {
   serviceName: string
   /** App name: phone settings header and document title. */
   appName: string
+  /** hyundai_kia_connect_api brand code, sent with every proxy request. */
+  apiBrandCode: number
 }
 
 const BRANDS: Record<BrandId, Brand> = {
@@ -36,18 +38,21 @@ const BRANDS: Record<BrandId, Brand> = {
     name: 'Genesis',
     serviceName: 'Genesis Connected Services',
     appName: 'Genesis Remote',
+    apiBrandCode: 3,
   },
   kia: {
     id: 'kia',
     name: 'Kia',
     serviceName: 'Kia Connect',
     appName: 'Kia Remote',
+    apiBrandCode: 1,
   },
   hyundai: {
     id: 'hyundai',
     name: 'Hyundai',
     serviceName: 'Bluelink',
     appName: 'Hyundai Remote',
+    apiBrandCode: 2,
   },
 }
 
@@ -68,8 +73,10 @@ export function applyBrand(doc: Document = document): void {
 
   for (const el of doc.querySelectorAll<HTMLElement>('[data-brand]')) {
     const key = el.dataset.brand as keyof Brand | undefined
-    if (key && key in BRAND) {
-      el.textContent = BRAND[key]
+    const value = key && key in BRAND ? BRAND[key] : undefined
+    // Copy keys only — data-brand="apiBrandCode" would be a mistake.
+    if (typeof value === 'string') {
+      el.textContent = value
     } else {
       console.warn(`unknown data-brand key: ${key}`)
     }

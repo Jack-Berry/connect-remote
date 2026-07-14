@@ -109,29 +109,35 @@
   <body>
     <div id="app">
       <h1><span data-brand="appName">Genesis Remote</span> — settings</h1>
-      <p class="hint">Status and controls are on the glasses. Configure the backend and car preferences here; they are saved to the Even app.</p>
+      <p class="hint">Status and controls are on the glasses. Sign in to your car account and set preferences here; they are saved to the Even app on this phone.</p>
 
       <details id="setup-guide">
         <summary>Setup guide</summary>
-        <p>This app needs a small self-hosted backend that talks to <span data-brand="serviceName">Genesis Connected Services</span> — your credentials stay on your server, never in this app.</p>
+        <p>Sign in with the same <span data-brand="serviceName">Genesis Connected Services</span> account you use in the official <span data-brand="name">Genesis</span> app. Your details are stored only on this phone (in the Even app) and sent, encrypted, straight to the app's relay when you use a control — the relay keeps nothing.</p>
         <ol>
-          <li>Open the project's GitHub page (link below) and click <strong>Deploy to Render</strong>.</li>
-          <li>Enter your <span data-brand="name">Genesis</span> username, password and PIN when Render asks.</li>
-          <li>If your <span data-brand="name">Genesis</span> account isn't registered in the EU, set <code>CONNECT_REMOTE_REGION</code> in Render's Environment tab to match its region.</li>
-          <li>After the first deploy, copy the service's HTTPS URL and the generated <code>CONNECT_REMOTE_API_TOKEN</code> from Render's Environment tab.</li>
-          <li>Paste both below, then hit <strong>Test connection</strong>. First contact can take a minute while the free tier wakes.</li>
+          <li>Enter your <span data-brand="serviceName">Genesis Connected Services</span> username and password below.</li>
+          <li>Enter your PIN — the code the official app asks for before lock/unlock. Most accounts have one.</li>
+          <li>Pick the region your account is registered in.</li>
+          <li>Hit <strong>Test connection</strong>. The first sign-in can take up to a minute.</li>
+          <li>Save. Status and controls live on the glasses.</li>
         </ol>
         <p><a href="https://github.com/jack-berry/connect-remote#readme" target="_blank" rel="noopener">Full documentation on GitHub &rarr;</a></p>
         <p><a href="https://jack-berry.github.io/connect-remote/privacy/" target="_blank" rel="noopener">Privacy policy &rarr;</a></p>
       </details>
 
-      <h2>Backend</h2>
+      <h2><span data-brand="serviceName">Genesis Connected Services</span> account</h2>
 
-      <label for="backend-url">Backend URL</label>
-      <input id="backend-url" type="url" placeholder="Paste your Render service URL" autocapitalize="off" autocorrect="off" />
+      <label for="acct-username">Username / email</label>
+      <input id="acct-username" type="text" placeholder="you@example.com" autocapitalize="off" autocorrect="off" autocomplete="username" />
 
-      <label for="api-token">API token</label>
-      <input id="api-token" type="password" placeholder="bearer token" autocapitalize="off" autocorrect="off" />
+      <label for="acct-password">Password</label>
+      <input id="acct-password" type="password" placeholder="password" autocapitalize="off" autocorrect="off" autocomplete="current-password" />
+
+      <label for="acct-pin">PIN</label>
+      <input id="acct-pin" type="password" inputmode="numeric" placeholder="the PIN the official app asks for" autocapitalize="off" autocorrect="off" />
+
+      <label for="acct-region">Account region</label>
+      <select id="acct-region"></select>
 
       <button id="test-btn" type="button" class="secondary">Test connection</button>
       <p id="test-status" class="status"></p>

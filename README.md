@@ -1,114 +1,125 @@
 # Connect Remote — control Genesis, Kia and Hyundai vehicles on Even Realities G2 glasses
 
-Remote status + control for your car on Even Realities G2 glasses and via Siri: state of charge, range, lock state, charging, climate — plus lock/unlock, climate presets and charge limits.
+Remote status + control for your car on Even Realities G2 glasses: state of charge, range, lock state, charging, climate — plus lock/unlock, climate control and charge limits.
 
-Vehicle access goes through [`hyundai_kia_connect_api`](https://github.com/Hyundai-Kia-Connect/hyundai_kia_connect_api), so any car that library supports should work: **Genesis, Kia (Kia Connect) and Hyundai (Bluelink)**, across its supported regions. Development and testing have been done on a **Genesis GV70 Electrified (EU)** — that's the configuration known to work end to end, and it's the default in the deploy blueprint. Other brands and models are expected to work but are unverified; if a field doesn't parse on your car, see [Reporting a problem](#reporting-a-problem) — that's exactly what it's for.
+Vehicle access goes through [`hyundai_kia_connect_api`](https://github.com/Hyundai-Kia-Connect/hyundai_kia_connect_api), so any car that library supports should work: **Genesis, Kia (Kia Connect) and Hyundai (Bluelink)**, in Europe, Canada, the USA and Australia. Development and testing have been done on a **Genesis GV70 Electrified (EU)** — that's the configuration known to work end to end. Other brands and models are expected to work but are unverified; if a field doesn't parse on your car, see [Reporting a problem](#reporting-a-problem).
 
-You bring your own backend: deploy it to Render (or any VPS/Docker host), and it becomes the only thing holding your Connected Services credentials. The glasses app and your Siri Shortcuts talk to it over HTTPS with a bearer token.
+## How it works
 
 ```
-backend/       FastAPI wrapper around Hyundai/Kia/Genesis Connected Services
 glasses-app/   EvenHub G2 web app (Vite + TS + @evenrealities/even_hub_sdk)
+backend/       FastAPI relay proxy, hosted at car-proxy.berrydev.co.uk
+deploy/        VPS deployment: compose stack, Caddyfile, server runbook
 ```
 
-## Privacy
+You sign in with your Connected Services account **in the app's phone
+settings screen**. The credentials are stored only in the Even app on your
+phone and sent, over HTTPS, with each request to a small **stateless relay
+proxy** run by the developer, which forwards them to the manufacturer's
+platform and returns the result. The relay keeps nothing on disk — no
+accounts, no database, no access logs (see [DECISIONS-LOG.md](DECISIONS-LOG.md)
+for why a hosted relay rather than bring-your-own backend: the Even Hub store
+whitelist needs one fixed domain).
 
-The developer collects nothing: no analytics, no accounts, no developer-run server. Your Connected Services credentials live only in the backend you deploy, and the glasses app talks only to that backend.
+Full privacy policy: **https://jack-berry.github.io/connect-remote/privacy/**
+(source: [PRIVACY.md](PRIVACY.md))
 
-Full policy: **https://jack-berry.github.io/connect-remote/privacy/** (source: [PRIVACY.md](PRIVACY.md))
+## Using the app
 
-## Backend
+1. Install the app from the Even Hub store (or sideload — see below).
+2. Open its settings on the phone: enter your Connected Services username,
+   password, PIN (the code the official app asks for before lock/unlock) and
+   account region.
+3. **Test connection**, then **Save**. Status and controls are on the glasses.
 
-### Deploy to Render (recommended)
+- **Glasses display**: a glanceable HUD — brand / lock state / range / SoC across the top, charging or transient notes bottom-centre. Double-tap opens the actions menu (context-aware: lock or unlock, climate on/off, charge start/stop, refresh, quit); a single tap on a menu item sends the command immediately — no confirm step, including unlock. Single tap on the HUD hides/shows the display ("glasses off"); tap on a failed connect screen retries. The system exit dialog opens via the menu's **Quit** item, a double-tap in the menu, or a double-tap on any connect/error screen. Refresh reads the relay's cached status only — force refresh is deliberately not available from the glasses (use the API directly).
+- **Phone screen**: settings — account sign-in, climate target temp, defrost/heat, charge limits. Saved to Even app storage; no credentials in the `.ehpk`.
+- **R1 ring**: gestures arrive through the same events; no code changes needed when it arrives.
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/jack-berry/connect-remote)
+## The relay API
 
-1. Click the button and enter the **username, password and PIN** for your car's Connected Services account — Genesis, Kia Connect or Bluelink, whichever you use (they're stored only in Render, marked `sync: false` in [render.yaml](render.yaml) — never in this repo).
-2. Render **generates the API token** for you. After the first deploy, copy it from the service's **Environment** tab (`CONNECT_REMOTE_API_TOKEN`).
-3. Note the service's HTTPS URL (`https://<your-service>.onrender.com`).
-4. Paste the **URL + token** into the glasses app settings (and your Siri Shortcuts).
+All car endpoints are `POST` with the account credentials in the JSON body —
+the relay holds no account state. `GET /healthz` is an unauthenticated
+liveness probe.
 
-### Choosing your brand and region
+```json
+{ "credentials": { "username": "you@example.com", "password": "…",
+                   "pin": "1234", "region": 1, "brand": 3 } }
+```
 
-The blueprint defaults to **Genesis in Europe** — the verified configuration. Two settings control this, both in Render's **Environment** tab (or your `.env`):
+Region codes: `1` EU, `2` Canada, `3` USA, `5` Australia. Brand codes: `1`
+Kia, `2` Hyundai, `3` Genesis (both straight from `hyundai_kia_connect_api`).
 
-| Variable | Meaning | Default |
+| Endpoint | Extra body fields | Notes |
 |---|---|---|
-| `CONNECT_REMOTE_BRAND` | Brand code — `3` is Genesis. Must match the app build you installed. | `3` |
-| `CONNECT_REMOTE_REGION` | Region code — `1` is Europe. Must match the region your account is registered in. | `1` |
+| `/status` | — | Cached vehicle state. Serves last-known state marked `stale: true` if the upstream service is unreachable. |
+| `/refresh` | — | Wakes the car. Throttled per account (15 min interval, 20/day) → `429` with `Retry-After`. |
+| `/climate` | `"on", "temp" (14–30), "defrost", "heating"` | heating = steering wheel + rear window/mirror heat |
+| `/charge` | `"on": bool` | Start/stop charging. |
+| `/charge-limits` | `"ac": 50–100, "dc": 50–100` | Sets the car's charge targets (percent). |
+| `/lock`, `/unlock` | — | Fire-and-forget — car applies in 30–90 s. |
+| `/debug/fields` | — | Redacted dump of every field your car reports — see below. |
 
-Both are passed straight through to `hyundai_kia_connect_api`; take the values for other brands and regions from that library's `Brand` and `Region` enums, which are the source of truth. Getting either wrong tends to surface as a confusing login failure rather than a clear error, so check them first if authentication won't go through.
+Requests are rate-limited per IP (30/min general; 5/min on `/refresh` and
+`/debug/fields`). Wrong credentials return `401`.
 
-**Region is the one most people need to change** — the same Genesis app build serves EU, US, Canada and Australia owners, and the region has to match the account. Brand you generally leave alone: it pairs with the app build you installed (see [Building for another brand](#building-for-another-brand)).
+### Reporting a problem
 
-The blueprint uses the **free** plan, which sleeps after ~15 min idle — the first request after that takes up to a minute while it wakes. Upgrade the plan if that's annoying.
+If the app shows a **parse error**, or you're running a car other than the
+Genesis GV70 it was developed against — different models report different
+field names, and that's the most likely thing to break — run:
 
-### Local development
+```bash
+curl -s https://car-proxy.berrydev.co.uk/debug/fields \
+  -H 'Content-Type: application/json' \
+  -d '{"credentials":{"username":"you@example.com","password":"…","pin":"1234","region":1,"brand":3}}'
+```
+
+You'll get every field your car reports, pretty-printed, and it works even
+when `/status` fails to parse — that's the point of it. **Copy all of it into
+a GitHub issue.** The VIN, the car's location and other identifying values are
+replaced with `<redacted>` before you see them, so the output is safe to post
+in public. Skim it anyway before you paste — if something identifying got
+through, redact it and please flag it in the issue.
+
+## Siri Shortcuts
+
+Each action is one **"Get Contents of URL"** step: URL from the table above,
+method **POST**, request body **JSON** including the `credentials` object plus
+any extra fields. Note the credentials then live inside the Shortcut — only do
+this on a device you trust, and think twice before giving `/unlock` a voice
+phrase: anyone near your unlocked phone can say it.
+
+## Development
+
+### Backend
 
 ```bash
 cd backend
 python3.13 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-cp .env.example .env         # fill in Connected Services credentials + API token
 .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+.venv/bin/python -m pytest      # tests
 ```
 
-Run tests: `.venv/bin/python -m pytest`
+The vehicle integration lives behind `StatusProvider`/`CommandProvider`
+protocols ([backend/app/providers/base.py](backend/app/providers/base.py)), so
+an official manufacturer API can later replace the status source without
+touching commands. `hyundai_kia_connect_api` is pinned — see the comment in
+[backend/pyproject.toml](backend/pyproject.toml) before bumping it.
 
-### Docker (self-host / VPS)
+### Deployment
+
+The production stack (Caddy + proxy via Docker Compose) and the full VPS
+runbook live in [deploy/README.md](deploy/README.md). Short version, on the
+server:
 
 ```bash
-cd backend
-cp .env.example .env         # fill in Connected Services credentials + API token
-docker build -t connect-remote-backend .
-docker run -d --name connect-remote --restart unless-stopped \
-  --env-file .env -p 127.0.0.1:8000:8000 connect-remote-backend
+git pull
+GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build
 ```
 
-Same app, same pinned `hyundai_kia_connect_api==4.15.0`. Bind to `127.0.0.1` and put HTTPS in front (see [VPS deployment](#vps-deployment)) — never expose port 8000 directly.
-
-Endpoints (all require `Authorization: Bearer <token>`, except `GET /healthz` — an unauthenticated liveness probe for Render/Docker health checks):
-
-| Endpoint | Method | Notes |
-|---|---|---|
-| `/status` | GET | Cached vehicle state. Serves last-known state marked `stale: true` if the upstream service is unreachable. |
-| `/refresh` | POST | Wakes the car. Throttled server-side (default: 15 min interval, 20/day) → `429` with `Retry-After`. |
-| `/climate` | POST | `{"on": bool, "temp": 14–30, "defrost": bool, "heating": bool}` — heating = steering wheel + rear window/mirror heat |
-| `/presets/{cool,warm,defrost}` | POST | No body — fixed climate presets for Siri (17° / 24° / 24°+defrost+heat). Edit `CLIMATE_PRESETS` in [backend/app/main.py](backend/app/main.py) to taste. |
-| `/charge-limits` | POST | `{"ac": 50–100, "dc": 50–100}` — sets the car's charge targets (percent) |
-| `/lock`, `/unlock` | POST | No body. Fire-and-forget — car applies in 30–90 s. |
-| `/debug`, `/debug/fields` | GET | Redacted dump of every field your car reports — see [Reporting a problem](#reporting-a-problem). |
-
-The vehicle integration lives behind `StatusProvider`/`CommandProvider` protocols
-([backend/app/providers/base.py](backend/app/providers/base.py)), so an official
-manufacturer API can later replace the status source without touching commands.
-
-### Reporting a problem
-
-If the app shows a **parse error**, or you're running a **car other than the Genesis GV70 it was developed against** — different brands and models report different field names, and that's the most likely thing to break — open this page in a browser:
-
-```
-https://<your-backend-url>/debug
-```
-
-Paste your API token into the box and press **Show fields**. You'll get every field your car reports, pretty-printed. **Copy all of it into a GitHub issue** — it's what tells us which field names your model uses. (From a terminal, `curl -H "Authorization: Bearer <your-token>" https://<your-backend-url>/debug/fields` gives the same thing.)
-
-This works even when `/status` fails to parse — that's the point of it: it never goes through the model that's failing.
-
-The VIN, the car's location and other identifying values are replaced with `<redacted>` before you see them, so the output is safe to post in public. Skim it anyway before you paste — if something identifying got through, redact it and please flag it in the issue. Your token stays in a request header, so it never lands in the URL, your browser history, or the server's logs.
-
-### VPS deployment
-
-1. Reverse-proxy with HTTPS — bearer token over plain HTTP is car theft waiting to happen. Caddy does it in two lines:
-   ```
-   car.example.com {
-       reverse_proxy 127.0.0.1:8000
-   }
-   ```
-2. Run uvicorn under systemd with `EnvironmentFile=` pointing at the `.env` — restarts never prompt for credentials; upstream tokens refresh automatically before every operation.
-3. Verify your manufacturer's own app (Genesis, Kia Connect or Bluelink) works before blaming the backend — the car needs an active Connected Services subscription.
-
-## Glasses app
+### Glasses app
 
 ```bash
 cd glasses-app
@@ -123,19 +134,25 @@ scan can hang the first time — that's the local-network permission prompt; all
 Even Hub in Settings and rescan. Phone and dev machine must be on the same network, and
 the `--url` must be your machine's LAN IP, not `localhost`.
 
-- **Glasses display**: a glanceable HUD — brand / lock state / range / SoC across the top, charging or transient notes bottom-centre. Double-tap opens the actions menu (context-aware: lock or unlock, climate on/off, charge start/stop, refresh, quit); a single tap on a menu item sends the command immediately — no confirm step, including unlock. Single tap on the HUD hides/shows the display ("glasses off"); tap on a failed connect screen retries. The system exit dialog opens via the menu's **Quit** item, a double-tap in the menu, or a double-tap on any connect/error screen. Refresh reads the backend's cached status only — force refresh is deliberately not available from the glasses (use the API directly, e.g. Siri Shortcuts).
-- **Phone screen**: settings — backend URL, API token, climate target temp, defrost/heat, charge limits. Saved to Even app storage; no credentials in the `.ehpk`.
-- **R1 ring**: gestures arrive through the same events; no code changes needed when it arrives.
+### Simulator testing against a fake car
 
-Before packing a distributable (`npx @evenrealities/evenhub-cli pack`), put your real
-backend hostname in the `network` permission whitelist in
-[glasses-app/app.json](glasses-app/app.json).
+```bash
+# terminal 1 — real proxy, fake vehicle (accepts any credentials)
+backend/.venv/bin/python scripts/fake_backend.py
+# terminal 2 — VITE_BACKEND_URL overrides the fixed proxy URL (dev only!)
+cd glasses-app && VITE_BACKEND_URL=http://127.0.0.1:8787 npx vite
+# terminal 3
+cd glasses-app && node node_modules/@evenrealities/evenhub-simulator/bin/index.js http://localhost:5173 --automation-port 9898
+```
+
+Enter any username/password in the simulator's phone panel — the fake backend
+accepts everything and serves one shared fake car.
 
 ### Building for another brand
 
-The glasses app is packed **one app per brand**. Brand is a build-time value; everything
-the user sees that names a manufacturer — the app name, the setup guide, the service it
-tells you to sign in to — comes from a single config in
+The glasses app is packed **one app per brand**. Brand is a build-time value;
+everything brand-specific — the app name, the setup copy, and the numeric
+brand code sent to the relay — comes from a single config in
 [glasses-app/src/brand.ts](glasses-app/src/brand.ts), keyed off `VITE_BRAND`:
 
 ```bash
@@ -147,44 +164,7 @@ Brand-specific copy in `index.html` is marked `data-brand="<key>"` and filled fr
 config at boot, so a new brand-specific string needs no code change — add the attribute
 and the field. Adding a brand outright means one new entry in `BRANDS`.
 
-Two things to keep in step when you pack a non-Genesis build:
-
-- The backend's `CONNECT_REMOTE_BRAND` must be the matching brand code — the app's build-time
-  brand drives copy only, and deliberately doesn't carry the API's numeric code, so the two
-  can't silently disagree about the credentials the backend logs in with.
-- `package_id` and `name` in [glasses-app/app.json](glasses-app/app.json) are per-app identity
-  and are **not** driven by `VITE_BRAND` — set them per brand before packing.
-
-### Simulator testing against a fake car
-
-```bash
-# terminal 1 — real backend, fake vehicle (no Connected Services account needed)
-backend/.venv/bin/python scripts/fake_backend.py
-# terminal 2
-cd glasses-app && VITE_BACKEND_URL=http://127.0.0.1:8787 VITE_API_TOKEN=test-token npx vite
-# terminal 3
-cd glasses-app && node node_modules/@evenrealities/evenhub-simulator/bin/index.js http://localhost:5173 --automation-port 9898
-```
-
-## Siri Shortcuts
-
-One shortcut per action in the Shortcuts app, each a single **"Get Contents of URL"** step:
-
-1. URL: `https://car.example.com/presets/warm` (or any endpoint below)
-2. Method: **POST**
-3. Headers: `Authorization` → `Bearer <your token>`
-4. Name it with the phrase you'll say: e.g. **"Warm my car"**.
-
-The `/presets/*` routes need no request body, which keeps the Shortcut to a
-single step. Suggested set:
-
-| Phrase | Endpoint | Body |
-|---|---|---|
-| "Warm my car" | `POST /presets/warm` | — (24 °C) |
-| "Cool my car" | `POST /presets/cool` | — (17 °C) |
-| "Defrost my car" | `POST /presets/defrost` | — (24 °C + defrost + rear/steering heat) |
-| "Climate off" | `POST /climate` | `{"on": false}` |
-| "Lock the car" | `POST /lock` | — |
-| "Car status" | `GET /status` | — (add "Show Result" step) |
-
-Think twice before giving `/unlock` a voice phrase — anyone near your unlocked phone can say it.
+`package_id` and `name` in [glasses-app/app.json](glasses-app/app.json) are per-app
+identity and are **not** driven by `VITE_BRAND` — set them per brand before packing
+(`npx @evenrealities/evenhub-cli pack`). Never set `VITE_BACKEND_URL` when packing:
+production builds must talk to the fixed, whitelisted relay only.
