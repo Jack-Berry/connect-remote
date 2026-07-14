@@ -343,17 +343,17 @@ function describeError(err: unknown): string {
     if (err.status === 401)
       return "Login rejected: check account in phone app";
     if (err.status === 502) return `${BRAND.name} unreachable`;
-    if (err.status === 429) return "Rate limited — wait a minute";
+    if (err.status === 429) return "Rate limited, wait a minute";
     // Proxy reached the car service but couldn't parse the reply — our bug,
     // not a connectivity problem, so don't send the user chasing credentials.
-    if (err.status === 500) return "Backend parse bug — please report";
+    if (err.status === 500) return "Backend parse bug, please report";
     return `Backend error ${err.status}`;
   }
-  if (err instanceof TimeoutError) return "Timed out — retry in 1 min";
+  if (err instanceof TimeoutError) return "Timed out, retry in 1 min";
   return "Proxy unreachable: check phone internet";
 }
 
-const NOT_CONFIGURED = `Not configured — open app on phone,\nenter your ${BRAND.name} account`;
+const NOT_CONFIGURED = `Not configured. Open app on phone,\nenter your ${BRAND.name} account`;
 
 // Re-render the current view from lastStatus. Menu items are rebuilt only
 // when the context-aware set actually changed (rebuild flickers; the info
@@ -519,7 +519,7 @@ async function selectMenuItem(index: number) {
     }
     // Fire-and-forget: back to the glanceable HUD with the sent note; the
     // car takes 30–90 s to apply, so re-poll the backend cache later.
-    await showHud(`${note} — car applies in 30-90s`);
+    await showHud(`${note}, car applies in 30-90s`);
     scheduleRepoll(15_000);
   } catch (err) {
     await updateMenuInfo(formatMenuInfo(lastStatus, describeError(err)));
@@ -728,7 +728,7 @@ function bindPhoneUi() {
       } catch {
         setStatus(
           testStatus,
-          "Proxy unreachable — check your internet connection.",
+          "Proxy unreachable. Check your internet connection.",
           true,
         );
         return;
@@ -737,37 +737,37 @@ function bindPhoneUi() {
         const status = await probe.getStatus();
         setStatus(
           testStatus,
-          `Connected — car responded (battery ${status.soc_percent ?? "?"}%).`,
+          `Connected. Car responded (battery ${status.soc_percent ?? "?"}%).`,
         );
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           setStatus(
             testStatus,
-            `${BRAND.serviceName} rejected the sign-in — check username, password, PIN and region.`,
+            `${BRAND.serviceName} rejected the sign-in. Check username, password, PIN and region.`,
             true,
           );
         } else if (err instanceof ApiError && err.status === 502) {
           setStatus(
             testStatus,
-            `Proxy OK, but ${BRAND.serviceName} could not be reached — try again in a minute.`,
+            `Proxy OK, but ${BRAND.serviceName} could not be reached. Try again in a minute.`,
             true,
           );
         } else if (err instanceof ApiError && err.status === 500) {
           setStatus(
             testStatus,
-            "Signed in, but the car data could not be parsed — a backend bug, please report it.",
+            "Signed in, but the car data could not be parsed. This is a backend bug, please report it.",
             true,
           );
         } else if (err instanceof ApiError && err.status === 429) {
           setStatus(
             testStatus,
-            "Rate limited — wait a minute and try again.",
+            "Rate limited. Wait a minute and try again.",
             true,
           );
         } else if (err instanceof TimeoutError) {
           setStatus(
             testStatus,
-            "The car status timed out — try again in a minute.",
+            "The car status timed out. Try again in a minute.",
             true,
           );
         } else {
@@ -789,7 +789,7 @@ function bindPhoneUi() {
     setStatus(limitsStatus, "Sending…");
     try {
       await limitsClient.setChargeLimits(Number(acEl.value), Number(dcEl.value));
-      setStatus(limitsStatus, "Limits sent — the car applies them in 30–90 s.");
+      setStatus(limitsStatus, "Limits sent. The car applies them in 30–90 s.");
     } catch (err) {
       setStatus(limitsStatus, describeError(err), true);
     } finally {
@@ -812,7 +812,7 @@ function bindPhoneUi() {
     };
     rebuildClient();
     const ok = await enqueue(() => saveSettings(bridge as Bridge, settings));
-    setStatus(saveStatus, ok ? "Saved." : "Save failed — try again.", !ok);
+    setStatus(saveStatus, ok ? "Saved." : "Save failed. Try again.", !ok);
     if (ok) guideEl.open = !isConfigured(settings);
     // Still on the connect page (first run: user just typed the account
     // details the connect attempt was missing) → restart the connect with the

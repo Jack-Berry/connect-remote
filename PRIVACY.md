@@ -1,9 +1,9 @@
 ---
-title: Privacy Policy — Connect Remote
+title: Connect Remote Privacy Policy
 permalink: /privacy/
 ---
 
-# Privacy Policy — Connect Remote
+# Connect Remote Privacy Policy
 
 _Last updated: 14 July 2026_
 
@@ -14,7 +14,7 @@ data the app handles, where it goes, and what is (and is not) kept.
 ## The short version
 
 Your vehicle account credentials are stored **only on your phone**. When you
-use the app, they are sent — encrypted with HTTPS — to a small relay server
+use the app, they are sent, encrypted with HTTPS, to a small relay server
 operated by the developer, which uses them to talk to your vehicle
 manufacturer's platform and immediately returns the result. **The relay stores
 nothing**: no database, no accounts, no analytics, no stored logs of request
@@ -23,16 +23,16 @@ and never appear in its logs.
 
 ## How Connect Remote is structured
 
-1. **The glasses app** — a web app that runs inside the Even Realities phone
+1. **The glasses app**: a web app that runs inside the Even Realities phone
    app and displays information on your G2 glasses.
-2. **The relay server** (`car-proxy.berrydev.co.uk`) — a stateless service
+2. **The relay server** (`car-proxy.berrydev.co.uk`): a stateless service
    operated by the developer that forwards your requests to your vehicle
    manufacturer's connected-services platform (Genesis Connected Services,
    Kia Connect, or Hyundai Bluelink). It exists because Even Hub store apps
    must declare a fixed list of network hosts, which rules out user-deployed
    servers.
 
-The relay's source code is in this repository — what it does is auditable.
+The relay's source code is in this repository, so what it does is auditable.
 
 ## What data is involved, and where it lives
 
@@ -43,11 +43,11 @@ The relay's source code is in this repository — what it does is auditable.
   manufacturer's platform on your behalf and does not persist them. To avoid
   a fresh sign-in on every request, the relay keeps a signed-in session in
   memory for up to 10 minutes of inactivity, keyed by a one-way hash of the
-  credentials — the credentials themselves are not retained, and a server
+  credentials. The credentials themselves are not retained, and a server
   restart erases all sessions. To protect your car's battery and your
   manufacturer account's daily command limits, the relay also keeps
   rate-limit timestamps and counters in memory, keyed by the same one-way
-  credential hash, for up to 24 hours of inactivity — timestamps and counts
+  credential hash, for up to 24 hours of inactivity: timestamps and counts
   only, nothing that identifies you or your account.
 
 - **Vehicle data** (state of charge, range, lock status, charging state,
@@ -55,18 +55,18 @@ The relay's source code is in this repository — what it does is auditable.
   beyond the same short-lived in-memory session.
 
 - **Settings** (credentials, climate preferences, charge limits) are stored
-  locally in the Even phone app's storage on your device — nowhere else.
+  locally in the Even phone app's storage on your device, and nowhere else.
 
 - **Relay logs** contain only the request method, path, status code and
-  latency — never request contents, headers, credentials, or vehicle data.
+  latency, never request contents, headers, credentials, or vehicle data.
   The web server in front of the relay has access logging disabled. Client IP
-  addresses are used transiently in memory for rate limiting — including a
-  temporary block of roughly 15 minutes after repeated failed sign-ins — and
+  addresses are used transiently in memory for rate limiting (including a
+  temporary block of roughly 15 minutes after repeated failed sign-ins) and
   are not retained.
 
 ## Network access
 
-The app requests network permission for exactly one host — the relay at
+The app requests network permission for exactly one host: the relay at
 `car-proxy.berrydev.co.uk`. The app contacts no other server and no third
 party.
 

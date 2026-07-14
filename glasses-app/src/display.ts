@@ -253,7 +253,7 @@ export function formatMenuInfo(
     if (status.charging) lines.push(chargingLine(status));
     if (status.climate_on) lines.push("Climate ON");
     lines.push(
-      `Updated ${timeOf(status.last_updated)}${status.stale ? " — STALE" : ""}`,
+      `Updated ${timeOf(status.last_updated)}${status.stale ? " (STALE)" : ""}`,
     );
   } else {
     lines.push("No data yet.");

@@ -41,7 +41,7 @@
       h1 { font-size: 18px; margin: 0 0 4px; }
       p.hint { color: #9a9a9a; margin: 0 0 20px; }
       label { display: block; margin: 14px 0 4px; color: #bdbdbd; }
-      input[type="url"], input[type="password"], input[type="number"] {
+      input[type="text"], input[type="url"], input[type="password"], input[type="number"] {
         width: 100%;
         box-sizing: border-box;
         padding: 10px;
@@ -108,15 +108,15 @@
   </head>
   <body>
     <div id="app">
-      <h1><span data-brand="appName">Genesis Remote</span> — settings</h1>
+      <h1><span data-brand="appName">Genesis Remote</span> settings</h1>
       <p class="hint">Status and controls are on the glasses. Sign in to your car account and set preferences here; they are saved to the Even app on this phone.</p>
 
       <details id="setup-guide">
         <summary>Setup guide</summary>
-        <p>Sign in with the same <span data-brand="serviceName">Genesis Connected Services</span> account you use in the official <span data-brand="name">Genesis</span> app. Your details are stored only on this phone (in the Even app) and sent, encrypted, straight to the app's relay when you use a control — the relay keeps nothing.</p>
+        <p>Sign in with the same <span data-brand="serviceName">Genesis Connected Services</span> account you use in the official <span data-brand="name">Genesis</span> app. Your details are stored only on this phone (in the Even app) and sent, encrypted, straight to the app's relay when you use a control; the relay keeps nothing.</p>
         <ol>
           <li>Enter your <span data-brand="serviceName">Genesis Connected Services</span> username and password below.</li>
-          <li>Enter your PIN — the code the official app asks for before lock/unlock. Most accounts have one.</li>
+          <li>Enter your PIN, the code the official app asks for before lock/unlock. Most accounts have one.</li>
           <li>Pick the region your account is registered in.</li>
           <li>Hit <strong>Test connection</strong>. The first sign-in can take up to a minute.</li>
           <li>Save. Status and controls live on the glasses.</li>
