@@ -17,9 +17,9 @@ Your vehicle account credentials are stored **only on your phone**. When you
 use the app, they are sent — encrypted with HTTPS — to a small relay server
 operated by the developer, which uses them to talk to your vehicle
 manufacturer's platform and immediately returns the result. **The relay stores
-nothing**: no database, no accounts, no analytics, no access logs. Credentials
-and vehicle data are never written to disk on the relay and never appear in
-its logs.
+nothing**: no database, no accounts, no analytics, no stored logs of request
+contents. Credentials and vehicle data are never written to disk on the relay
+and never appear in its logs.
 
 ## How Connect Remote is structured
 
@@ -44,7 +44,11 @@ The relay's source code is in this repository — what it does is auditable.
   a fresh sign-in on every request, the relay keeps a signed-in session in
   memory for up to 10 minutes of inactivity, keyed by a one-way hash of the
   credentials — the credentials themselves are not retained, and a server
-  restart erases all sessions.
+  restart erases all sessions. To protect your car's battery and your
+  manufacturer account's daily command limits, the relay also keeps
+  rate-limit timestamps and counters in memory, keyed by the same one-way
+  credential hash, for up to 24 hours of inactivity — timestamps and counts
+  only, nothing that identifies you or your account.
 
 - **Vehicle data** (state of charge, range, lock status, charging state,
   climate state) passes through the relay to your glasses and is not stored
@@ -56,8 +60,9 @@ The relay's source code is in this repository — what it does is auditable.
 - **Relay logs** contain only the request method, path, status code and
   latency — never request contents, headers, credentials, or vehicle data.
   The web server in front of the relay has access logging disabled. Client IP
-  addresses are used transiently in memory for rate limiting and are not
-  retained.
+  addresses are used transiently in memory for rate limiting — including a
+  temporary block of roughly 15 minutes after repeated failed sign-ins — and
+  are not retained.
 
 ## Network access
 
@@ -86,7 +91,8 @@ delete. To remove your data:
 - Clear the app's settings (or delete the app) on your phone to remove the
   stored credentials.
 - Any in-memory relay session for your account expires by itself within
-  10 minutes.
+  10 minutes; in-memory rate-limit counters (which contain no account data)
+  expire within 24 hours.
 - Change your manufacturer-account password to invalidate anything derived
   from the old credentials.
 

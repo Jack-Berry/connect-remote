@@ -65,13 +65,16 @@ def test_to_status_unparseable_data_raises_provider_data_error():
 # delay — the (0, 3, 7) backoff itself would make the test sleep for real.
 
 
-def make_login_provider(monkeypatch, exc: Exception) -> GenesisProvider:
+def make_login_provider(
+    monkeypatch, exc: Exception, scrub_values: list[str] | None = None
+) -> GenesisProvider:
     import threading
 
     monkeypatch.setattr(GenesisProvider, "RETRY_DELAYS", (0,))
     provider = GenesisProvider.__new__(GenesisProvider)
     provider._lock = threading.Lock()
     provider._vehicle_id = None
+    provider._scrub_values = scrub_values or []
 
     def raise_exc():
         raise exc
@@ -108,3 +111,30 @@ def test_non_auth_login_failure_becomes_upstream_error(monkeypatch):
     provider = make_login_provider(monkeypatch, ConnectionError("ECONNRESET"))
     with pytest.raises(UpstreamError):
         provider._prepare()
+
+
+# The lib embeds raw upstream response bodies in AuthenticationError text
+# (e.g. KiaUvoApiEU puts resp.text[:300] in the message), and the upstream
+# may echo the submitted account back — so anything leaving the provider as
+# exception text must have the credentials scrubbed out, case-insensitively.
+def test_auth_error_text_is_scrubbed_of_credentials(monkeypatch):
+    echoed = AuthenticationError(
+        'Signin failed: HTTP 400 — {"error":"bad password for USER@Example.COM"}'
+    )
+    provider = make_login_provider(
+        monkeypatch, echoed, scrub_values=["user@example.com", "hunter2"]
+    )
+    with pytest.raises(AuthError) as excinfo:
+        provider._prepare()
+    text = str(excinfo.value)
+    assert "user@example.com" not in text.lower()
+    assert "<credential>" in text
+    assert "Signin failed" in text  # diagnostic value survives
+
+
+def test_scrub_replaces_overlapping_credentials_longest_first(monkeypatch):
+    provider = make_login_provider(
+        monkeypatch, Exception("x"), scrub_values=["ab", "abcd"]
+    )
+    provider._scrub_values = sorted(["ab", "abcd"], key=len, reverse=True)
+    assert provider._scrub(Exception("abcd and ab")) == "<credential> and <credential>"

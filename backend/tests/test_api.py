@@ -10,7 +10,7 @@ from app.providers.base import (
     UpstreamError,
     VehicleStatus,
 )
-from app.rate_limit import ThrottleRegistry
+from app.rate_limit import FailedAuthLimiter, ThrottleRegistry
 from app.redact import REDACTED, redact
 from app.session_cache import SessionCache, credentials_key
 
@@ -135,6 +135,7 @@ def client(factory):
     app.state.refresh_throttles = ThrottleRegistry(
         min_interval_seconds=900, daily_cap=20
     )
+    app.state.failed_auth = FailedAuthLimiter()
     # Per-IP limits are covered by their own test; everywhere else they'd
     # trip on the shared in-memory counters as the suite hammers one "IP".
     app.state.limiter.enabled = False
@@ -448,6 +449,76 @@ def test_healthz_needs_no_credentials(client):
     r = client.get("/healthz")
     assert r.status_code == 200
     assert r.json()["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Failed-auth limiter (per IP)
+
+
+def test_five_auth_failures_block_the_ip(client, provider):
+    provider.fail_auth = True
+    for _ in range(5):
+        assert client.post("/status", json=body()).status_code == 401
+    # Even with now-valid credentials, the block answers before upstream.
+    provider.fail_auth = False
+    r = client.post("/status", json=body())
+    assert r.status_code == 429
+    assert "Retry-After" in r.headers
+    assert "try again" in r.json()["detail"]
+    # …and it covers every car endpoint, not just the one that tripped it.
+    assert client.post("/lock", json=body()).status_code == 429
+
+
+def test_auth_success_resets_the_failure_count(client, provider):
+    provider.fail_auth = True
+    for _ in range(4):
+        client.post("/status", json=body())
+    provider.fail_auth = False
+    assert client.post("/status", json=body()).status_code == 200  # resets
+    provider.fail_auth = True
+    for _ in range(4):
+        assert client.post("/status", json=body()).status_code == 401  # not 429
+
+
+def test_failed_auth_block_is_per_ip(client, provider):
+    provider.fail_auth = True
+    for _ in range(5):
+        client.post(
+            "/status", json=body(), headers={"X-Forwarded-For": "203.0.113.9"}
+        )
+    assert (
+        client.post(
+            "/status", json=body(), headers={"X-Forwarded-For": "203.0.113.9"}
+        ).status_code
+        == 429
+    )
+    # A different client IP is unaffected.
+    assert (
+        client.post(
+            "/status", json=body(), headers={"X-Forwarded-For": "198.51.100.7"}
+        ).status_code
+        == 401
+    )
+
+
+def test_failed_auth_block_does_not_extend_and_expires(monkeypatch):
+    # Class-level with a fake clock: rejected checks inside the block must not
+    # push the expiry out, and expiry wipes the failure record.
+    now = [1000.0]
+    monkeypatch.setattr("app.rate_limit.time.monotonic", lambda: now[0])
+    limiter = FailedAuthLimiter(max_failures=5, window_seconds=900, block_seconds=900)
+    for _ in range(5):
+        limiter.record_failure("ip")
+    assert limiter.check("ip") == (True, 901)
+    now[0] += 800
+    for _ in range(50):  # hammering while blocked…
+        blocked, retry_after = limiter.check("ip")
+        assert blocked
+    assert retry_after == 101  # …never extends the block
+    now[0] += 101
+    assert limiter.check("ip") == (False, 0)  # expired
+    limiter.record_failure("ip")  # old failures were wiped with the block:
+    assert limiter.check("ip") == (False, 0)  # one new failure ≠ re-trip
 
 
 # ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ from .providers.base import (
     UpstreamError,
     VehicleStatus,
 )
-from .rate_limit import ThrottleRegistry
+from .rate_limit import FailedAuthLimiter, ThrottleRegistry
 from .redact import redact
 from .session_cache import Session, SessionCache
 
@@ -53,6 +53,12 @@ REFRESH_DAILY_CAP = 20
 # (/refresh wakes the car, /debug/fields dumps everything).
 RATE_GENERAL = "30/minute"
 RATE_EXPENSIVE = "5/minute"
+
+# Failed-auth limiter: 5 upstream auth failures from one IP within 15 min
+# blocks that IP's car endpoints for 15 min (see FailedAuthLimiter).
+AUTH_FAIL_MAX = 5
+AUTH_FAIL_WINDOW_SECONDS = 900.0
+AUTH_FAIL_BLOCK_SECONDS = 900.0
 
 
 def _build_provider(creds: "Credentials"):
@@ -85,6 +91,9 @@ app.state.limiter = limiter
 app.state.cache = SessionCache(factory=_build_provider, ttl_seconds=SESSION_TTL_SECONDS)
 app.state.refresh_throttles = ThrottleRegistry(
     REFRESH_MIN_INTERVAL_SECONDS, REFRESH_DAILY_CAP
+)
+app.state.failed_auth = FailedAuthLimiter(
+    AUTH_FAIL_MAX, AUTH_FAIL_WINDOW_SECONDS, AUTH_FAIL_BLOCK_SECONDS
 )
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -175,17 +184,36 @@ def _now() -> datetime:
 
 
 def _session(request: Request, creds: Credentials) -> Session:
+    """Choke point for every car endpoint (healthz doesn't pass through):
+    an IP inside a failed-auth block is rejected here, before anything can
+    reach the upstream."""
+    blocked, retry_after = request.app.state.failed_auth.check(_client_ip(request))
+    if blocked:
+        raise HTTPException(
+            status_code=429,
+            detail="too many failed sign-ins from this network — "
+            f"wait about {max(1, retry_after // 60)} min and try again",
+            headers={"Retry-After": str(retry_after)},
+        )
     return request.app.state.cache.get_or_create(creds)
 
 
 def _auth_failed(request: Request, session: Session, exc: AuthError) -> HTTPException:
-    """Evict the dead session so the next attempt does a clean login, and
-    tell the client its credentials were rejected."""
+    """Evict the dead session so the next attempt does a clean login, count
+    the failure against the client IP, and tell the client its credentials
+    were rejected."""
     request.app.state.cache.evict(session.key)
+    request.app.state.failed_auth.record_failure(_client_ip(request))
     return HTTPException(
         status_code=401,
         detail=f"Connected Services rejected the credentials: {exc}",
     )
+
+
+def _auth_ok(request: Request) -> None:
+    """An upstream call authenticated fine — forget the IP's failed sign-ins
+    so a user who mistypes, then fixes it, never accumulates toward a block."""
+    request.app.state.failed_auth.record_success(_client_ip(request))
 
 
 def _parse_bug_response(exc: ProviderDataError) -> HTTPException:
@@ -213,6 +241,7 @@ def get_status(body: CredentialedRequest, request: Request) -> VehicleStatus:
     try:
         status = session.provider.get_cached_status()
         session.last_known = status
+        _auth_ok(request)
         return status
     except AuthError as exc:
         raise _auth_failed(request, session, exc)
@@ -244,6 +273,7 @@ def force_refresh(body: CredentialedRequest, request: Request) -> VehicleStatus:
     try:
         status = session.provider.force_refresh()
         session.last_known = status
+        _auth_ok(request)
         return status
     except AuthError as exc:
         raise _auth_failed(request, session, exc)
@@ -267,6 +297,7 @@ def debug_fields(body: CredentialedRequest, request: Request) -> Response:
         raise _auth_failed(request, session, exc)
     except UpstreamError as exc:
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}")
+    _auth_ok(request)
     content = json.dumps(redact(raw), indent=2, sort_keys=True, default=str)
     return Response(content=content, media_type="application/json")
 
@@ -279,6 +310,7 @@ def _send_command(request: Request, creds: Credentials, fn) -> CommandAccepted:
         raise _auth_failed(request, session, exc)
     except UpstreamError as exc:
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}")
+    _auth_ok(request)
     return CommandAccepted(sent_at=_now())
 
 

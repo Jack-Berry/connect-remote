@@ -76,3 +76,69 @@ class ThrottleRegistry:
             )
             self._entries[key] = (throttle, now)
             return throttle
+
+
+class FailedAuthLimiter:
+    """Per-IP upstream-auth-failure limiter.
+
+    After max_failures upstream authentication failures from one IP within
+    window_seconds, that IP's car-endpoint requests are rejected with 429 for
+    block_seconds — protecting users' manufacturer accounts from credential
+    spraying through us, and this proxy's IP reputation with the upstream.
+
+    Lockout is survivable by design: the block is fixed at trip time and
+    rejected requests do NOT extend it (no punishment loop); when it expires
+    the failure record is wiped so stale failures can't re-trip it; and a
+    successful auth clears the IP's record entirely. In-memory only.
+    """
+
+    def __init__(
+        self,
+        max_failures: int = 5,
+        window_seconds: float = 900.0,
+        block_seconds: float = 900.0,
+    ):
+        self._max = max_failures
+        self._window = window_seconds
+        self._block = block_seconds
+        self._lock = threading.Lock()
+        self._failures: dict[str, list[float]] = {}
+        self._blocked_until: dict[str, float] = {}
+
+    def check(self, ip: str) -> tuple[bool, int]:
+        """Returns (blocked, retry_after_seconds)."""
+        now = time.monotonic()
+        with self._lock:
+            until = self._blocked_until.get(ip)
+            if until is not None:
+                if now < until:
+                    return True, int(until - now) + 1
+                del self._blocked_until[ip]
+                self._failures.pop(ip, None)
+            return False, 0
+
+    def record_failure(self, ip: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            fails = [t for t in self._failures.get(ip, ()) if now - t < self._window]
+            fails.append(now)
+            if len(fails) >= self._max:
+                self._blocked_until[ip] = now + self._block
+                self._failures.pop(ip, None)
+            else:
+                self._failures[ip] = fails
+            self._prune(now)
+
+    def record_success(self, ip: str) -> None:
+        with self._lock:
+            self._failures.pop(ip, None)
+
+    def _prune(self, now: float) -> None:
+        # Bound memory: drop failure lists whose newest entry left the window,
+        # and blocks that have expired.
+        for ip in [
+            ip for ip, f in self._failures.items() if now - f[-1] > self._window
+        ]:
+            del self._failures[ip]
+        for ip in [ip for ip, u in self._blocked_until.items() if now >= u]:
+            del self._blocked_until[ip]

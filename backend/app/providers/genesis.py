@@ -10,6 +10,7 @@ first.
 
 import dataclasses
 import logging
+import re
 import threading
 import time
 
@@ -55,6 +56,22 @@ class GenesisProvider:
             pin=pin,
         )
         self._vehicle_id: str | None = None
+        # For _scrub: the lib embeds raw upstream response bodies / redirect
+        # URLs in AuthenticationError messages (e.g. KiaUvoApiEU signin puts
+        # resp.text[:300] in the message), and the upstream may echo the
+        # submitted account back. Longest-first so overlapping values can't
+        # leave fragments behind.
+        self._scrub_values = sorted(
+            (v for v in (username, password, pin) if v), key=len, reverse=True
+        )
+
+    def _scrub(self, exc: Exception) -> str:
+        """Exception text safe for logs and error details: any occurrence of
+        the submitted credentials is replaced, case-insensitively."""
+        text = str(exc)
+        for value in self._scrub_values:
+            text = re.sub(re.escape(value), "<credential>", text, flags=re.IGNORECASE)
+        return text
 
     def _prepare(self) -> str:
         """Refresh auth token (they expire — do this before every operation)
@@ -80,17 +97,14 @@ class GenesisProvider:
             except UpstreamError:
                 raise  # e.g. no vehicles on the account — retrying won't help
             except PINMissingError as exc:
-                raise AuthError(str(exc)) from exc
+                raise AuthError(self._scrub(exc)) from exc
             except Exception as exc:
                 last_exc = exc
-                logger.warning("login/refresh failed, retrying: %s", exc)
+                logger.warning("login/refresh failed, retrying: %s", self._scrub(exc))
+        detail = f"login failed after {len(self.RETRY_DELAYS)} attempts: {self._scrub(last_exc)}"
         if isinstance(last_exc, AuthenticationError):
-            raise AuthError(
-                f"login failed after {len(self.RETRY_DELAYS)} attempts: {last_exc}"
-            ) from last_exc
-        raise UpstreamError(
-            f"login failed after {len(self.RETRY_DELAYS)} attempts: {last_exc}"
-        )
+            raise AuthError(detail) from last_exc
+        raise UpstreamError(detail)
 
     def _prepare_once(self) -> str:
         t0 = time.monotonic()
@@ -161,9 +175,9 @@ class GenesisProvider:
             except (UpstreamError, ProviderDataError, AuthError):
                 raise
             except AuthenticationError as exc:  # token died mid-session
-                raise AuthError(str(exc)) from exc
+                raise AuthError(self._scrub(exc)) from exc
             except Exception as exc:  # lib raises assorted request errors
-                raise UpstreamError(str(exc)) from exc
+                raise UpstreamError(self._scrub(exc)) from exc
 
     def force_refresh(self) -> VehicleStatus:
         t_req = time.monotonic()
@@ -183,9 +197,9 @@ class GenesisProvider:
             except (UpstreamError, ProviderDataError, AuthError):
                 raise
             except AuthenticationError as exc:
-                raise AuthError(str(exc)) from exc
+                raise AuthError(self._scrub(exc)) from exc
             except Exception as exc:
-                raise UpstreamError(str(exc)) from exc
+                raise UpstreamError(self._scrub(exc)) from exc
 
     def get_raw_fields(self) -> dict:
         """Everything the lib knows about the car: dataclass fields, derived
@@ -200,9 +214,9 @@ class GenesisProvider:
             except (UpstreamError, AuthError):
                 raise
             except AuthenticationError as exc:
-                raise AuthError(str(exc)) from exc
+                raise AuthError(self._scrub(exc)) from exc
             except Exception as exc:
-                raise UpstreamError(str(exc)) from exc
+                raise UpstreamError(self._scrub(exc)) from exc
 
         fields = {
             f.name: getattr(v, f.name, None)
@@ -273,6 +287,6 @@ class GenesisProvider:
             except (UpstreamError, AuthError):
                 raise
             except AuthenticationError as exc:
-                raise AuthError(str(exc)) from exc
+                raise AuthError(self._scrub(exc)) from exc
             except Exception as exc:
-                raise UpstreamError(str(exc)) from exc
+                raise UpstreamError(self._scrub(exc)) from exc
