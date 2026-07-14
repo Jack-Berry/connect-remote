@@ -89,6 +89,13 @@ class UpstreamError(Exception):
     """Raised when the vehicle API is unreachable or rejects the request."""
 
 
+class AuthError(Exception):
+    """Raised when the vehicle API rejects the account credentials (bad
+    username/password/PIN, OTP or consent required). Kept separate from
+    UpstreamError so the proxy can evict the cached session and answer 401
+    instead of 502."""
+
+
 class ProviderDataError(Exception):
     """Raised when the vehicle API responded but its data didn't fit our
     model — a backend bug to report, not a connectivity problem. Kept

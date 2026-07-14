@@ -1,8 +1,11 @@
-"""Genesis Connected Services provider via hyundai_kia_connect_api.
+"""Genesis / Kia / Hyundai Connected Services provider via
+hyundai_kia_connect_api.
 
-Genesis EU: region=1 (EU), brand=3 (Genesis). Direct username/password login
+Region/brand codes follow the lib's const module (brand: 1=Kia 2=Hyundai
+3=Genesis; region: 1=EU 2=CA 3=US 5=AU …). Direct username/password login
 works from lib v4.8.1. This is the most fragile part of the stack — if login
-breaks after a lib update, check the repo's Genesis EU issues first.
+breaks after a lib update, check the lib repo's issues for your brand/region
+first.
 """
 
 import dataclasses
@@ -11,14 +14,18 @@ import threading
 import time
 
 from hyundai_kia_connect_api import ClimateRequestOptions, VehicleManager
+from hyundai_kia_connect_api.exceptions import AuthenticationError, PINMissingError
 from pydantic import ValidationError
 
-from .base import ClimateSettings, ProviderDataError, UpstreamError, VehicleStatus
+from .base import (
+    AuthError,
+    ClimateSettings,
+    ProviderDataError,
+    UpstreamError,
+    VehicleStatus,
+)
 
 logger = logging.getLogger(__name__)
-
-REGION_EU = 1
-BRAND_GENESIS = 3
 
 
 class GenesisProvider:
@@ -28,13 +35,16 @@ class GenesisProvider:
     threadpool, so every upstream call holds a lock.
     """
 
+    # Login retry backoff — see _prepare.
+    RETRY_DELAYS = (0, 3, 7)
+
     def __init__(
         self,
         username: str,
         password: str,
         pin: str,
-        region: int = REGION_EU,
-        brand: int = BRAND_GENESIS,
+        region: int,
+        brand: int,
     ):
         self._lock = threading.Lock()
         self._vm = VehicleManager(
@@ -50,22 +60,37 @@ class GenesisProvider:
         """Refresh auth token (they expire — do this before every operation)
         and return the vehicle id.
 
-        Fresh logins from a just-booted host fail transiently (the EU
-        endpoints rate-limit/bot-check new sessions), so retry with backoff
-        before giving up. Total worst case ~10s of sleep — well inside the
-        glasses app's 65s request timeout."""
+        Fresh logins fail transiently on the EU endpoints (they
+        rate-limit/bot-check new sessions — a Hyundai/Kia quirk, independent
+        of where the proxy is hosted), so retry with backoff before giving
+        up. Total worst case ~10s of sleep — well inside the app's request
+        timeout.
+
+        AuthenticationError is retried too: the transient rejections are not
+        reliably distinguishable from a genuinely wrong password. Only when it
+        persists across all attempts do we classify it as AuthError (-> 401 +
+        session eviction upstairs). PINMissingError is config, not transient —
+        no retry."""
         last_exc: Exception | None = None
-        for delay in (0, 3, 7):
+        for delay in self.RETRY_DELAYS:
             if delay:
                 time.sleep(delay)
             try:
                 return self._prepare_once()
             except UpstreamError:
                 raise  # e.g. no vehicles on the account — retrying won't help
+            except PINMissingError as exc:
+                raise AuthError(str(exc)) from exc
             except Exception as exc:
                 last_exc = exc
-                logger.warning("Genesis login/refresh failed, retrying: %s", exc)
-        raise UpstreamError(f"Genesis login failed after 3 attempts: {last_exc}")
+                logger.warning("login/refresh failed, retrying: %s", exc)
+        if isinstance(last_exc, AuthenticationError):
+            raise AuthError(
+                f"login failed after {len(self.RETRY_DELAYS)} attempts: {last_exc}"
+            ) from last_exc
+        raise UpstreamError(
+            f"login failed after {len(self.RETRY_DELAYS)} attempts: {last_exc}"
+        )
 
     def _prepare_once(self) -> str:
         t0 = time.monotonic()
@@ -133,9 +158,11 @@ class GenesisProvider:
                     lock_wait, t1 - t0, time.monotonic() - t1,
                 )
                 return self._to_status()
-            except (UpstreamError, ProviderDataError):
+            except (UpstreamError, ProviderDataError, AuthError):
                 raise
-            except Exception as exc:  # lib raises assorted request/auth errors
+            except AuthenticationError as exc:  # token died mid-session
+                raise AuthError(str(exc)) from exc
+            except Exception as exc:  # lib raises assorted request errors
                 raise UpstreamError(str(exc)) from exc
 
     def force_refresh(self) -> VehicleStatus:
@@ -153,8 +180,10 @@ class GenesisProvider:
                     lock_wait, t1 - t0, time.monotonic() - t1,
                 )
                 return self._to_status()
-            except (UpstreamError, ProviderDataError):
+            except (UpstreamError, ProviderDataError, AuthError):
                 raise
+            except AuthenticationError as exc:
+                raise AuthError(str(exc)) from exc
             except Exception as exc:
                 raise UpstreamError(str(exc)) from exc
 
@@ -168,8 +197,10 @@ class GenesisProvider:
                 vehicle_id = self._prepare()
                 self._vm.update_vehicle_with_cached_state(vehicle_id)
                 v = self._vm.vehicles[vehicle_id]
-            except UpstreamError:
+            except (UpstreamError, AuthError):
                 raise
+            except AuthenticationError as exc:
+                raise AuthError(str(exc)) from exc
             except Exception as exc:
                 raise UpstreamError(str(exc)) from exc
 
@@ -239,7 +270,9 @@ class GenesisProvider:
                     "timing command %s: lock wait %.1fs, login/prepare %.1fs, command call %.1fs",
                     name, lock_wait, t1 - t0, time.monotonic() - t1,
                 )
-            except UpstreamError:
+            except (UpstreamError, AuthError):
                 raise
+            except AuthenticationError as exc:
+                raise AuthError(str(exc)) from exc
             except Exception as exc:
                 raise UpstreamError(str(exc)) from exc

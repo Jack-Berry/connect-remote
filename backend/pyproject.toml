@@ -13,6 +13,8 @@ dependencies = [
     # Pinned to 4.15.0 as the known-good version; bump deliberately and
     # re-test the Genesis EU login flow when you do.
     "hyundai_kia_connect_api==4.15.0",
+    # Per-IP rate limiting
+    "slowapi>=0.1.9",
 ]
 
 [project.optional-dependencies]

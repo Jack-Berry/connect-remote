@@ -1,28 +1,22 @@
-"""Run the real FastAPI backend with a fake vehicle provider.
+"""Run the real FastAPI proxy with a fake vehicle provider.
 
-For simulator/dev testing without a Genesis account. Serves on :8787 with
-token "test-token". Commands mutate the fake car so re-polls show the change.
+For simulator/dev testing without a Connected Services account. Serves on
+:8787 and accepts ANY credentials — every account shares the one fake car.
+Commands mutate the fake car so re-polls show the change.
 """
 
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-
-os.environ.update(
-    CONNECT_REMOTE_USERNAME="fake",
-    CONNECT_REMOTE_PASSWORD="fake",
-    CONNECT_REMOTE_PIN="0000",
-    CONNECT_REMOTE_API_TOKEN="test-token",
-)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 import uvicorn
 
-from app.main import AppState, app
+from app.main import app
 from app.providers.base import ClimateSettings, VehicleStatus
-from app.rate_limit import RefreshThrottle
+from app.rate_limit import ThrottleRegistry
+from app.session_cache import SessionCache
 
 
 class FakeProvider:
@@ -93,10 +87,8 @@ class FakeProvider:
 
 
 provider = FakeProvider()
-app.state.wiring = AppState(
-    status_provider=provider,
-    command_provider=provider,
-    throttle=RefreshThrottle(min_interval_seconds=5, daily_cap=100),
-)
+# One shared fake car no matter what credentials the app sends.
+app.state.cache = SessionCache(factory=lambda creds: provider)
+app.state.refresh_throttles = ThrottleRegistry(min_interval_seconds=5, daily_cap=100)
 
 uvicorn.run(app, host="127.0.0.1", port=8787, log_level="info")
