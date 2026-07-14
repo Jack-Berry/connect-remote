@@ -24,6 +24,12 @@ whitelist needs one fixed domain).
 Full privacy policy: **https://jack-berry.github.io/connect-remote/privacy/**
 (source: [PRIVACY.md](PRIVACY.md))
 
+> **GitHub Pages**: the site (landing page + privacy policy) is published by
+> the legacy branch build from **`main`, root folder** — [index.md](index.md)
+> and [PRIVACY.md](PRIVACY.md) go live automatically on every push to `main`
+> ([_config.yml](_config.yml) controls what's excluded). If the architecture
+> changes, update those two files in the same PR.
+
 ## Using the app
 
 1. Install the app from the Even Hub store (or sideload — see below).

@@ -1,5 +1,8 @@
-# GitHub Pages site — serves the privacy policy at /privacy/.
-# Source: main branch, / (root). Nothing else in the repo is published.
+# GitHub Pages site — serves the landing page (index.md) and the privacy
+# policy at /privacy/ (PRIVACY.md, via its permalink front matter).
+# Deploys via the legacy branch build: main branch, / (root) — every push to
+# main republishes automatically. Keep index.md and PRIVACY.md in step with
+# the architecture; they are user-facing the moment main is pushed.
 title: Connect Remote
 description: Remote status + control for Genesis, Kia and Hyundai vehicles on Even Realities G2 glasses
 theme: jekyll-theme-minimal
@@ -15,5 +18,7 @@ exclude:
   - glasses-app/
   - scripts/
   - docs-internal/
-  - render.yaml
+  - deploy/
+  - store-assets/
+  - docker-compose.yml
   - .claude/
