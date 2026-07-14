@@ -43,6 +43,7 @@ import {
 import {
   type AppSettings,
   type Bridge,
+  DEFAULT_SETTINGS,
   isConfigured,
   loadSettings,
   saveSettings,
@@ -50,7 +51,9 @@ import {
 
 const bridge = await waitForEvenAppBridge();
 
-let settings: AppSettings = await loadSettings(bridge);
+// Real settings load AFTER the first frame is on the glasses (boot section at
+// the bottom) — a slow bridge storage read must never delay the first paint.
+let settings: AppSettings = { ...DEFAULT_SETTINGS };
 let client: BackendClient | null = null;
 let lastStatus: VehicleStatus | null = null;
 // 'connect' until the first successful /status (no HUD of empty values);
@@ -63,9 +66,14 @@ let connectState: "connecting" | "failed" = "connecting";
 let hudHidden = false;
 let menuItems: MenuItem[] = [];
 let repollTimer: ReturnType<typeof setTimeout> | null = null;
-// Guard against rapid repeat double-taps: without it, HUD→menu can
-// immediately chain into menu→close-app.
+// Guard against a rapid repeat double-tap re-firing the exit dialog.
 let lastDoubleClickAt = 0;
+// True between FOREGROUND_EXIT and FOREGROUND_ENTER: timers are paused and
+// nothing may be rendered — the page isn't on the glasses while backgrounded.
+let backgrounded = false;
+// Bumped to invalidate an in-flight connect attempt (superseded by a newer
+// attempt, or backgrounded mid-flight); a stale attempt must not render.
+let connectGen = 0;
 
 function rebuildClient() {
   client = isConfigured(settings)
@@ -247,12 +255,42 @@ async function updateHud(note = "") {
   );
 }
 
-// Single tap on the HUD toggles "glasses off". Unhide paints last-known data
+// Transient HUD note: clears itself back to the regular bottom line (blank
+// while hidden) after `ms`. Used for the hide-recovery hint, so it never
+// masks the charging line for long.
+let noteTimer: ReturnType<typeof setTimeout> | null = null;
+function clearNoteTimer() {
+  if (noteTimer) clearTimeout(noteTimer);
+  noteTimer = null;
+}
+function scheduleNoteClear(ms: number) {
+  clearNoteTimer();
+  noteTimer = setTimeout(() => {
+    noteTimer = null;
+    if (view === "hud" && !backgrounded) void updateHud();
+  }, ms);
+}
+
+const HUD_HIDDEN_HINT = "HUD Hidden: Tap to show";
+
+// Single tap on the HUD toggles "glasses off". Hiding leaves a bottom-centred
+// recovery hint up for 2 s before going fully blank — an instant silent blank
+// reads as a crash to anyone but the owner. Unhide paints last-known data
 // immediately, then refreshes in the background — never a stale-blank wait.
 async function toggleHudHidden() {
   hudHidden = !hudHidden;
-  await updateHud();
-  if (!hudHidden) void pollStatus();
+  clearNoteTimer();
+  if (hudHidden) {
+    await upgradeText(HUD_ROW_CONTAINER, " ");
+    await upgradeText(
+      HUD_NOTE_CONTAINER,
+      formatHudBottom(null, HUD_HIDDEN_HINT),
+    );
+    scheduleNoteClear(2000);
+  } else {
+    await updateHud();
+    void pollStatus();
+  }
 }
 
 function updateMenuInfo(content: string) {
@@ -261,6 +299,9 @@ function updateMenuInfo(content: string) {
 
 function showHud(note = "") {
   view = "hud";
+  // Explicit navigation to the HUD always shows it — landing from the menu
+  // (or a fresh connect) on an invisible page would look broken.
+  hudHidden = false;
   return enqueue(() =>
     bridge.rebuildPageContainer(new RebuildPageContainer(hudPage(note))),
   );
@@ -306,6 +347,8 @@ const NOT_CONFIGURED =
 // when the context-aware set actually changed (rebuild flickers; the info
 // panel upgrade does not).
 async function renderCurrent(note = "") {
+  // Backgrounded: the page isn't on the glasses; FOREGROUND_ENTER re-polls.
+  if (backgrounded) return;
   if (view === "hud") {
     await updateHud(note);
   } else if (sameMenu(buildMenuItems(lastStatus, settings), menuItems)) {
@@ -359,10 +402,14 @@ function startSpinner() {
 }
 
 async function connectToBackend() {
+  const gen = ++connectGen;
   if (!client) {
     connectState = "failed";
     await upgradeText(CONNECT_SPIN_CONTAINER, " ");
-    await upgradeText(CONNECT_CONTAINER, formatConnectFail(NOT_CONFIGURED));
+    await upgradeText(
+      CONNECT_CONTAINER,
+      formatConnectFail(NOT_CONFIGURED, "Double-tap to exit"),
+    );
     return;
   }
   connectState = "connecting";
@@ -375,10 +422,13 @@ async function connectToBackend() {
     // single launch /status was one dropped request during a Render cold
     // start away from never waking the backend at all.
     await client.wake();
-    lastStatus = await client.getStatus();
+    const status = await client.getStatus();
+    if (gen !== connectGen) return; // superseded or backgrounded mid-flight
+    lastStatus = status;
     stopSpinner();
     await showHud();
   } catch (err) {
+    if (gen !== connectGen) return;
     stopSpinner();
     connectState = "failed";
     await upgradeText(CONNECT_SPIN_CONTAINER, " ");
@@ -402,6 +452,12 @@ async function selectMenuItem(index: number) {
 
   if (item.key === "hud") {
     await showHud();
+    return;
+  }
+  if (item.key === "quit") {
+    // Same system Yes/No dialog as double-tap; cleanup stays in the
+    // SYSTEM_EXIT handler so cancelling leaves a live app.
+    void bridge.shutDownPageContainer(1);
     return;
   }
   if (!client) {
@@ -461,87 +517,115 @@ async function selectMenuItem(index: number) {
 }
 
 // ---------------------------------------------------------------------------
-// Startup page + events
+// Events
 
-const createResult = await bridge.createStartUpPageContainer(
-  new CreateStartUpPageContainer(connectPage(CONNECTING_TEXT, spinnerFrame(0))),
-);
-console.log(
-  "Page created:",
-  createResult === 0 ? "success" : `failed (${createResult})`,
-);
+let unsubscribe: () => void = () => {};
 
-const unsubscribe = bridge.onEvenHubEvent((event) => {
-  // Protobuf drops zero-value fields: CLICK_EVENT (0) and item index 0
-  // arrive as undefined, so coalesce with ?? 0 — but only when the
-  // envelope itself is present.
-  const sysType = event.sysEvent ? (event.sysEvent.eventType ?? 0) : null;
-  const textType = event.textEvent ? (event.textEvent.eventType ?? 0) : null;
-  const listIndex = event.listEvent
-    ? (event.listEvent.currentSelectItemIndex ?? 0)
-    : null;
+function subscribeEvents() {
+  unsubscribe = bridge.onEvenHubEvent((event) => {
+    // Protobuf drops zero-value fields: CLICK_EVENT (0) and item index 0
+    // arrive as undefined, so coalesce with ?? 0 — but only when the
+    // envelope itself is present.
+    const sysType = event.sysEvent ? (event.sysEvent.eventType ?? 0) : null;
+    const textType = event.textEvent ? (event.textEvent.eventType ?? 0) : null;
+    const listIndex = event.listEvent
+      ? (event.listEvent.currentSelectItemIndex ?? 0)
+      : null;
 
-  // Double-tap: HUD → open the actions menu; menu → system "close app?"
-  // Yes/No dialog. Cleanup happens on SYSTEM_EXIT/ABNORMAL_EXIT, not here —
-  // the user can still cancel the dialog. (The simulator does not render the
-  // dialog and just blanks the panel; hardware shows Yes/No.)
-  if (
-    sysType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
-    textType === OsEventTypeList.DOUBLE_CLICK_EVENT
-  ) {
-    const now = Date.now();
-    if (now - lastDoubleClickAt < 800) return;
-    lastDoubleClickAt = now;
-    if (view === "connect") {
-      // Mid-connect taps are ignored; after a failure, double-tap retries.
-      if (connectState === "failed") void connectToBackend();
-    } else if (view === "hud") {
-      void openMenu();
-    } else {
-      void bridge.shutDownPageContainer(1);
+    // Double-tap: HUD (hidden or not) → open the actions menu (the standard
+    // gesture across Even Hub apps; the menu's Quit item and its double-tap
+    // both reach the system exit dialog). Everywhere else — unconfigured,
+    // connecting, failed, menu — the system "close app?" Yes/No dialog.
+    // Cleanup happens on SYSTEM_EXIT/ABNORMAL_EXIT, not here — the user can
+    // still cancel the dialog. (The simulator does not render the dialog and
+    // just blanks the panel; hardware shows Yes/No.)
+    if (
+      sysType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
+      textType === OsEventTypeList.DOUBLE_CLICK_EVENT
+    ) {
+      // Debounce: without it, HUD→menu can immediately chain into
+      // menu→close-app.
+      const now = Date.now();
+      if (now - lastDoubleClickAt < 800) return;
+      lastDoubleClickAt = now;
+      if (view === "hud") {
+        void openMenu();
+      } else {
+        void bridge.shutDownPageContainer(1);
+      }
+      return;
     }
-    return;
-  }
 
-  if (
-    sysType === OsEventTypeList.SYSTEM_EXIT_EVENT ||
-    sysType === OsEventTypeList.ABNORMAL_EXIT_EVENT
-  ) {
-    if (repollTimer) clearTimeout(repollTimer);
-    stopSpinner();
-    unsubscribe();
-    return;
-  }
-
-  if (sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
-    if (view === "connect") {
-      if (connectState === "failed") void connectToBackend();
-    } else {
-      void pollStatus();
+    if (
+      sysType === OsEventTypeList.SYSTEM_EXIT_EVENT ||
+      sysType === OsEventTypeList.ABNORMAL_EXIT_EVENT
+    ) {
+      if (repollTimer) clearTimeout(repollTimer);
+      stopSpinner();
+      clearNoteTimer();
+      unsubscribe();
+      return;
     }
-    return;
-  }
 
-  // Menu: the firmware scrolls the list natively; a single tap reports the
-  // selected item. R1 ring gestures arrive through the same events.
-  if (listIndex !== null && view === "menu") {
-    void selectMenuItem(listIndex);
-    return;
-  }
+    if (sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
+      backgrounded = false;
+      if (view === "connect") {
+        // Restart the attempt outright: a fetch suspended mid-flight may never
+        // settle, and the old attempt was invalidated on FOREGROUND_EXIT — a
+        // resume must never leave an indefinite spinner. (Unconfigured just
+        // re-renders the not-configured message.)
+        void connectToBackend();
+      } else {
+        void pollStatus();
+      }
+      return;
+    }
 
-  // HUD: single tap toggles "glasses off" (hide/show everything). Double-tap
-  // still opens the menu from either state, handled above. Swipes do nothing.
-  if (
-    view === "hud" &&
-    (sysType === OsEventTypeList.CLICK_EVENT ||
-      textType === OsEventTypeList.CLICK_EVENT)
-  ) {
-    void toggleHudHidden();
-    return;
-  }
-});
+    if (sysType === OsEventTypeList.FOREGROUND_EXIT_EVENT) {
+      // Backgrounded: stop driving the display and the network — no container
+      // upgrades, no polls. Everything resumes via FOREGROUND_ENTER (immediate
+      // re-poll / connect restart). Settings are written on Save and are
+      // already durable, so there is nothing else to flush.
+      backgrounded = true;
+      connectGen++;
+      stopSpinner();
+      if (repollTimer) clearTimeout(repollTimer);
+      repollTimer = null;
+      clearNoteTimer();
+      return;
+    }
 
-void connectToBackend();
+    // Menu: the firmware scrolls the list natively; a single tap reports the
+    // selected item. R1 ring gestures arrive through the same events.
+    if (listIndex !== null && view === "menu") {
+      void selectMenuItem(listIndex);
+      return;
+    }
+
+    // Connect page: single tap retries after a failure (double-tap is exit).
+    // Mid-connect and unconfigured taps do nothing — there's nothing to retry.
+    if (
+      view === "connect" &&
+      (sysType === OsEventTypeList.CLICK_EVENT ||
+        textType === OsEventTypeList.CLICK_EVENT)
+    ) {
+      if (client && connectState === "failed") void connectToBackend();
+      return;
+    }
+
+    // HUD: single tap toggles "glasses off" (hide/show everything).
+    // Double-tap opens the menu from either state, handled above. Swipes
+    // do nothing.
+    if (
+      view === "hud" &&
+      (sysType === OsEventTypeList.CLICK_EVENT ||
+        textType === OsEventTypeList.CLICK_EVENT)
+    ) {
+      void toggleHudHidden();
+      return;
+    }
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Phone-side settings screen
@@ -705,14 +789,34 @@ function bindPhoneUi() {
     setStatus(saveStatus, ok ? "Saved." : "Save failed — try again.", !ok);
     if (ok) guideEl.open = !isConfigured(settings);
     // Still on the connect page (first run: user just typed the URL/token
-    // the connect attempt was missing) → kick off a fresh connect; after
-    // that, a plain re-poll updates the HUD/menu in place.
+    // the connect attempt was missing) → restart the connect with the new
+    // values; the generation guard supersedes any attempt still in flight.
+    // After first connect, a plain re-poll updates the HUD/menu in place.
     if (view === "connect") {
-      if (connectState === "failed") void connectToBackend();
+      void connectToBackend();
     } else {
       void pollStatus();
     }
   });
 }
 
-bindPhoneUi();
+// ---------------------------------------------------------------------------
+// Boot. Order matters: the first frame goes to the glasses before anything
+// else — in particular before the settings read, which must never sit
+// between launch and first paint (black-frame risk on a slow storage read).
+
+const createResult = await bridge.createStartUpPageContainer(
+  new CreateStartUpPageContainer(connectPage(CONNECTING_TEXT, spinnerFrame(0))),
+);
+if (createResult !== 0) {
+  // No startup page means nothing can ever render — every later call would
+  // drive containers that don't exist. Exit cleanly instead of continuing.
+  console.error(`Startup page creation failed (${createResult}) — exiting`);
+  void bridge.shutDownPageContainer(0);
+} else {
+  settings = await loadSettings(bridge);
+  rebuildClient();
+  subscribeEvents();
+  void connectToBackend();
+  bindPhoneUi();
+}

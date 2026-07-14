@@ -21,9 +21,23 @@
       #app {
         max-width: 420px;
         margin: 0 auto;
-        padding: 24px 20px;
+        /* Bottom padding keeps the last form fields clear of the fixed
+           Save footer. */
+        padding: 24px 20px 110px;
         box-sizing: border-box;
       }
+      .footer {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: #232323;
+        border-top: 1px solid #3a3a3a;
+        padding: 10px 20px calc(10px + env(safe-area-inset-bottom));
+      }
+      .footer .inner { max-width: 420px; margin: 0 auto; }
+      .footer button { margin-top: 0; }
+      .footer .status { margin: 6px 0 0; min-height: 1.2em; }
       h1 { font-size: 18px; margin: 0 0 4px; }
       p.hint { color: #9a9a9a; margin: 0 0 20px; }
       label { display: block; margin: 14px 0 4px; color: #bdbdbd; }
@@ -114,7 +128,7 @@
       <h2>Backend</h2>
 
       <label for="backend-url">Backend URL</label>
-      <input id="backend-url" type="url" placeholder="https://your-service.onrender.com" autocapitalize="off" autocorrect="off" />
+      <input id="backend-url" type="url" placeholder="Paste your Render service URL" autocapitalize="off" autocorrect="off" />
 
       <label for="api-token">API token</label>
       <input id="api-token" type="password" placeholder="bearer token" autocapitalize="off" autocorrect="off" />
@@ -150,9 +164,14 @@
 
       <button id="limits-btn" type="button" class="secondary">Send limits to car</button>
       <p id="limits-status" class="status"></p>
-
-      <button id="save-btn" type="button">Save</button>
-      <p id="save-status" class="status"></p>
+    </div>
+    <!-- Save stays visible regardless of scroll position — on a long form a
+         bottom-of-form Save ends up off-screen. -->
+    <div class="footer">
+      <div class="inner">
+        <button id="save-btn" type="button">Save</button>
+        <p id="save-status" class="status"></p>
+      </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

@@ -123,8 +123,8 @@ scan can hang the first time — that's the local-network permission prompt; all
 Even Hub in Settings and rescan. Phone and dev machine must be on the same network, and
 the `--url` must be your machine's LAN IP, not `localhost`.
 
-- **Glasses display**: status (SoC / range / lock / charging / climate) on top, action bar below. Swipe cycles actions (refresh, force refresh, climate on/off, lock, unlock), single tap sends, double tap exits. Unlock takes two taps (arm + confirm).
-- **Phone screen**: settings — backend URL, API token, climate target temp, defrost. Saved to Even app storage; no credentials in the `.ehpk`.
+- **Glasses display**: a glanceable HUD — brand / lock state / range / SoC across the top, charging or transient notes bottom-centre. Double-tap opens the actions menu (context-aware: lock or unlock, climate on/off, charge start/stop, refresh, quit); a single tap on a menu item sends the command immediately — no confirm step, including unlock. Single tap on the HUD hides/shows the display ("glasses off"); tap on a failed connect screen retries. The system exit dialog opens via the menu's **Quit** item, a double-tap in the menu, or a double-tap on any connect/error screen. Refresh reads the backend's cached status only — force refresh is deliberately not available from the glasses (use the API directly, e.g. Siri Shortcuts).
+- **Phone screen**: settings — backend URL, API token, climate target temp, defrost/heat, charge limits. Saved to Even app storage; no credentials in the `.ehpk`.
 - **R1 ring**: gestures arrive through the same events; no code changes needed when it arrives.
 
 Before packing a distributable (`npx @evenrealities/evenhub-cli pack`), put your real

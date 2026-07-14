@@ -92,7 +92,8 @@ export type MenuKey =
   | "climateOn"
   | "climateOff"
   | "chargeStart"
-  | "chargeStop";
+  | "chargeStop"
+  | "quit";
 
 export interface MenuItem {
   key: MenuKey;
@@ -140,6 +141,10 @@ export function buildMenuItems(
     key: "refresh",
     label: updated === "?" ? "Refresh" : `Refresh · updated ${updated}`,
   });
+
+  // Explicit exit path in the list, alongside double-tap: both open the
+  // system close dialog.
+  items.push({ key: "quit", label: "Quit" });
 
   return items.map((i) => ({
     ...i,
@@ -218,8 +223,11 @@ export function spinnerFrame(i: number): string {
   );
 }
 
-export function formatConnectFail(message: string): string {
-  return centerBlock(`${message}\nDouble-tap to retry`, HUD_INNER_W);
+export function formatConnectFail(
+  message: string,
+  hint = "Tap to retry · double-tap to exit",
+): string {
+  return centerBlock(`${message}\n${hint}`, HUD_INNER_W);
 }
 
 // Right-hand info panel of the menu: compact status + feedback line.

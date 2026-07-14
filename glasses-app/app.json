@@ -1,16 +1,16 @@
 {
-  "package_id": "com.jackberry.gv70remote",
+  "package_id": "com.jackberry.genesisremote",
   "edition": "202601",
   "name": "Genesis Remote",
-  "version": "0.1.5",
+  "version": "1.0.1",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",
   "permissions": [
     {
       "name": "network",
-      "desc": "Talks to your self-hosted Genesis backend for vehicle status and remote commands.",
-      "whitelist": ["*.onrender.com"]
+      "desc": "Talks to your self-hosted Genesis backend for vehicle status and remote commands. GitHub hosts the setup documentation and privacy policy linked from the settings screen.",
+      "whitelist": ["*.onrender.com", "jack-berry.github.io", "github.com"]
     }
   ],
   "supported_languages": ["en"]
