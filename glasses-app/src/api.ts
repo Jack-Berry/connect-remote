@@ -1,19 +1,37 @@
+/** Backend powertrain classification. UNKNOWN = conflicting or insufficient
+ *  signals; the UI must render only what is genuinely present. Typed as
+ *  string because the value is server-driven — an unrecognized label must
+ *  degrade like UNKNOWN, never crash. */
+export type Powertrain = "EV" | "PHEV" | "HEV" | "ICE" | "UNKNOWN";
+
+/** Every field is optional AND nullable: no powertrain populates all of
+ *  them, and an older proxy omits the newer ones entirely. Render paths must
+ *  null-guard every access — an absent field draws nothing, never "0%",
+ *  "undefined" or a crash. */
 export interface VehicleStatus {
-  soc_percent: number | null
-  range_value: number | null
-  range_unit: string
-  locked: boolean | null
-  charging: boolean | null
-  charge_eta_minutes: number | null
-  climate_on: boolean | null
-  doors_open: string[]
+  powertrain?: Powertrain | string | null
+  // EV side — absent on HEV/ICE.
+  soc_percent?: number | null
+  range_value?: number | null
+  // Covers all ranges in the response (range_value, fuel_range, total_range).
+  range_unit?: string | null
+  locked?: boolean | null
+  charging?: boolean | null
+  charge_eta_minutes?: number | null
+  climate_on?: boolean | null
+  doors_open?: string[] | null
   // Car position — returned by the backend; no glasses UI consumes it yet.
-  latitude: number | null
-  longitude: number | null
-  last_updated: string | null
-  charge_limit_ac: number | null
-  charge_limit_dc: number | null
-  stale: boolean
+  latitude?: number | null
+  longitude?: number | null
+  last_updated?: string | null
+  charge_limit_ac?: number | null
+  charge_limit_dc?: number | null
+  // Fuel side — only sent for fuel-bearing powertrains (PHEV/HEV/ICE, or
+  // UNKNOWN with real fuel evidence). Never sent for an EV.
+  fuel_level_percent?: number | null
+  fuel_range?: number | null
+  total_range?: number | null
+  stale?: boolean | null
 }
 
 /** Sent in every request body. The proxy is stateless: it holds no account

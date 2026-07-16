@@ -15,7 +15,7 @@ import threading
 import time
 
 from hyundai_kia_connect_api import ClimateRequestOptions, VehicleManager
-from hyundai_kia_connect_api.const import OTP_NOTIFY_TYPE
+from hyundai_kia_connect_api.const import BRANDS, OTP_NOTIFY_TYPE, REGIONS
 from hyundai_kia_connect_api.exceptions import (
     AuthenticationError,
     AuthenticationOTPRequired,
@@ -24,6 +24,7 @@ from hyundai_kia_connect_api.exceptions import (
 from hyundai_kia_connect_api.Token import Token
 from pydantic import ValidationError
 
+from .. import shape_capture
 from .base import (
     AuthError,
     ClimateSettings,
@@ -34,6 +35,59 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _has_genuine_fuel(v) -> bool:
+    """True only on real fuel evidence. Every pure-EV payload in every region
+    carries a vestigial ``fuelLevel: 0`` (present, not absent — see
+    docs-internal/POWERTRAIN-FIELDS.md), so only a non-zero level or the
+    low-fuel light counts. Cost: a fuel car on a truly empty tank shows no
+    fuel evidence — detection therefore leads with engine_type, and this is
+    only the cross-check / last resort."""
+    fuel_level = getattr(v, "fuel_level", None)
+    if isinstance(fuel_level, (int, float)) and fuel_level > 0:
+        return True
+    return getattr(v, "fuel_level_is_low", None) is True
+
+
+def _detect_powertrain(v) -> str:
+    """Classify a lib Vehicle as EV / PHEV / HEV / ICE / UNKNOWN.
+
+    Rules derived from the lib's own fixtures and parser source (evidence in
+    docs-internal/POWERTRAIN-FIELDS.md): lead with the lib's engine_type
+    (authoritative from the EU vehicle list; inferred from evStatus presence
+    on Kia-US), cross-check it against field evidence, and return UNKNOWN on
+    conflict — never guess. Absent, null and zero-valued fields are three
+    different things here: ev_battery_percentage None means "no EV battery
+    reported", while fuel_level 0 means nothing at all (EVs report it too).
+
+    Known limitation: a Kia-US HEV arrives from the lib classified as ICE
+    (no evStatus block -> ICE in the lib's inference). The app degrades
+    HEV and ICE identically, so the mislabel is cosmetic until a real
+    tester's /debug/fields dump settles what Kia-US HEVs actually report.
+    """
+    raw = getattr(v, "engine_type", None)
+    # ENGINE_TYPES enum, plain string, or None depending on region/lib path.
+    lib_type = getattr(raw, "value", raw)
+    has_ev_battery = getattr(v, "ev_battery_percentage", None) is not None
+    has_fuel = _has_genuine_fuel(v)
+
+    if lib_type == "EV":
+        return "EV" if has_ev_battery and not has_fuel else "UNKNOWN"
+    if lib_type == "PHEV":
+        return "PHEV" if has_ev_battery else "UNKNOWN"
+    if lib_type == "HEV":
+        # Only ever set from an authoritative vehicle-list type ('HV'), and
+        # no HEV fixture exists to cross-check against — trust it.
+        return "HEV"
+    if lib_type == "ICE":
+        return "ICE" if not has_ev_battery else "UNKNOWN"
+    # engine_type missing entirely (AU/CN never set it): infer only the one
+    # unambiguous case. Fuel-only evidence can't separate HEV from ICE, and
+    # ev-battery + fuel can't be confirmed as PHEV — both stay UNKNOWN.
+    if has_ev_battery and not has_fuel:
+        return "EV"
+    return "UNKNOWN"
 
 
 class GenesisProvider:
@@ -76,6 +130,14 @@ class GenesisProvider:
             token=stored_token,
         )
         self._vehicle_id: str | None = None
+        # Classified on the first status fetch of this provider's life (== one
+        # proxy session — the session cache owns provider lifetime), then
+        # reused: a mid-session data blip must not flip the classification.
+        self._powertrain: str | None = None
+        # For shape capture keys — names, since ints would rot if the lib
+        # renumbered.
+        self._brand_name = BRANDS.get(brand, str(brand))
+        self._region_name = REGIONS.get(region, str(region))
         # For _scrub: the lib embeds raw upstream response bodies / redirect
         # URLs in AuthenticationError messages (e.g. KiaUvoApiEU signin puts
         # resp.text[:300] in the message), and the upstream may echo the
@@ -238,6 +300,26 @@ class GenesisProvider:
 
     def _to_status(self) -> VehicleStatus:
         v = self._vm.vehicles[self._vehicle_id]
+        if self._powertrain is None:
+            self._powertrain = _detect_powertrain(v)
+            logger.info(
+                "powertrain classified: %s (%s/%s)",
+                self._powertrain,
+                self._brand_name,
+                self._region_name,
+            )
+        # Names + types only, never values; never raises (see shape_capture).
+        shape_capture.store.record(
+            self._brand_name, self._region_name, self._powertrain, v
+        )
+        # Fuel fields are gated on the classification, not on field presence:
+        # every EV reports fuelLevel 0, and Kia-US EVs get fuel_driving_range
+        # populated with their EV range via a distanceToEmpty fallback. For
+        # UNKNOWN, genuine fuel evidence (non-zero level / low-fuel light) is
+        # required — better a missing fuel line than a bogus one.
+        fuel_bearing = self._powertrain in ("PHEV", "HEV", "ICE") or (
+            self._powertrain == "UNKNOWN" and _has_genuine_fuel(v)
+        )
         doors = [
             name
             for name, attr in (
@@ -251,11 +333,29 @@ class GenesisProvider:
             if getattr(v, attr, None)
         ]
         eta = getattr(v, "ev_estimated_current_charge_duration", None)
+        # One unit covers all ranges (the account reports a single unit); for
+        # fuel-only cars the EV unit is None and the fuel/total units are the
+        # only ones set. _fuel_driving_range_unit is private in lib 4.15.0 —
+        # there is no public property for it.
+        range_unit = (
+            getattr(v, "ev_driving_range_unit", None)
+            or getattr(v, "_fuel_driving_range_unit", None)
+            or getattr(v, "total_driving_range_unit", None)
+            or "km"
+        )
         try:
             return VehicleStatus(
+                powertrain=self._powertrain,
                 soc_percent=getattr(v, "ev_battery_percentage", None),
                 range_value=getattr(v, "ev_driving_range", None),
-                range_unit=getattr(v, "ev_driving_range_unit", None) or "km",
+                range_unit=range_unit,
+                fuel_level_percent=(
+                    getattr(v, "fuel_level", None) if fuel_bearing else None
+                ),
+                fuel_range=(
+                    getattr(v, "fuel_driving_range", None) if fuel_bearing else None
+                ),
+                total_range=getattr(v, "total_driving_range", None),
                 locked=getattr(v, "is_locked", None),
                 charging=getattr(v, "ev_battery_is_charging", None),
                 charge_eta_minutes=eta if eta else None,

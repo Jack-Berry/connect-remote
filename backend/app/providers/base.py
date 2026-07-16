@@ -24,10 +24,27 @@ LaxInt = Annotated[int, BeforeValidator(_round_float)]
 
 
 class VehicleStatus(BaseModel):
+    # Powertrain classification: EV / PHEV / HEV / ICE / UNKNOWN. UNKNOWN
+    # means conflicting or insufficient signals (see genesis._detect_powertrain)
+    # — the app must render only the fields that are actually present. Every
+    # field below is nullable: no powertrain populates all of them.
+    powertrain: str = "UNKNOWN"
+    # EV-side fields — absent (None) on HEV/ICE.
     soc_percent: LaxInt | None = None
-    # UK/EU accounts report range in the account's unit ('mi' for UK)
+    # UK/EU accounts report range in the account's unit ('mi' for UK).
+    # range_unit covers ALL ranges in this response (range_value, fuel_range,
+    # total_range) — the upstream reports one unit per account.
     range_value: LaxInt | None = None
     range_unit: str = "km"
+    # Fuel-side fields — populated only for fuel-bearing powertrains
+    # (PHEV/HEV/ICE, or UNKNOWN with genuine fuel evidence). Never populated
+    # for a classified EV: every EV payload carries a vestigial fuelLevel: 0
+    # and Kia-US EVs get a bogus fuel range via a distanceToEmpty fallback
+    # (see docs-internal/POWERTRAIN-FIELDS.md).
+    fuel_level_percent: LaxInt | None = None
+    fuel_range: LaxInt | None = None
+    # Combined range where the API provides one (PHEV: EV + fuel).
+    total_range: LaxInt | None = None
     locked: bool | None = None
     charging: bool | None = None
     charge_eta_minutes: LaxInt | None = None

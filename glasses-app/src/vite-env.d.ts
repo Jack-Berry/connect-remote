@@ -7,6 +7,9 @@ interface ImportMetaEnv {
   readonly VITE_BACKEND_URL?: string
   /** Build-time brand: 'genesis' (default) | 'kia' | 'hyundai'. See src/brand.ts. */
   readonly VITE_BRAND?: string
+  /** Dev-only: seed fake credentials so the simulator reaches the HUD
+   * against a mock proxy. Ignored outside `vite dev` (DEV guard). */
+  readonly VITE_FAKE_CREDS?: string
 }
 
 interface ImportMeta {

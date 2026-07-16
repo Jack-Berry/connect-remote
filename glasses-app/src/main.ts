@@ -151,7 +151,9 @@ function hudPage(note: string) {
         borderColor: 0,
         paddingLength: HUD_PADDING,
         ...HUD_ROW_CONTAINER,
-        content: hudHidden ? " " : formatHudRow(lastStatus),
+        content: hudHidden
+          ? " "
+          : safeText("render/hud", () => formatHudRow(lastStatus), safeHudRow()),
         isEventCapture: 0,
       }),
       new TextContainerProperty({
@@ -163,7 +165,13 @@ function hudPage(note: string) {
         borderColor: 0,
         paddingLength: HUD_PADDING,
         ...HUD_NOTE_CONTAINER,
-        content: hudHidden ? " " : formatHudBottom(lastStatus, note),
+        content: hudHidden
+          ? " "
+          : safeText(
+              "render/hud",
+              () => formatHudBottom(lastStatus, note),
+              SAFE_NOTE,
+            ),
         isEventCapture: 0,
       }),
     ],
@@ -277,11 +285,19 @@ function upgradeText(
 async function updateHud(note = "") {
   await upgradeText(
     HUD_ROW_CONTAINER,
-    hudHidden ? " " : formatHudRow(lastStatus),
+    hudHidden
+      ? " "
+      : safeText("render/hud", () => formatHudRow(lastStatus), safeHudRow()),
   );
   await upgradeText(
     HUD_NOTE_CONTAINER,
-    hudHidden ? " " : formatHudBottom(lastStatus, note),
+    hudHidden
+      ? " "
+      : safeText(
+          "render/hud",
+          () => formatHudBottom(lastStatus, note),
+          SAFE_NOTE,
+        ),
   );
 }
 
@@ -341,13 +357,32 @@ function showHud(note = "") {
 // changing its context-aware items) is a full page rebuild.
 function showMenu(note = "") {
   view = "menu";
-  menuItems = buildMenuItems(lastStatus, settings);
+  try {
+    menuItems = buildMenuItems(lastStatus, settings);
+  } catch (err) {
+    // Same safety net as the HUD: a broken status must still leave a
+    // navigable menu (the universal actions need no status at all).
+    recordError("render/menu", err);
+    menuItems = [
+      { key: "hud", label: "Return to HUD" },
+      { key: "refresh", label: "Refresh" },
+      { key: "quit", label: "Quit" },
+    ];
+  }
   return enqueue(() =>
     bridge.rebuildPageContainer(
       new RebuildPageContainer({
         containerTotalNum: 2,
         listObject: [menuListContainer(menuItems)],
-        textObject: [menuInfoContainer(formatMenuInfo(lastStatus, note))],
+        textObject: [
+          menuInfoContainer(
+            safeText(
+              "render/menu",
+              () => formatMenuInfo(lastStatus, note),
+              SAFE_NOTE,
+            ),
+          ),
+        ],
       }),
     ),
   );
@@ -364,8 +399,42 @@ function recordError(endpoint: string, err: unknown) {
     lastError = { endpoint, status: err.status, detail: err.message.slice(0, 200) };
   } else if (err instanceof TimeoutError) {
     lastError = { endpoint, status: 0, detail: "timeout" };
+  } else if (err instanceof Error) {
+    // Non-network errors too (e.g. a render crash caught by the safety
+    // net) — name + message so the diagnostic report says what actually
+    // broke, still never credentials.
+    lastError = {
+      endpoint,
+      status: 0,
+      detail: `${err.name}: ${err.message}`.slice(0, 200),
+    };
   } else {
     lastError = { endpoint, status: 0, detail: "network/fetch error" };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Render crash-safety net: a formatter bug (an unexpected payload shape from
+// a car we've never seen) must degrade to a thin-but-alive screen — car name
+// + lock state + "Some data unavailable" — never a black screen (store
+// auto-reject lesson). The crash lands in the diagnostic report via
+// recordError.
+
+const SAFE_NOTE = "Some data unavailable";
+
+/** Fallback HUD row built from primitives only — cannot itself throw. */
+function safeHudRow(): string {
+  const locked = lastStatus?.locked;
+  const lock = locked == null ? "" : locked ? "Locked" : "UNLOCKED";
+  return ` ${BRAND.name}   ${lock}`;
+}
+
+function safeText(label: string, build: () => string, fallback: string): string {
+  try {
+    return build();
+  } catch (err) {
+    recordError(label, err);
+    return fallback;
   }
 }
 
@@ -394,12 +463,23 @@ const NOT_CONFIGURED = `Not configured. Open app on phone,\nenter your ${BRAND.n
 async function renderCurrent(note = "") {
   // Backgrounded: the page isn't on the glasses; FOREGROUND_ENTER re-polls.
   if (backgrounded) return;
-  if (view === "hud") {
-    await updateHud(note);
-  } else if (sameMenu(buildMenuItems(lastStatus, settings), menuItems)) {
-    await updateMenuInfo(formatMenuInfo(lastStatus, note));
-  } else {
-    await showMenu(note);
+  try {
+    if (view === "hud") {
+      await updateHud(note);
+    } else if (sameMenu(buildMenuItems(lastStatus, settings), menuItems)) {
+      await updateMenuInfo(
+        safeText("render/menu", () => formatMenuInfo(lastStatus, note), SAFE_NOTE),
+      );
+    } else {
+      await showMenu(note);
+    }
+  } catch (err) {
+    // Everything below already degrades per-container; this is the last
+    // resort (e.g. buildMenuItems itself threw during the sameMenu diff).
+    // Fall back to the HUD, whose row/bottom formatters are individually
+    // guarded — thin data beats a dead screen.
+    recordError("render", err);
+    await showHud(SAFE_NOTE).catch(() => undefined);
   }
 }
 
@@ -410,6 +490,7 @@ async function pollStatus(note = "") {
   }
   try {
     lastStatus = await client.getStatus();
+    updateChargeLimitsVisibility();
     await renderCurrent(note);
   } catch (err) {
     // 409 mid-session = device token expired. Clear it so the phone-side
@@ -423,6 +504,17 @@ async function pollStatus(note = "") {
     recordError("status", err);
     await renderCurrent(describeError(err));
   }
+}
+
+// Phone settings: charge-limit preferences make no sense on a car that
+// can't plug in. Hidden only on a positive non-plug classification —
+// EV/PHEV/UNKNOWN (or no data yet) keep the section, so existing EV users
+// and older proxies (no powertrain field) see no change.
+function updateChargeLimitsVisibility() {
+  const el = document.getElementById("charge-limits-section");
+  if (!el) return;
+  const pt = lastStatus?.powertrain;
+  el.style.display = pt === "HEV" || pt === "ICE" ? "none" : "";
 }
 
 function scheduleRepoll(delayMs: number) {
@@ -476,6 +568,7 @@ async function connectToBackend() {
     const status = await client.getStatus();
     if (gen !== connectGen) return; // superseded or backgrounded mid-flight
     lastStatus = status;
+    updateChargeLimitsVisibility();
     stopSpinner();
     await showHud();
   } catch (err) {
@@ -792,10 +885,15 @@ function bindPhoneUi() {
       }
       try {
         const status = await probe.getStatus();
-        setStatus(
-          testStatus,
-          `Connected. Car responded (battery ${status.soc_percent ?? "?"}%).`,
-        );
+        // Describe whichever energy figure the car actually reports — a
+        // hybrid answering "battery ?%" would read as a broken connection.
+        const figure =
+          status.soc_percent != null
+            ? `battery ${status.soc_percent}%`
+            : status.fuel_level_percent != null
+              ? `fuel ${status.fuel_level_percent}%`
+              : "limited data";
+        setStatus(testStatus, `Connected. Car responded (${figure}).`);
       } catch (err) {
         recordError("test/status", err);
         if (err instanceof ApiError && err.status === 409) {
@@ -1177,6 +1275,12 @@ if (createResult !== 0) {
   void bridge.shutDownPageContainer(0);
 } else {
   settings = await loadSettings(bridge);
+  // Dev-server-only (never in a production build: DEV guard): fake
+  // credentials so the simulator can reach the HUD against a mock proxy
+  // (VITE_BACKEND_URL). The mock ignores credentials entirely.
+  if (import.meta.env.DEV && import.meta.env.VITE_FAKE_CREDS) {
+    settings = { ...settings, username: "simulator", password: "simulator" };
+  }
   rebuildClient();
   subscribeEvents();
   void connectToBackend();

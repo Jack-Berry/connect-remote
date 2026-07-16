@@ -5,7 +5,7 @@ permalink: /privacy/
 
 # Connect Remote Privacy Policy
 
-_Last updated: 14 July 2026_
+_Last updated: 16 July 2026_
 
 Connect Remote is an open-source companion app for Genesis, Kia, and Hyundai
 vehicles, running on Even Realities G2 smart glasses. This policy explains what
@@ -17,9 +17,11 @@ Your vehicle account credentials are stored **only on your phone**. When you
 use the app, they are sent, encrypted with HTTPS, to a small relay server
 operated by the developer, which uses them to talk to your vehicle
 manufacturer's platform and immediately returns the result. **The relay stores
-nothing**: no database, no accounts, no analytics, no stored logs of request
-contents. Credentials and vehicle data are never written to disk on the relay
-and never appear in its logs.
+nothing about you**: no database, no accounts, no analytics, no stored logs of
+request contents. Credentials and vehicle data are never written to disk on
+the relay and never appear in its logs. The only thing it keeps is a list of
+which data fields each vehicle model exposes (field names only, never values —
+see below).
 
 ## How Connect Remote is structured
 
@@ -52,10 +54,18 @@ The relay's source code is in this repository, so what it does is auditable.
 
 - **Vehicle data** (state of charge, range, lock status, charging state,
   climate state) passes through the relay to your glasses and is not stored
-  beyond the same short-lived in-memory session.
+  beyond the same short-lived in-memory session. To improve support for
+  different vehicle types, the relay may record which data fields a vehicle
+  model exposes — field names only, never values — keyed by brand, region and
+  powertrain type, not by account.
 
 - **Settings** (credentials, climate preferences, charge limits) are stored
   locally in the Even phone app's storage on your device, and nowhere else.
+  For Kia US accounts, a device-trust token (containing no password) is also
+  stored on your phone alongside your credentials and sent with each request;
+  it allows the relay to re-use a trusted device identity without a fresh
+  verification code each time. It can be cleared by changing your account
+  username in the app's settings or by clearing the app's data.
 
 - **Relay logs** contain only the request method, path, status code and
   latency, never request contents, headers, credentials, or vehicle data.
@@ -77,16 +87,18 @@ party.
   credentials. Their handling of your data is governed by their own privacy
   policy.
 - **DigitalOcean**, which hosts the relay server. It has no access to request
-  contents (TLS terminates inside the server), and the relay writes no data
-  for it to hold.
+  contents (TLS terminates inside the server); the only data at rest on its
+  infrastructure is the vehicle-model field-name list described above, which
+  contains no values and no account information.
 
 Connect Remote is not affiliated with, endorsed by, or sponsored by Genesis,
 Kia, Hyundai, Hyundai Motor Group, or Even Realities.
 
 ## Data retention and deletion
 
-The relay retains nothing at rest, so there is nothing for the developer to
-delete. To remove your data:
+The relay retains nothing at rest that identifies you or your account (the
+vehicle-model field-name list above contains no values and no account link),
+so there is nothing for the developer to delete. To remove your data:
 
 - Clear the app's settings (or delete the app) on your phone to remove the
   stored credentials.
@@ -98,7 +110,8 @@ delete. To remove your data:
 
 ## Children
 
-Connect Remote is not directed at children and collects no data from anyone.
+Connect Remote is not directed at children and collects no personal data
+from anyone.
 
 ## Changes to this policy
 

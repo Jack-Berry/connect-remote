@@ -130,10 +130,14 @@ export function buildMenuItems(
   else if (climate === false) items.push(climateOn);
   else items.push(climateOn, climateOff);
 
+  // Charging actions only when the car verifiably plugs in: hidden for
+  // HEV/ICE and whenever the charging field is absent — no data is not an
+  // EV. (Climate and lock/unlock stay universal above.)
+  const pt = status?.powertrain ?? "UNKNOWN";
   const charging = status?.charging ?? null;
-  if (charging === true) items.push(chargeStop);
-  else if (charging === false) items.push(chargeStart);
-  else items.push(chargeStart, chargeStop);
+  if (charging != null && pt !== "HEV" && pt !== "ICE") {
+    items.push(charging ? chargeStop : chargeStart);
+  }
 
   // Cached /status only — force refresh is deliberately not on the glasses.
   const updated = timeOf(status?.last_updated ?? null);
@@ -158,7 +162,7 @@ export function sameMenu(a: MenuItem[], b: MenuItem[]): boolean {
   );
 }
 
-function timeOf(iso: string | null): string {
+function timeOf(iso: string | null | undefined): string {
   if (!iso) return "?";
   const d = new Date(iso);
   if (isNaN(d.getTime())) return "?";
@@ -175,29 +179,93 @@ function chargingLine(status: VehicleStatus): string {
   return c;
 }
 
-// HUD top row: brand · lock state · range · SoC, evenly spaced across the
-// full width. Nothing else lives on the HUD except the bottom line.
-export function formatHudRow(status: VehicleStatus | null): string {
-  return justifyRow(
-    [
-      BRAND.name,
-      status?.locked == null ? "Lock ?" : status.locked ? "Locked" : "UNLOCKED",
-      status?.range_value != null
-        ? `${status.range_value} ${status.range_unit}`
-        : "range ?",
-      status?.soc_percent != null ? `${status.soc_percent}%` : "?%",
-    ],
-    HUD_ROW_INNER_W,
+// ---------------------------------------------------------------------------
+// Honest degradation: an energy line renders only when its fields are
+// genuinely present — an absent field draws nothing, never "0%", "?" or
+// "undefined". The proxy guarantees fuel fields are never sent for an EV
+// (every EV payload upstream carries a vestigial fuelLevel: 0), so presence
+// here can be trusted.
+
+// EV-side items in HUD order: range, then SoC.
+function evItems(status: VehicleStatus): string[] {
+  const items: string[] = [];
+  if (status.range_value != null) {
+    const unit = status.range_unit ?? "";
+    items.push(`${status.range_value}${unit ? ` ${unit}` : ""}`);
+  }
+  if (status.soc_percent != null) items.push(`${status.soc_percent}%`);
+  return items;
+}
+
+// "Fuel 62% · 310mi" — either half alone if that's all the car reports.
+function fuelLine(status: VehicleStatus): string | null {
+  const parts: string[] = [];
+  if (status.fuel_level_percent != null)
+    parts.push(`${status.fuel_level_percent}%`);
+  if (status.fuel_range != null)
+    parts.push(`${status.fuel_range}${status.range_unit ?? ""}`);
+  return parts.length ? `Fuel ${parts.join(" · ")}` : null;
+}
+
+export function hasEnergyData(status: VehicleStatus | null): boolean {
+  return (
+    status != null && (evItems(status).length > 0 || fuelLine(status) != null)
   );
 }
 
-// HUD bottom line, centred: transient notes (command sent / errors) take
-// precedence; otherwise the charging line, shown only while charging.
+// True when the car reports both sides (PHEV, or an UNKNOWN with genuine
+// fuel evidence and EV data). Both-sides cars split across the two HUD
+// containers: fuel keeps the top row (like HEV/ICE), the EV side moves to
+// the bottom line — one row can't comfortably hold both on 576px.
+function isBothSides(status: VehicleStatus): boolean {
+  return fuelLine(status) != null && evItems(status).length > 0;
+}
+
+// HUD top row: brand · lock state · whatever energy data the car genuinely
+// reports (EV: range + SoC; HEV/ICE/PHEV: fuel), evenly spaced. Nothing
+// else lives on the HUD except the bottom line.
+export function formatHudRow(status: VehicleStatus | null): string {
+  const lock =
+    status?.locked == null ? "Lock ?" : status.locked ? "Locked" : "UNLOCKED";
+  // No data yet (pre-first-fetch): the placeholders read as "loading",
+  // not as a car reporting zeros.
+  if (!status) {
+    return justifyRow([BRAND.name, lock, "range ?", "?%"], HUD_ROW_INNER_W);
+  }
+  const items = [BRAND.name, lock];
+  const fuel = fuelLine(status);
+  if (isBothSides(status)) items.push(fuel as string);
+  else if (fuel) items.push(fuel);
+  else items.push(...evItems(status));
+  // Shouldn't happen since both-sides cars split across the containers,
+  // but flag rather than silently wrap if a row still runs long.
+  if (getTextWidth(items.join(" ")) > HUD_ROW_INNER_W) {
+    console.warn(`HUD row overflows 576px: ${items.join(" | ")}`);
+  }
+  return justifyRow(items, HUD_ROW_INNER_W);
+}
+
+// HUD bottom block, centred. Transient notes (command sent / errors) take
+// precedence over everything, then:
+//   · both-sides cars (PHEV): the EV line ("25 mi  55%"), with the charging
+//     line stacked directly below it while charging — same spot where a
+//     pure EV's charging line lives;
+//   · pure EV: the charging line while charging;
+//   · a car with no renderable energy data at all: an honest "limited data"
+//     notice so the near-empty top row doesn't read as a malfunction.
 export function formatHudBottom(
   status: VehicleStatus | null,
   note = "",
 ): string {
-  const text = note || (status?.charging ? chargingLine(status) : "");
+  let text = note;
+  if (!text && status) {
+    const lines: string[] = [];
+    if (isBothSides(status)) lines.push(evItems(status).join("  "));
+    if (status.charging) lines.push(chargingLine(status));
+    if (!lines.length && !hasEnergyData(status))
+      lines.push("Limited data for this vehicle");
+    text = lines.join("\n");
+  }
   if (!text) return " ";
   return centerBlock(text, HUD_INNER_W);
 }
@@ -237,12 +305,12 @@ export function formatMenuInfo(
 ): string {
   const lines: string[] = [];
   if (status) {
-    const soc = status.soc_percent != null ? `${status.soc_percent}%` : "?%";
-    const range =
-      status.range_value != null
-        ? `${status.range_value} ${status.range_unit}`
-        : "range ?";
-    lines.push(`${soc}  ${range}`);
+    // Same honest degradation as the HUD: render only what's present.
+    const ev = evItems(status);
+    const fuel = fuelLine(status);
+    if (ev.length) lines.push(ev.join("  "));
+    if (fuel) lines.push(fuel);
+    if (!ev.length && !fuel) lines.push("Limited data for this vehicle");
     lines.push(
       status.locked == null
         ? "Lock ?"

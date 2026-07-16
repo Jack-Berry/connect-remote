@@ -13,6 +13,7 @@ headers, or query strings — bodies carry car-unlocking credentials.
 import json
 import logging
 import os
+import secrets
 import time
 from datetime import datetime, timezone
 
@@ -32,6 +33,7 @@ from .providers.base import (
     UpstreamError,
     VehicleStatus,
 )
+from . import shape_capture
 from .rate_limit import FailedAuthLimiter, ThrottleRegistry
 from .redact import redact
 from .session_cache import Session, SessionCache
@@ -330,6 +332,20 @@ def debug_fields(body: CredentialedRequest, request: Request) -> Response:
     _auth_ok(request)
     content = json.dumps(redact(raw), indent=2, sort_keys=True, default=str)
     return Response(content=content, media_type="application/json")
+
+
+@app.get("/debug/shapes", include_in_schema=False)
+def debug_shapes(request: Request) -> dict:
+    """Collected field shapes (names + type names only, never values), keyed
+    by brand:region:powertrain — see shape_capture.py. Developer-only:
+    requires the SHAPES_DEBUG_TOKEN env var to be set AND matched by the
+    X-Debug-Token header. 404 (not 401/403) otherwise, so the endpoint's
+    existence isn't advertised to scanners."""
+    expected = os.environ.get("SHAPES_DEBUG_TOKEN")
+    provided = request.headers.get("x-debug-token", "")
+    if not expected or not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=404, detail="Not Found")
+    return shape_capture.store.snapshot()
 
 
 def _send_command(request: Request, creds: Credentials, fn) -> CommandAccepted:

@@ -18,6 +18,9 @@ def make_provider(**vehicle_attrs) -> GenesisProvider:
     provider = GenesisProvider.__new__(GenesisProvider)
     provider._vehicle_id = "v1"
     provider._vm = SimpleNamespace(vehicles={"v1": SimpleNamespace(**vehicle_attrs)})
+    provider._powertrain = None
+    provider._brand_name = "Genesis"
+    provider._region_name = "Europe"
     return provider
 
 

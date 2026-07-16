@@ -179,19 +179,23 @@
         <label for="climate-heating" style="margin:0">Steering wheel + rear window heat with climate</label>
       </div>
 
-      <div class="cols" style="margin-top:14px">
-        <div>
-          <label for="charge-limit-ac" style="margin-top:0">AC charge limit</label>
-          <select id="charge-limit-ac"></select>
+      <!-- Hidden by main.ts when the car is classified as a non-plug
+           powertrain (HEV/ICE) — charge limits mean nothing there. -->
+      <div id="charge-limits-section">
+        <div class="cols" style="margin-top:14px">
+          <div>
+            <label for="charge-limit-ac" style="margin-top:0">AC charge limit</label>
+            <select id="charge-limit-ac"></select>
+          </div>
+          <div>
+            <label for="charge-limit-dc" style="margin-top:0">DC charge limit</label>
+            <select id="charge-limit-dc"></select>
+          </div>
         </div>
-        <div>
-          <label for="charge-limit-dc" style="margin-top:0">DC charge limit</label>
-          <select id="charge-limit-dc"></select>
-        </div>
-      </div>
 
-      <button id="limits-btn" type="button" class="secondary">Send limits to car</button>
-      <p id="limits-status" class="status"></p>
+        <button id="limits-btn" type="button" class="secondary">Send limits to car</button>
+        <p id="limits-status" class="status"></p>
+      </div>
 
       <h2>Diagnostics</h2>
       <p class="hint">If something isn't working, copy a diagnostic report and send it to the developer. No passwords or tokens are included.</p>

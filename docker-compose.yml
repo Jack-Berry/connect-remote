@@ -29,7 +29,18 @@ services:
     # Deliberately no ports: — the proxy is reachable only from Caddy over
     # the internal compose network. TLS terminates at Caddy; credentials in
     # request bodies never traverse the host un-encrypted.
+    environment:
+      # Field-shape capture (names + types only, never values — see
+      # backend/app/shape_capture.py and PRIVACY.md). The volume is the only
+      # thing the proxy writes to disk.
+      SHAPE_CAPTURE_PATH: /data/shapes.json
+      # Gate for GET /debug/shapes (X-Debug-Token header). Unset = endpoint
+      # answers 404 for everyone.
+      SHAPES_DEBUG_TOKEN: ${SHAPES_DEBUG_TOKEN:-}
+    volumes:
+      - proxy-shapes:/data
 
 volumes:
   caddy-data:
   caddy-config:
+  proxy-shapes:
