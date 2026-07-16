@@ -28,6 +28,7 @@ from .providers.base import (
     AuthError,
     ClimateSettings,
     ProviderDataError,
+    ReenrollRequired,
     UpstreamError,
     VehicleStatus,
 )
@@ -60,6 +61,12 @@ AUTH_FAIL_MAX = 5
 AUTH_FAIL_WINDOW_SECONDS = 900.0
 AUTH_FAIL_BLOCK_SECONDS = 900.0
 
+# Kia-US enrollment: per-credential throttle to prevent OTP spam.
+# 3 attempts per hour is generous for a human enrolling; an attacker trying
+# to flood someone's email/SMS gets 3 codes then waits an hour.
+ENROLL_MIN_INTERVAL_SECONDS = 120
+ENROLL_HOURLY_CAP = 3
+
 
 def _build_provider(creds: "Credentials"):
     # Imported lazily so tests can run with a fake provider factory.
@@ -71,6 +78,7 @@ def _build_provider(creds: "Credentials"):
         pin=creds.pin,
         region=creds.region,
         brand=creds.brand,
+        device_token=creds.device_token,
     )
 
 
@@ -91,6 +99,9 @@ app.state.limiter = limiter
 app.state.cache = SessionCache(factory=_build_provider, ttl_seconds=SESSION_TTL_SECONDS)
 app.state.refresh_throttles = ThrottleRegistry(
     REFRESH_MIN_INTERVAL_SECONDS, REFRESH_DAILY_CAP
+)
+app.state.enroll_throttles = ThrottleRegistry(
+    ENROLL_MIN_INTERVAL_SECONDS, ENROLL_HOURLY_CAP
 )
 app.state.failed_auth = FailedAuthLimiter(
     AUTH_FAIL_MAX, AUTH_FAIL_WINDOW_SECONDS, AUTH_FAIL_BLOCK_SECONDS
@@ -135,6 +146,10 @@ class Credentials(BaseModel):
     pin: str = Field(default="", repr=False)
     region: int
     brand: int
+    # Kia-US only: stored device token from OTP enrollment (device_id +
+    # rmtoken). Sent per-request so the proxy stays stateless. Not included
+    # in the session cache key — it's derived state, not account identity.
+    device_token: dict | None = Field(default=None, repr=False)
 
     @field_validator("region")
     @classmethod
@@ -210,6 +225,15 @@ def _auth_failed(request: Request, session: Session, exc: AuthError) -> HTTPExce
     )
 
 
+def _reenroll_needed(request: Request, session: Session, exc: ReenrollRequired) -> HTTPException:
+    """Kia-US: device trust missing or expired. Evict the session (so the
+    next request with a fresh device_token builds a new provider) but do NOT
+    count it as a failed auth — credentials are fine, only device trust is
+    absent. 409, not 401."""
+    request.app.state.cache.evict(session.key)
+    return HTTPException(status_code=409, detail=str(exc))
+
+
 def _auth_ok(request: Request) -> None:
     """An upstream call authenticated fine — forget the IP's failed sign-ins
     so a user who mistypes, then fixes it, never accumulates toward a block."""
@@ -243,6 +267,8 @@ def get_status(body: CredentialedRequest, request: Request) -> VehicleStatus:
         session.last_known = status
         _auth_ok(request)
         return status
+    except ReenrollRequired as exc:
+        raise _reenroll_needed(request, session, exc)
     except AuthError as exc:
         raise _auth_failed(request, session, exc)
     except ProviderDataError as exc:
@@ -275,6 +301,8 @@ def force_refresh(body: CredentialedRequest, request: Request) -> VehicleStatus:
         session.last_known = status
         _auth_ok(request)
         return status
+    except ReenrollRequired as exc:
+        raise _reenroll_needed(request, session, exc)
     except AuthError as exc:
         raise _auth_failed(request, session, exc)
     except ProviderDataError as exc:
@@ -293,6 +321,8 @@ def debug_fields(body: CredentialedRequest, request: Request) -> Response:
     session = _session(request, body.credentials)
     try:
         raw = session.provider.get_raw_fields()
+    except ReenrollRequired as exc:
+        raise _reenroll_needed(request, session, exc)
     except AuthError as exc:
         raise _auth_failed(request, session, exc)
     except UpstreamError as exc:
@@ -306,6 +336,8 @@ def _send_command(request: Request, creds: Credentials, fn) -> CommandAccepted:
     session = _session(request, creds)
     try:
         fn(session.provider)
+    except ReenrollRequired as exc:
+        raise _reenroll_needed(request, session, exc)
     except AuthError as exc:
         raise _auth_failed(request, session, exc)
     except UpstreamError as exc:
@@ -351,3 +383,76 @@ def lock(body: CredentialedRequest, request: Request) -> CommandAccepted:
 @app.post("/unlock", response_model=CommandAccepted)
 def unlock(body: CredentialedRequest, request: Request) -> CommandAccepted:
     return _send_command(request, body.credentials, lambda p: p.unlock())
+
+
+# -- Kia-US OTP enrollment ---------------------------------------------------
+# These endpoints exist only because Kia-US (brand=1, region=3) requires a
+# device-trust OTP on first login. Other brand/region combos never need them.
+# The flow is: start → user receives email/SMS code → verify → phone stores
+# the returned device_token and sends it with every subsequent request.
+
+KIA_US_BRAND = 1  # const.BRAND_KIA
+KIA_US_REGION = 3  # const.REGION_USA
+
+
+class EnrollStartBody(CredentialedRequest):
+    notify_type: str = Field(
+        default="EMAIL",
+        description="How to send the OTP: EMAIL or SMS",
+        pattern="^(EMAIL|SMS)$",
+    )
+
+
+class EnrollVerifyBody(CredentialedRequest):
+    code: str = Field(min_length=1, description="The OTP code from the email/SMS")
+
+
+def _require_kia_us(creds: Credentials) -> None:
+    if creds.brand != KIA_US_BRAND or creds.region != KIA_US_REGION:
+        raise HTTPException(
+            status_code=400,
+            detail="Device enrollment is only required for Kia + USA. "
+            f"Got brand={creds.brand} region={creds.region}.",
+        )
+
+
+@app.post("/kia-us/enroll/start")
+@limiter.limit(RATE_EXPENSIVE)
+def enroll_start(body: EnrollStartBody, request: Request) -> dict:
+    """Kick off Kia-US OTP device enrollment. Returns masked destinations
+    (email/phone) or ``{"enrolled": true}`` if already trusted."""
+    _require_kia_us(body.credentials)
+    # Per-credential throttle: 3/hour — prevents OTP spam to someone else's
+    # email/SMS. Separate from (and tighter than) the per-IP rate limiter.
+    session = _session(request, body.credentials)
+    throttle = request.app.state.enroll_throttles.get(session.key)
+    allowed, retry_after = throttle.try_acquire()
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="enrollment rate limited — too many OTP requests for this account",
+            headers={"Retry-After": str(retry_after)},
+        )
+    try:
+        return session.provider.start_enrollment(body.notify_type)
+    except AuthError as exc:
+        raise _auth_failed(request, session, exc)
+    except UpstreamError as exc:
+        raise HTTPException(status_code=502, detail=f"upstream error: {exc}")
+
+
+@app.post("/kia-us/enroll/verify")
+@limiter.limit(RATE_EXPENSIVE)
+def enroll_verify(body: EnrollVerifyBody, request: Request) -> dict:
+    """Verify the OTP code and return the device_token for phone storage."""
+    _require_kia_us(body.credentials)
+    session = _session(request, body.credentials)
+    try:
+        return session.provider.verify_enrollment(body.code)
+    except ReenrollRequired as exc:
+        # Session expired between /start and /verify — tell client to restart.
+        raise _reenroll_needed(request, session, exc)
+    except AuthError as exc:
+        raise _auth_failed(request, session, exc)
+    except UpstreamError as exc:
+        raise HTTPException(status_code=502, detail=f"upstream error: {exc}")

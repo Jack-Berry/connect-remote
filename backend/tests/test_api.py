@@ -7,6 +7,7 @@ from app.main import app
 from app.providers.base import (
     AuthError,
     ProviderDataError,
+    ReenrollRequired,
     UpstreamError,
     VehicleStatus,
 )
@@ -16,6 +17,7 @@ from app.session_cache import SessionCache, credentials_key
 
 CREDS = {"username": "u", "password": "p", "pin": "1234", "region": 1, "brand": 3}
 OTHER_CREDS = {**CREDS, "username": "someone-else"}
+KIA_US_CREDS = {"username": "kia-u", "password": "kia-p", "pin": "5678", "region": 3, "brand": 1}
 
 
 def body(**extra) -> dict:
@@ -44,9 +46,17 @@ class FakeProvider:
         self.fail = False
         self.fail_parse = False
         self.fail_auth = False
+        self.fail_reenroll = False
         self.commands: list[str] = []
+        # Enrollment tracking
+        self.enrollment_started = False
+        self.enrollment_verified = False
+        self.enrollment_fail_verify = False
+        self.enrollment_expired = False
 
     def _check(self):
+        if self.fail_reenroll:
+            raise ReenrollRequired("device enrollment required")
         if self.fail_auth:
             raise AuthError("bad credentials")
         if self.fail:
@@ -65,6 +75,9 @@ class FakeProvider:
     def get_raw_fields(self):
         # Like the real provider: never builds VehicleStatus, so a parse
         # failure (fail_parse) can't stop it — only auth/upstream failures.
+        # ReenrollRequired fires from _prepare, which get_raw_fields calls too.
+        if self.fail_reenroll:
+            raise ReenrollRequired("device enrollment required")
         if self.fail_auth:
             raise AuthError("bad credentials")
         if self.fail:
@@ -105,6 +118,39 @@ class FakeProvider:
         self._check()
         self.commands.append("charge:stop")
 
+    def start_enrollment(self, notify_type):
+        if self.fail_auth:
+            raise AuthError("bad credentials")
+        if self.fail:
+            raise UpstreamError("upstream down")
+        self.enrollment_started = True
+        return {
+            "enrolled": False,
+            "destinations": {
+                "has_email": True,
+                "has_sms": False,
+                "email": "k***@example.com",
+                "sms": None,
+            },
+        }
+
+    def verify_enrollment(self, code):
+        if self.enrollment_expired:
+            raise ReenrollRequired("enrollment session expired")
+        if self.enrollment_fail_verify:
+            raise AuthError("wrong OTP code")
+        if self.fail:
+            raise UpstreamError("upstream down")
+        self.enrollment_verified = True
+        return {
+            "device_token": {
+                "access_token": "sid123",
+                "refresh_token": "rm456",
+                "device_id": "DEV-789",
+                "valid_until": "2026-07-17T12:00:00+00:00",
+            }
+        }
+
 
 class Factory:
     """Provider factory that records how often it was called — a second call
@@ -134,6 +180,9 @@ def client(factory):
     app.state.cache = SessionCache(factory=factory, ttl_seconds=600)
     app.state.refresh_throttles = ThrottleRegistry(
         min_interval_seconds=900, daily_cap=20
+    )
+    app.state.enroll_throttles = ThrottleRegistry(
+        min_interval_seconds=0, daily_cap=1000  # no throttle in most tests
     )
     app.state.failed_auth = FailedAuthLimiter()
     # Per-IP limits are covered by their own test; everywhere else they'd
@@ -585,3 +634,154 @@ def test_redact_keeps_fields_that_merely_look_sensitive():
         "GearPosition": 1,
         "Version": "ABCDEFGH123456789JK",
     }
+
+
+# ---------------------------------------------------------------------------
+# Kia-US OTP enrollment (409, enrollment endpoints, limiter interaction)
+
+
+def kia_body(**extra) -> dict:
+    return {"credentials": KIA_US_CREDS, **extra}
+
+
+def test_reenroll_required_is_409_not_401(client, provider):
+    """Kia-US needing device enrollment returns 409, not 401."""
+    provider.fail_reenroll = True
+    r = client.post("/status", json=kia_body())
+    assert r.status_code == 409
+    assert "enrollment" in r.json()["detail"].lower()
+
+
+def test_reenroll_does_not_trip_failed_auth_limiter(client, provider):
+    """409 (re-enroll) must not count toward the 5-strike IP block."""
+    provider.fail_reenroll = True
+    for _ in range(10):  # well past the 5-failure limit
+        r = client.post("/status", json=kia_body())
+        assert r.status_code == 409  # never 429
+
+    # A different account on the same IP should still work fine.
+    provider.fail_reenroll = False
+    r = client.post("/status", json=body())
+    assert r.status_code == 200
+
+
+def test_reenroll_evicts_session(client, factory, provider):
+    """After a 409, the session is evicted so the next request with a
+    device_token builds a fresh provider."""
+    provider.fail_reenroll = True
+    client.post("/status", json=kia_body())
+    calls_before = factory.calls
+    provider.fail_reenroll = False
+    client.post("/status", json=kia_body())
+    assert factory.calls > calls_before  # new provider was built
+
+
+def test_reenroll_on_all_car_endpoints(client, provider):
+    """Every car endpoint returns 409, not 401, for ReenrollRequired."""
+    provider.fail_reenroll = True
+    for path, extra in [
+        ("/status", {}),
+        ("/refresh", {}),
+        ("/debug/fields", {}),
+        ("/lock", {}),
+        ("/unlock", {}),
+        ("/climate", {"on": True}),
+        ("/charge", {"on": True}),
+        ("/charge-limits", {"ac": 80, "dc": 90}),
+    ]:
+        r = client.post(path, json=kia_body(**extra))
+        assert r.status_code == 409, f"{path} returned {r.status_code}, expected 409"
+
+
+def test_enroll_start_rejects_non_kia_us(client):
+    """Enrollment endpoints return 400 for non-Kia-US credentials."""
+    r = client.post("/kia-us/enroll/start", json=body(notify_type="EMAIL"))
+    assert r.status_code == 400
+    assert "Kia" in r.json()["detail"]
+
+
+def test_enroll_start_returns_destinations(client, provider):
+    """Enrollment start returns masked destinations for OTP delivery."""
+    r = client.post(
+        "/kia-us/enroll/start", json=kia_body(notify_type="EMAIL")
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["enrolled"] is False
+    assert data["destinations"]["has_email"] is True
+    assert data["destinations"]["email"] == "k***@example.com"
+    assert provider.enrollment_started is True
+
+
+def test_enroll_verify_returns_device_token(client, provider):
+    """Enrollment verify returns a device_token without credentials."""
+    r = client.post(
+        "/kia-us/enroll/verify", json=kia_body(code="123456")
+    )
+    assert r.status_code == 200
+    token = r.json()["device_token"]
+    assert "device_id" in token
+    assert "refresh_token" in token
+    # Credentials must be stripped (QA point 1)
+    assert "username" not in token
+    assert "password" not in token
+    assert "pin" not in token
+    assert provider.enrollment_verified is True
+
+
+def test_enroll_verify_wrong_code_is_401(client, provider):
+    """A bad OTP code is a real auth failure → 401."""
+    provider.enrollment_fail_verify = True
+    r = client.post(
+        "/kia-us/enroll/verify", json=kia_body(code="wrong")
+    )
+    assert r.status_code == 401
+
+
+def test_enroll_verify_expired_session_is_409(client, provider):
+    """If the enrollment session expired, verify returns 409 (not 502)
+    with a message telling the client to restart enrollment."""
+    provider.enrollment_expired = True
+    r = client.post(
+        "/kia-us/enroll/verify", json=kia_body(code="123456")
+    )
+    assert r.status_code == 409
+    assert "restart" in r.json()["detail"].lower() or "expired" in r.json()["detail"].lower()
+
+
+def test_enroll_verify_rejects_non_kia_us(client):
+    r = client.post("/kia-us/enroll/verify", json=body(code="123456"))
+    assert r.status_code == 400
+
+
+def test_enroll_start_per_credential_throttle(client, provider):
+    """Enrollment start is throttled per-credential (3/hour)."""
+    app.state.enroll_throttles = ThrottleRegistry(
+        min_interval_seconds=0, daily_cap=3
+    )
+    for _ in range(3):
+        r = client.post(
+            "/kia-us/enroll/start", json=kia_body(notify_type="EMAIL")
+        )
+        assert r.status_code == 200
+    r = client.post(
+        "/kia-us/enroll/start", json=kia_body(notify_type="EMAIL")
+    )
+    assert r.status_code == 429
+    assert "enrollment" in r.json()["detail"].lower()
+    # Reset for other tests
+    app.state.enroll_throttles = ThrottleRegistry(
+        min_interval_seconds=0, daily_cap=1000
+    )
+
+
+def test_device_token_field_is_optional_and_backward_compatible(client):
+    """Existing requests without device_token still work (Genesis EU etc.)."""
+    r = client.post("/status", json=body())
+    assert r.status_code == 200
+    # With an explicit null
+    r = client.post(
+        "/status",
+        json={"credentials": {**CREDS, "device_token": None}},
+    )
+    assert r.status_code == 200

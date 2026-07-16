@@ -96,6 +96,13 @@ class AuthError(Exception):
     instead of 502."""
 
 
+class ReenrollRequired(Exception):
+    """Raised when the vehicle API demands device re-enrollment (Kia-US OTP).
+    Distinct from AuthError so the proxy can answer 409 (not 401) and avoid
+    counting it as a failed-auth strike — the credentials are fine, only the
+    device trust has expired."""
+
+
 class ProviderDataError(Exception):
     """Raised when the vehicle API responded but its data didn't fit our
     model — a backend bug to report, not a connectivity problem. Kept

@@ -15,13 +15,20 @@ import threading
 import time
 
 from hyundai_kia_connect_api import ClimateRequestOptions, VehicleManager
-from hyundai_kia_connect_api.exceptions import AuthenticationError, PINMissingError
+from hyundai_kia_connect_api.const import OTP_NOTIFY_TYPE
+from hyundai_kia_connect_api.exceptions import (
+    AuthenticationError,
+    AuthenticationOTPRequired,
+    PINMissingError,
+)
+from hyundai_kia_connect_api.Token import Token
 from pydantic import ValidationError
 
 from .base import (
     AuthError,
     ClimateSettings,
     ProviderDataError,
+    ReenrollRequired,
     UpstreamError,
     VehicleStatus,
 )
@@ -46,14 +53,27 @@ class GenesisProvider:
         pin: str,
         region: int,
         brand: int,
+        device_token: dict | None = None,
     ):
         self._lock = threading.Lock()
+        # If a stored device token is provided (Kia-US OTP flow), seed the
+        # VehicleManager with it so check_and_refresh_token() can reuse the
+        # device_id + rmtoken and skip the OTP challenge. Update username/
+        # password to current values — the token may have been stored when the
+        # credentials were different.
+        stored_token: Token | None = None
+        if device_token:
+            stored_token = Token.from_dict(device_token)
+            stored_token.username = username
+            stored_token.password = password
+            stored_token.pin = pin or stored_token.pin
         self._vm = VehicleManager(
             region=region,
             brand=brand,
             username=username,
             password=password,
             pin=pin,
+            token=stored_token,
         )
         self._vehicle_id: str | None = None
         # For _scrub: the lib embeds raw upstream response bodies / redirect
@@ -98,6 +118,16 @@ class GenesisProvider:
                 raise  # e.g. no vehicles on the account — retrying won't help
             except PINMissingError as exc:
                 raise AuthError(self._scrub(exc)) from exc
+            except AuthenticationOTPRequired:
+                # Kia-US: device trust missing or expired. Not transient —
+                # retrying won't help, and it must NOT be classified as an
+                # auth failure (credentials are fine, only device trust is
+                # absent). Raise immediately; the proxy maps this to 409.
+                raise ReenrollRequired(
+                    "This account requires device enrollment (Kia-US OTP). "
+                    "Complete enrollment via /kia-us/enroll/start and "
+                    "/kia-us/enroll/verify."
+                )
             except Exception as exc:
                 last_exc = exc
                 logger.warning("login/refresh failed, retrying: %s", self._scrub(exc))
@@ -121,6 +151,90 @@ class GenesisProvider:
                 logger.warning("multiple vehicles found, using first: %s", ids)
             self._vehicle_id = ids[0]
         return self._vehicle_id
+
+    # -- Kia-US OTP enrollment -----------------------------------------
+    # These are called only by the /kia-us/enroll/* endpoints.
+    # The same GenesisProvider instance (same VehicleManager, same device_id)
+    # must handle both start and verify — the session cache guarantees this.
+
+    def _safe_token_dict(self) -> dict:
+        """Return the VM's token as a dict safe for phone storage: strip
+        username/password/PIN since (a) the phone already stores those in
+        settings, (b) a stale embedded password would be confusing, and
+        (c) the provider re-injects current credentials on every request
+        anyway. Only device_id + refresh_token + access_token + valid_until
+        actually matter."""
+        d = self._vm.token.to_dict()
+        d.pop("username", None)
+        d.pop("password", None)
+        d.pop("pin", None)
+        return d
+
+    def start_enrollment(self, notify_type: str) -> dict:
+        """Kick off the OTP flow: login → OTPRequest → send code.
+
+        Returns destinations for the UI (masked email/phone). If the account
+        is already trusted on this device (no OTP needed), returns
+        ``{"enrolled": True}`` with the token so the phone can store it.
+        """
+        with self._lock:
+            try:
+                result = self._vm.login()
+            except AuthenticationError as exc:
+                raise AuthError(self._scrub(exc)) from exc
+            except Exception as exc:
+                raise UpstreamError(self._scrub(exc)) from exc
+
+            if result is True:
+                # Already trusted (has a valid rmtoken) — no OTP needed.
+                return {"enrolled": True, "device_token": self._safe_token_dict()}
+
+            # result stored an OTPRequest on self._vm.otp_request
+            otp_type = (
+                OTP_NOTIFY_TYPE.EMAIL
+                if notify_type.upper() == "EMAIL"
+                else OTP_NOTIFY_TYPE.SMS
+            )
+            try:
+                self._vm.send_otp(otp_type)
+            except Exception as exc:
+                raise UpstreamError(
+                    f"failed to send OTP: {self._scrub(exc)}"
+                ) from exc
+
+            otp_req = self._vm.otp_request
+            return {
+                "enrolled": False,
+                "destinations": {
+                    "has_email": getattr(otp_req, "has_email", False),
+                    "has_sms": getattr(otp_req, "has_sms", False),
+                    "email": getattr(otp_req, "email", None),
+                    "sms": getattr(otp_req, "sms", None),
+                },
+            }
+
+    def verify_enrollment(self, code: str) -> dict:
+        """Verify the OTP code and return the device token for phone storage."""
+        with self._lock:
+            if self._vm.otp_request is None:
+                # Session cache expired between /enroll/start and /verify —
+                # the VehicleManager no longer holds the in-flight OTPRequest.
+                raise ReenrollRequired(
+                    "Enrollment session expired. Please restart enrollment "
+                    "via /kia-us/enroll/start."
+                )
+            try:
+                self._vm.verify_otp_and_complete_login(code)
+            except AuthenticationError as exc:
+                raise AuthError(
+                    f"OTP verification failed: {self._scrub(exc)}"
+                ) from exc
+            except Exception as exc:
+                raise UpstreamError(
+                    f"OTP verification error: {self._scrub(exc)}"
+                ) from exc
+
+            return {"device_token": self._safe_token_dict()}
 
     def _to_status(self) -> VehicleStatus:
         v = self._vm.vehicles[self._vehicle_id]
