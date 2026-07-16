@@ -18,6 +18,11 @@ export interface AppSettings {
   // AC/DC charge targets (percent, 50–100) sent via "Send limits to car"
   chargeLimitAc: number
   chargeLimitDc: number
+  // Kia-US only: stored device token from OTP enrollment. Contains
+  // device_id + refresh_token (no credentials — they're stripped by the
+  // proxy). Sent per-request so the proxy can reuse a trusted device
+  // identity without storing anything server-side.
+  kiaUsDeviceToken?: Record<string, unknown>
 }
 
 export const REGIONS: { code: number; label: string }[] = [

@@ -24,6 +24,23 @@ export interface Credentials {
   pin: string
   region: number
   brand: number
+  /** Kia-US only: stored device token from OTP enrollment. */
+  device_token?: Record<string, unknown>
+}
+
+export interface EnrollDestinations {
+  enrolled: boolean
+  device_token?: Record<string, unknown>
+  destinations?: {
+    has_email: boolean
+    has_sms: boolean
+    email: string | null
+    sms: string | null
+  }
+}
+
+export interface EnrollResult {
+  device_token: Record<string, unknown>
 }
 
 // The one and only backend: the hosted proxy, matching the single domain in
@@ -110,6 +127,25 @@ export class BackendClient {
 
   setChargeLimits(ac: number, dc: number): Promise<void> {
     return this.post('/charge-limits', { ac, dc })
+  }
+
+  // -- Kia-US OTP enrollment -----------------------------------------------
+
+  enrollStart(notifyType: 'EMAIL' | 'SMS'): Promise<EnrollDestinations> {
+    return this.post('/kia-us/enroll/start', { notify_type: notifyType })
+  }
+
+  enrollVerify(code: string): Promise<EnrollResult> {
+    return this.post('/kia-us/enroll/verify', { code })
+  }
+
+  // -- Diagnostics -------------------------------------------------------------
+
+  /** Raw vehicle fields from the library, server-side redacted. Used by the
+   *  "Copy diagnostic report" feature so non-technical testers can paste a
+   *  field dump without touching a terminal. */
+  getDebugFields(): Promise<Record<string, unknown>> {
+    return this.post('/debug/fields')
   }
 
   // Unauthenticated liveness probe — distinguishes "proxy down/no internet"

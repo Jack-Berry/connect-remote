@@ -142,6 +142,28 @@
       <button id="test-btn" type="button" class="secondary">Test connection</button>
       <p id="test-status" class="status"></p>
 
+      <!-- Kia-US only: device enrollment via OTP. Hidden for all other
+           brand/region combos. Shown dynamically by main.ts. -->
+      <div id="enroll-section" style="display:none">
+        <h2>Device enrollment</h2>
+        <p class="hint">Kia Connect (US) requires a one-time verification code to trust this app. You'll receive the code by email or text. This only needs to be done once, and codes expire after a few minutes.</p>
+        <div id="enroll-start-area">
+          <label for="enroll-notify-type">Send code via</label>
+          <select id="enroll-notify-type">
+            <option value="EMAIL">Email</option>
+            <option value="SMS">SMS</option>
+          </select>
+          <button id="enroll-start-btn" type="button" class="secondary">Send verification code</button>
+        </div>
+        <div id="enroll-verify-area" style="display:none">
+          <label for="enroll-code">Verification code</label>
+          <input id="enroll-code" type="text" inputmode="numeric" placeholder="Enter the code from your email/SMS" autocapitalize="off" autocorrect="off" />
+          <button id="enroll-verify-btn" type="button" class="secondary">Verify code</button>
+          <p style="margin:8px 0 0;"><a href="#" id="enroll-resend" style="color:#8fbc8f;font-size:14px;">Didn't get a code? Send again</a></p>
+        </div>
+        <p id="enroll-status" class="status"></p>
+      </div>
+
       <h2>Car</h2>
 
       <label for="climate-temp">Climate target temperature (&deg;C)</label>
@@ -170,6 +192,11 @@
 
       <button id="limits-btn" type="button" class="secondary">Send limits to car</button>
       <p id="limits-status" class="status"></p>
+
+      <h2>Diagnostics</h2>
+      <p class="hint">If something isn't working, copy a diagnostic report and send it to the developer. No passwords or tokens are included.</p>
+      <button id="diag-btn" type="button" class="secondary">Copy diagnostic report</button>
+      <p id="diag-status" class="status"></p>
     </div>
     <!-- Save stays visible regardless of scroll position — on a long form a
          bottom-of-form Save ends up off-screen. -->
