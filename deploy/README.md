@@ -9,9 +9,14 @@ Docker Compose:
 - **proxy** — the FastAPI app. No published ports; reachable only from Caddy
   on the internal compose network.
 
-The proxy is stateless (see `/DECISIONS-LOG.md`): no database, no volumes, no
-credentials at rest. Restarts and redeploys lose nothing but the in-memory
-session cache — the next request from each user just logs in afresh.
+The proxy is stateless for user data (see `/DECISIONS-LOG.md`): no database,
+no credentials at rest. Restarts and redeploys lose nothing but the in-memory
+session cache — the next request from each user just logs in afresh. The one
+volume (`proxy-shapes`) holds the vehicle-model field-name list (names +
+types only, never values — see `backend/app/shape_capture.py` and
+PRIVACY.md); set `SHAPES_DEBUG_TOKEN` in the compose environment to make
+`GET /debug/shapes` readable with the `X-Debug-Token` header, otherwise the
+endpoint answers 404.
 
 ## One-time server setup
 
