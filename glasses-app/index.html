@@ -166,7 +166,15 @@
 
       <h2>Car</h2>
 
-      <label for="climate-temp">Climate target temperature (&deg;C)</label>
+      <label for="temp-unit">Temperature unit</label>
+      <select id="temp-unit">
+        <option value="C">Celsius (&deg;C)</option>
+        <option value="F">Fahrenheit (&deg;F)</option>
+      </select>
+
+      <!-- Label text and the min/max/step are rewritten by main.ts whenever
+           the unit changes; the value is always stored as Celsius. -->
+      <label for="climate-temp" id="climate-temp-label">Climate target temperature (&deg;C)</label>
       <input id="climate-temp" type="number" min="14" max="30" step="0.5" />
 
       <div class="row">
@@ -179,8 +187,9 @@
         <label for="climate-heating" style="margin:0">Steering wheel + rear window heat with climate</label>
       </div>
 
-      <!-- Hidden by main.ts when the car is classified as a non-plug
-           powertrain (HEV/ICE) — charge limits mean nothing there. -->
+      <!-- Hidden by main.ts when the car can't plug in (HEV/ICE, or
+           UNKNOWN with fuel-only evidence) — charge limits mean nothing
+           there. Rule: chargeLimitsRelevant in settings.ts. -->
       <div id="charge-limits-section">
         <div class="cols" style="margin-top:14px">
           <div>

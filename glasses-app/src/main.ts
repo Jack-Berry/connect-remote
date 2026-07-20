@@ -22,6 +22,13 @@ import {
   CONNECT_SPIN_CONTAINER,
   CONNECT_SPIN_W,
   CONNECT_SPIN_X,
+  FINDER_CONTAINER,
+  FINDER_FOOT_CONTAINER,
+  FINDER_FOOT_H,
+  FINDER_FOOT_Y,
+  FINDER_MAIN_CONTAINER,
+  FINDER_MAIN_H,
+  FINDER_MAIN_Y,
   HUD_CONTAINER,
   HUD_NOTE_CONTAINER,
   HUD_PADDING,
@@ -34,20 +41,35 @@ import {
   type MenuItem,
   buildMenuItems,
   formatConnectFail,
+  formatFinder,
   formatHudBottom,
   formatHudRow,
   formatMenuInfo,
   sameMenu,
   spinnerFrame,
 } from "./display";
+import { createGlyphIndicator } from "./direction";
+import {
+  CourseTracker,
+  type Fix,
+  type FinderProblem,
+  finderView,
+  isUsableFix,
+} from "./finder";
+import { type PositionWatch, startPositionWatch } from "./geo";
 import {
   type AppSettings,
   type Bridge,
+  type TempUnit,
   DEFAULT_SETTINGS,
   REGIONS,
+  chargeLimitsRelevant,
   isConfigured,
   loadSettings,
+  resolveTempUnit,
   saveSettings,
+  tempFieldState,
+  toCanonicalC,
 } from "./settings";
 // Vite resolves JSON imports at build time — gives us the version string
 // from app.json without a runtime fetch.
@@ -64,7 +86,7 @@ let client: BackendClient | null = null;
 let lastStatus: VehicleStatus | null = null;
 // 'connect' until the first successful /status (no HUD of empty values);
 // then two-layer UI: 'hud' is glanceable status only, 'menu' holds controls.
-let view: "connect" | "hud" | "menu" = "connect";
+let view: "connect" | "hud" | "menu" | "finder" = "connect";
 let connectState: "connecting" | "failed" = "connecting";
 // Deliberate single-tap "glasses off" mode: the HUD renders nothing but the
 // app keeps running and polling. Distinct from connect/error states, which
@@ -389,6 +411,226 @@ function showMenu(note = "") {
 }
 
 // ---------------------------------------------------------------------------
+// Car finder ("Find my car")
+//
+// Bearing and distance from the phone's own GPS to the car position that
+// /status already gave us. Every coordinate stays on the device — nothing
+// below adds anything to a request, which is what PRIVACY.md promises.
+//
+// There is no compass: the Stage 0 probe found the Even WebView refuses
+// DeviceOrientationEvent.requestPermission() outright (denied in 0–5ms, no
+// dialog), so the arrow is relative to the user's *travel course* derived from
+// successive fixes, and degrades to absolute cardinal text when they stop.
+
+/** How long the arrival screen holds before returning to the HUD. */
+const ARRIVAL_HOLD_MS = 3000;
+/** Re-render cadence: slow enough to be free, fast enough that the course
+ *  expiring (user stopped walking) flips back to cardinal text promptly. */
+const FINDER_TICK_MS = 1000;
+
+let finderWatch: PositionWatch | null = null;
+let finderTick: ReturnType<typeof setInterval> | null = null;
+let finderArrival: ReturnType<typeof setTimeout> | null = null;
+let finderFix: Fix | null = null;
+let finderProblem: FinderProblem | null = null;
+let finderOctant: number | null = null;
+const finderCourse = new CourseTracker();
+// Last rendered content, so the 1 Hz tick only touches containers that
+// actually changed — an unchanged upgrade is a wasted bridge call. (The
+// direction indicator does its own diffing behind its interface.)
+let finderShown: { main: string; foot: string } | null = null;
+
+// The arrow, behind a swappable interface: the glyph renderer ships now and
+// stays as the fallback; an image-container renderer (large arrow in a circle)
+// drops in here once the hot-swap spike says whether that's viable.
+const directionIndicator = createGlyphIndicator(upgradeText);
+
+function finderPage(content: { main: string; foot: string }) {
+  const cell = (
+    ids: { containerID: number; containerName: string },
+    y: number,
+    height: number,
+    text: string,
+  ) =>
+    new TextContainerProperty({
+      xPosition: 0,
+      yPosition: y,
+      width: 576,
+      height,
+      borderWidth: 0,
+      borderColor: 0,
+      paddingLength: HUD_PADDING,
+      ...ids,
+      content: text,
+      isEventCapture: 0,
+    });
+
+  const direction = directionIndicator.containers();
+  return {
+    containerTotalNum: 3 + direction.count,
+    textObject: [
+      new TextContainerProperty({
+        xPosition: 0,
+        yPosition: 0,
+        width: 576,
+        height: 288,
+        borderWidth: 0,
+        borderColor: 0,
+        paddingLength: 0,
+        ...FINDER_CONTAINER,
+        content: " ",
+        isEventCapture: 1,
+      }),
+      ...direction.textObject,
+      cell(FINDER_MAIN_CONTAINER, FINDER_MAIN_Y, FINDER_MAIN_H, content.main),
+      cell(FINDER_FOOT_CONTAINER, FINDER_FOOT_Y, FINDER_FOOT_H, content.foot),
+    ],
+    ...(direction.imageObject?.length
+      ? { imageObject: direction.imageObject }
+      : {}),
+  };
+}
+
+function carPosition() {
+  const lat = lastStatus?.latitude;
+  const lon = lastStatus?.longitude;
+  return lat != null && lon != null ? { lat, lon } : null;
+}
+
+/** Build the current finder strings. Crash-safe like every other formatter
+ *  here: a maths bug must still leave a readable screen with a way out. */
+function finderContent() {
+  try {
+    const v = finderView({
+      car: carPosition(),
+      fix: finderFix,
+      course: finderCourse.course(Date.now()),
+      now: Date.now(),
+      unit: lastStatus?.range_unit ?? null,
+      parkedAt: lastStatus?.location_last_updated ?? null,
+      prevOctant: finderOctant,
+      problem: finderProblem,
+    });
+    finderOctant = v.octant;
+    return {
+      arrived: v.mode === "arrived",
+      octant: v.octant,
+      content: formatFinder(v),
+    };
+  } catch (err) {
+    recordError("render/finder", err);
+    return {
+      arrived: false,
+      octant: null,
+      content: formatFinder({
+        mode: "problem",
+        arrow: null,
+        headline: "Finder unavailable",
+        detail: SAFE_NOTE,
+        hint: "Tap: back · 2x tap: close app",
+        octant: null,
+      }),
+    };
+  }
+}
+
+async function renderFinder() {
+  if (backgrounded || view !== "finder") return;
+  // Entered before the car reported a position, and a later poll has now
+  // supplied one: this is the point where asking for GPS finally makes sense.
+  if (carPosition() && !finderWatch && finderTick) startFinderWatch();
+  const { arrived, octant, content } = finderContent();
+  await directionIndicator.update(octant);
+  if (content.main !== finderShown?.main) {
+    await upgradeText(FINDER_MAIN_CONTAINER, content.main);
+  }
+  if (content.foot !== finderShown?.foot) {
+    await upgradeText(FINDER_FOOT_CONTAINER, content.foot);
+  }
+  finderShown = content;
+
+  // Arrival ends the feature: the job is done, so the watcher stops right
+  // here (not on the way out) and the screen holds briefly before returning
+  // to the HUD. No other state has a timeout — nothing yanks the user back
+  // mid-walk.
+  if (arrived) {
+    stopFinderWatch("arrived");
+    finderArrival = setTimeout(() => {
+      finderArrival = null;
+      if (view === "finder" && !backgrounded) void showHud();
+    }, ARRIVAL_HOLD_MS);
+  }
+}
+
+/** The one place the GPS watch and its timers are torn down. Every exit path
+ *  — finder exit, arrival, foreground exit, system exit — calls this, and the
+ *  watch logs a line when it stops (handoff §4.6). */
+function stopFinderWatch(reason: string) {
+  if (finderWatch) {
+    finderWatch.stop(reason);
+    finderWatch = null;
+  }
+  if (finderTick) clearInterval(finderTick);
+  finderTick = null;
+  if (finderArrival) clearTimeout(finderArrival);
+  finderArrival = null;
+}
+
+function startFinderWatch() {
+  stopFinderWatch("restart");
+  // The 1 Hz repaint runs regardless: it is what lets the course go stale, and
+  // what notices a car position arriving on a later poll.
+  finderTick = setInterval(() => void renderFinder(), FINDER_TICK_MS);
+  // No car position ⇒ nothing to compute a bearing to, so don't ask for the
+  // location permission at all. Prompting for a sensor we can't use yet is a
+  // bad trade; the screen already explains what's missing, and the tick above
+  // starts the watch the moment coordinates turn up.
+  if (!carPosition()) return;
+  finderWatch = startPositionWatch(
+    {
+      onFix(fix) {
+        // A fix too vague to trust is worse than no fix: it would move the
+        // distance around by tens of metres and invent a course out of noise.
+        if (!isUsableFix(fix)) return;
+        finderProblem = null;
+        finderFix = fix;
+        finderCourse.push(fix);
+        void renderFinder();
+      },
+      onProblem(problem) {
+        finderProblem = problem;
+        void renderFinder();
+      },
+    },
+    carPosition(),
+  );
+}
+
+async function enterFinder() {
+  view = "finder";
+  finderFix = null;
+  finderProblem = null;
+  finderOctant = null;
+  finderShown = null;
+  finderCourse.reset();
+  directionIndicator.reset();
+  // Paint the first frame ("Locating…", or the explanation if the car never
+  // reported a position) before asking for GPS — the permission prompt can
+  // take seconds and the glasses must not sit blank behind it.
+  const { content } = finderContent();
+  finderShown = content;
+  await enqueue(() =>
+    bridge.rebuildPageContainer(new RebuildPageContainer(finderPage(content))),
+  );
+  startFinderWatch();
+}
+
+function exitFinder() {
+  stopFinderWatch("finder exit");
+  return showHud();
+}
+
+// ---------------------------------------------------------------------------
 // Status polling (cached backend state only — no force refresh on glasses)
 
 /** Record the last error for the diagnostics report. The `endpoint` is a
@@ -464,7 +706,11 @@ async function renderCurrent(note = "") {
   // Backgrounded: the page isn't on the glasses; FOREGROUND_ENTER re-polls.
   if (backgrounded) return;
   try {
-    if (view === "hud") {
+    if (view === "finder") {
+      // A fresh status can carry a newer car position; the finder recomputes
+      // from lastStatus on every render, so there is nothing else to do.
+      await renderFinder();
+    } else if (view === "hud") {
       await updateHud(note);
     } else if (sameMenu(buildMenuItems(lastStatus, settings), menuItems)) {
       await updateMenuInfo(
@@ -490,7 +736,7 @@ async function pollStatus(note = "") {
   }
   try {
     lastStatus = await client.getStatus();
-    updateChargeLimitsVisibility();
+    applyPowertrain(lastStatus);
     await renderCurrent(note);
   } catch (err) {
     // 409 mid-session = device token expired. Clear it so the phone-side
@@ -506,15 +752,42 @@ async function pollStatus(note = "") {
   }
 }
 
-// Phone settings: charge-limit preferences make no sense on a car that
-// can't plug in. Hidden only on a positive non-plug classification —
-// EV/PHEV/UNKNOWN (or no data yet) keep the section, so existing EV users
-// and older proxies (no powertrain field) see no change.
-function updateChargeLimitsVisibility() {
+// Phone settings: show/hide form sections from the persisted powertrain
+// (chargeLimitsRelevant in settings.ts holds the rule). Reads settings, not
+// a live status, so the form is right on open before any fetch.
+function renderPowertrainForm() {
   const el = document.getElementById("charge-limits-section");
   if (!el) return;
-  const pt = lastStatus?.powertrain;
-  el.style.display = pt === "HEV" || pt === "ICE" ? "none" : "";
+  const show = chargeLimitsRelevant(
+    settings.lastPowertrain,
+    settings.lastPowertrainFuelOnly,
+  );
+  el.style.display = show ? "" : "none";
+  console.debug(
+    `powertrain form: ${settings.lastPowertrain ?? "none"}` +
+      `${settings.lastPowertrainFuelOnly ? " (fuel-only)" : ""} → charge limits ${show ? "shown" : "hidden"}`,
+  );
+}
+
+// Evaluate the powertrain from any successful status fetch (glasses poll,
+// launch connect, or the phone Test connection), persist it when it changed,
+// and re-render the form. A status without the powertrain field (older
+// proxy) keeps the last-known classification rather than resetting it.
+function applyPowertrain(status: VehicleStatus | null) {
+  const pt = status?.powertrain;
+  if (typeof pt === "string" && status) {
+    const fuelOnly =
+      status.fuel_level_percent != null && status.soc_percent == null;
+    if (
+      settings.lastPowertrain !== pt ||
+      settings.lastPowertrainFuelOnly !== fuelOnly
+    ) {
+      settings.lastPowertrain = pt;
+      settings.lastPowertrainFuelOnly = fuelOnly;
+      void enqueue(() => saveSettings(bridge as Bridge, settings));
+    }
+  }
+  renderPowertrainForm();
 }
 
 function scheduleRepoll(delayMs: number) {
@@ -568,7 +841,7 @@ async function connectToBackend() {
     const status = await client.getStatus();
     if (gen !== connectGen) return; // superseded or backgrounded mid-flight
     lastStatus = status;
-    updateChargeLimitsVisibility();
+    applyPowertrain(status);
     stopSpinner();
     await showHud();
   } catch (err) {
@@ -604,6 +877,12 @@ async function selectMenuItem(index: number) {
 
   if (item.key === "hud") {
     await showHud();
+    return;
+  }
+  if (item.key === "finder") {
+    // No backend needed — the car position is already in lastStatus and the
+    // rest is on-device maths.
+    await enterFinder();
     return;
   }
   if (item.key === "quit") {
@@ -716,13 +995,21 @@ function subscribeEvents() {
       if (repollTimer) clearTimeout(repollTimer);
       stopSpinner();
       clearNoteTimer();
+      // The app is going away with the GPS watch possibly still running —
+      // this is the path that would otherwise leak it into the user's pocket.
+      stopFinderWatch("system exit");
       unsubscribe();
       return;
     }
 
     if (sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
       backgrounded = false;
-      if (view === "connect") {
+      if (view === "finder") {
+        // The watch was stopped on the way out; resume it and repaint from
+        // whatever the last status said.
+        startFinderWatch();
+        void renderFinder();
+      } else if (view === "connect") {
         // Restart the attempt outright: a fetch suspended mid-flight may never
         // settle, and the old attempt was invalidated on FOREGROUND_EXIT — a
         // resume must never leave an indefinite spinner. (Unconfigured just
@@ -745,6 +1032,9 @@ function subscribeEvents() {
       if (repollTimer) clearTimeout(repollTimer);
       repollTimer = null;
       clearNoteTimer();
+      // GPS is the expensive one: a watch left running while the phone is in
+      // a pocket is a battery complaint. FOREGROUND_ENTER restarts it.
+      stopFinderWatch("foreground exit");
       return;
     }
 
@@ -763,6 +1053,18 @@ function subscribeEvents() {
         textType === OsEventTypeList.CLICK_EVENT)
     ) {
       if (client && connectState === "failed") void connectToBackend();
+      return;
+    }
+
+    // Finder: single tap goes back to the HUD (and stops the GPS watch).
+    // Double-tap is the system exit dialog, handled above with everywhere
+    // else that isn't the HUD.
+    if (
+      view === "finder" &&
+      (sysType === OsEventTypeList.CLICK_EVENT ||
+        textType === OsEventTypeList.CLICK_EVENT)
+    ) {
+      void exitFinder();
       return;
     }
 
@@ -802,6 +1104,10 @@ function bindPhoneUi() {
     "test-status",
   ) as HTMLParagraphElement;
   const tempEl = document.getElementById("climate-temp") as HTMLInputElement;
+  const tempUnitEl = document.getElementById("temp-unit") as HTMLSelectElement;
+  const tempLabelEl = document.getElementById(
+    "climate-temp-label",
+  ) as HTMLLabelElement;
   const defrostEl = document.getElementById(
     "climate-defrost",
   ) as HTMLInputElement;
@@ -819,6 +1125,35 @@ function bindPhoneUi() {
     "save-status",
   ) as HTMLParagraphElement;
 
+  // The unit currently on screen. `climateTemp` is Celsius no matter what
+  // this says — only the input, its bounds and the label follow it.
+  let tempUnit: TempUnit = resolveTempUnit(settings);
+  // Once the user picks a unit themselves we stop inferring it from the
+  // region, so choosing Celsius in the US survives a later region edit.
+  let tempUnitExplicit = settings.tempUnit != null;
+
+  // Retarget the input at `unit`, carrying whatever is currently typed across
+  // the conversion (it's read back in `prev`, the unit it was entered in) so
+  // an unsaved edit isn't lost by flipping the toggle.
+  function applyTempUnit(unit: TempUnit, prev: TempUnit) {
+    const canonicalC = toCanonicalC(parseFloat(tempEl.value), prev);
+    tempUnit = unit;
+    tempUnitEl.value = unit;
+    const field = tempFieldState(canonicalC, unit);
+    // Bounds before value: assigning a Fahrenheit value while the Celsius
+    // max is still in place would let the browser clamp it.
+    tempEl.min = field.min;
+    tempEl.max = field.max;
+    tempEl.step = field.step;
+    tempEl.value = field.value;
+    tempLabelEl.textContent = field.label;
+  }
+
+  tempUnitEl.addEventListener("change", () => {
+    tempUnitExplicit = true;
+    applyTempUnit(tempUnitEl.value as TempUnit, tempUnit);
+  });
+
   for (const region of REGIONS) {
     regionEl.add(new Option(region.label, String(region.code)));
   }
@@ -834,11 +1169,17 @@ function bindPhoneUi() {
   passwordEl.value = settings.password;
   pinEl.value = settings.pin;
   regionEl.value = String(settings.region);
+  // Seed the field in Celsius (the stored unit), then let applyTempUnit
+  // convert it into whatever the user should see.
   tempEl.value = String(settings.climateTemp);
+  applyTempUnit(resolveTempUnit(settings), "C");
   defrostEl.checked = settings.climateDefrost;
   heatingEl.checked = settings.climateHeating;
   acEl.value = String(settings.chargeLimitAc);
   dcEl.value = String(settings.chargeLimitDc);
+  // Sections reflect the persisted powertrain immediately — no waiting for
+  // a fetch to stop showing an EV form to a fuel car.
+  renderPowertrainForm();
 
   // Client built from the current field values (not saved state) so users
   // can test before saving. Null until username + password are filled in.
@@ -885,6 +1226,9 @@ function bindPhoneUi() {
       }
       try {
         const status = await probe.getStatus();
+        // A successful phone-side fetch is as good as a glasses poll for
+        // learning what the car is — adapt the form right away.
+        applyPowertrain(status);
         // Describe whichever energy figure the car actually reports — a
         // hybrid answering "battery ?%" would read as a broken connection.
         const figure =
@@ -893,7 +1237,15 @@ function bindPhoneUi() {
             : status.fuel_level_percent != null
               ? `fuel ${status.fuel_level_percent}%`
               : "limited data";
-        setStatus(testStatus, `Connected. Car responded (${figure}).`);
+        // Success proves the form's details work — persist them now rather
+        // than trusting the user to also tap Save.
+        const saved = await persistForm();
+        setStatus(
+          testStatus,
+          `Connected. Car responded (${figure}).` +
+            (saved ? " Details saved." : " Auto-save failed — tap Save."),
+          !saved,
+        );
       } catch (err) {
         recordError("test/status", err);
         if (err instanceof ApiError && err.status === 409) {
@@ -972,6 +1324,14 @@ function bindPhoneUi() {
     setStatus(enrollStatus, "");
   }
 
+  // Selecting USA switches the display to Fahrenheit (and back out of it),
+  // but only while the user hasn't overridden the unit themselves.
+  regionEl.addEventListener("change", () => {
+    if (tempUnitExplicit) return;
+    const inferred: TempUnit = Number(regionEl.value) === 3 ? "F" : "C";
+    if (inferred !== tempUnit) applyTempUnit(inferred, tempUnit);
+  });
+
   // Show/hide on region change — enrollment is only for Kia + US.
   regionEl.addEventListener("change", () => {
     if (needsEnrollment()) {
@@ -1001,12 +1361,19 @@ function bindPhoneUi() {
         enrollNotifyType.value as "EMAIL" | "SMS",
       );
       if (result.enrolled && result.device_token) {
-        // Already trusted — no OTP needed.
+        // Already trusted — no OTP needed. Persist the whole form with the
+        // token: the token was minted for these credentials, and saving
+        // only the token used to strand unsaved credentials.
         settings.kiaUsDeviceToken = result.device_token;
-        rebuildClient();
-        await enqueue(() => saveSettings(bridge as Bridge, settings));
-        setStatus(enrollStatus, "Device already trusted. Saved.");
-        hideEnrollSection();
+        const ok = await persistForm(true);
+        setStatus(
+          enrollStatus,
+          ok
+            ? "Device already trusted. Details saved."
+            : "Device trusted but save failed. Tap Save.",
+          !ok,
+        );
+        if (ok) hideEnrollSection();
       } else if (result.destinations) {
         const dest =
           enrollNotifyType.value === "EMAIL"
@@ -1047,13 +1414,16 @@ function bindPhoneUi() {
     setStatus(enrollStatus, "Verifying...");
     try {
       const result = await enrollClient.enrollVerify(code);
+      // Persist the whole form, not just the token: enrolling before Save
+      // used to leave the credentials unsaved — and a later Save then wiped
+      // the fresh token via the username-change rule (saved username was
+      // still empty), forcing a re-enrolment.
       settings.kiaUsDeviceToken = result.device_token;
-      rebuildClient();
-      const ok = await enqueue(() => saveSettings(bridge as Bridge, settings));
+      const ok = await persistForm(true);
       if (ok) {
         setStatus(
           enrollStatus,
-          "Device enrolled and saved. Tap Test connection to verify.",
+          "Device enrolled and details saved. Tap Test connection to verify.",
         );
         // Reset UI: hide enrollment, show success
         enrollStartArea.style.display = "";
@@ -1216,13 +1586,24 @@ function bindPhoneUi() {
     }
   });
 
-  saveBtn.addEventListener("click", async () => {
-    const temp = parseFloat(tempEl.value);
+  // The one save routine: persists the current form to bridge storage.
+  // Shared by the Save button and the auto-save-on-success paths (Test
+  // connection, OTP enrolment) — the tester lost his credentials because
+  // testing and enrolling before ever tapping Save persisted nothing.
+  //
+  // tokenFromForm: the device token now in `settings` was just minted with
+  // the form's credentials (enrolment paths), so skip the username-change
+  // wipe — that rule exists to kill a stored token belonging to a
+  // previously saved, different account.
+  async function persistForm(tokenFromForm = false): Promise<boolean> {
+    // Read in whatever unit is on screen; store Celsius. Clamping and the
+    // 0.5°C snap live in toCanonicalC.
+    const temp = toCanonicalC(parseFloat(tempEl.value), tempUnit);
     // Different username ⇒ different account ⇒ old device token is stale.
     const usernameChanged =
       usernameEl.value.trim().toLowerCase() !==
       settings.username.trim().toLowerCase();
-    if (usernameChanged && settings.kiaUsDeviceToken) {
+    if (!tokenFromForm && usernameChanged && settings.kiaUsDeviceToken) {
       delete settings.kiaUsDeviceToken;
       if (needsEnrollment()) showEnrollSection();
     }
@@ -1231,7 +1612,11 @@ function bindPhoneUi() {
       password: passwordEl.value,
       pin: pinEl.value.trim(),
       region: Number(regionEl.value),
-      climateTemp: isNaN(temp) ? 21 : Math.min(30, Math.max(14, temp)),
+      climateTemp: temp,
+      // Persist the unit only once it's been chosen deliberately — leaving it
+      // undefined keeps the region inference live for users who never touch
+      // the toggle.
+      ...(tempUnitExplicit ? { tempUnit } : {}),
       climateDefrost: defrostEl.checked,
       climateHeating: heatingEl.checked,
       chargeLimitAc: Number(acEl.value),
@@ -1243,10 +1628,13 @@ function bindPhoneUi() {
       ...(settings.kiaUsDeviceToken
         ? { kiaUsDeviceToken: settings.kiaUsDeviceToken }
         : {}),
+      // The powertrain memory belongs to the car, not the form — carry it
+      // across saves.
+      lastPowertrain: settings.lastPowertrain,
+      lastPowertrainFuelOnly: settings.lastPowertrainFuelOnly,
     };
     rebuildClient();
     const ok = await enqueue(() => saveSettings(bridge as Bridge, settings));
-    setStatus(saveStatus, ok ? "Saved." : "Save failed. Try again.", !ok);
     if (ok) guideEl.open = !isConfigured(settings);
     // Still on the connect page (first run: user just typed the account
     // details the connect attempt was missing) → restart the connect with the
@@ -1257,6 +1645,12 @@ function bindPhoneUi() {
     } else {
       void pollStatus();
     }
+    return ok;
+  }
+
+  saveBtn.addEventListener("click", async () => {
+    const ok = await persistForm();
+    setStatus(saveStatus, ok ? "Saved." : "Save failed. Try again.", !ok);
   });
 }
 

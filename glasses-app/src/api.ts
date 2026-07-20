@@ -20,9 +20,14 @@ export interface VehicleStatus {
   charge_eta_minutes?: number | null
   climate_on?: boolean | null
   doors_open?: string[] | null
-  // Car position — returned by the backend; no glasses UI consumes it yet.
+  // Car position — consumed by the "Find my car" finder mode.
   latitude?: number | null
   longitude?: number | null
+  /** When the car last reported that position — drives "parked 2h ago".
+   *  Absent from an older proxy, in which case the finder omits the age
+   *  line rather than guessing from last_updated (a car parked hours ago
+   *  still refreshes its status). */
+  location_last_updated?: string | null
   last_updated?: string | null
   charge_limit_ac?: number | null
   charge_limit_dc?: number | null

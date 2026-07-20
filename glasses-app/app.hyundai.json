@@ -1,8 +1,8 @@
 {
-  "package_id": "com.jackberry.genesisremote",
+  "package_id": "com.jackberry.hyundairemote",
   "edition": "202601",
-  "name": "Genesis Remote",
-  "version": "1.3.0",
+  "name": "Hyundai Remote",
+  "version": "1.0.0",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",

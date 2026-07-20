@@ -3,16 +3,20 @@
  *  Statuses here mirror what the proxy actually sends per powertrain
  *  (backend/tests/test_powertrain.py is the other half of the contract). */
 
+import { getTextWidth } from "@evenrealities/pretext";
 import { describe, expect, it } from "vitest";
 
 import type { VehicleStatus } from "./api";
 import {
+  arrowCell,
   buildMenuItems,
+  formatFinder,
   formatHudBottom,
   formatHudRow,
   formatMenuInfo,
   hasEnergyData,
 } from "./display";
+import type { FinderView } from "./finder";
 import { DEFAULT_SETTINGS } from "./settings";
 
 const EV: VehicleStatus = {
@@ -212,5 +216,123 @@ describe("formatMenuInfo", () => {
     const info = formatMenuInfo(PHEV);
     expect(info).toContain("25 mi  55%");
     expect(info).toContain("Fuel 60% · 340mi");
+  });
+});
+
+describe("buildMenuItems climate temperature unit", () => {
+  const climateLabel = (s: Partial<typeof DEFAULT_SETTINGS>) =>
+    buildMenuItems(EV, { ...DEFAULT_SETTINGS, ...s }).find(
+      (i) => i.key === "climateOn",
+    )?.label;
+
+  it("shows Celsius by default, unchanged from before the toggle", () => {
+    expect(climateLabel({ climateTemp: 21 })).toBe("Climate on (21°C)");
+    expect(climateLabel({ climateTemp: 22.5 })).toBe("Climate on (22.5°C)");
+  });
+
+  it("shows Fahrenheit when the user chose it", () => {
+    expect(climateLabel({ climateTemp: 21, tempUnit: "F" })).toBe(
+      "Climate on (70°F)",
+    );
+  });
+
+  it("follows the US region when no unit was chosen", () => {
+    expect(climateLabel({ climateTemp: 21, region: 3 })).toBe(
+      "Climate on (70°F)",
+    );
+    expect(climateLabel({ climateTemp: 21, region: 1 })).toBe(
+      "Climate on (21°C)",
+    );
+  });
+
+  it("keeps the unit alongside the defrost suffix", () => {
+    expect(
+      climateLabel({ climateTemp: 21, tempUnit: "F", climateDefrost: true }),
+    ).toBe("Climate on (70°F +defrost)");
+  });
+
+  it("truncates defrost+heat at the same point in either unit", () => {
+    // Pre-existing pxTruncate behaviour, not a unit problem: the label is
+    // already too wide for MENU_ITEM_MAX_PX with both suffixes. "°F" and "°C"
+    // are the same width, so the toggle must not move where it cuts.
+    const both = { climateTemp: 21, climateDefrost: true, climateHeating: true };
+    expect(climateLabel({ ...both, tempUnit: "C" })).toBe(
+      "Climate on (21°C +defrost ...",
+    );
+    expect(climateLabel({ ...both, tempUnit: "F" })).toBe(
+      "Climate on (70°F +defrost ...",
+    );
+  });
+});
+
+describe("car finder menu item", () => {
+  const items = (s: VehicleStatus | null) =>
+    buildMenuItems(s, DEFAULT_SETTINGS).map((i) => i.key);
+
+  it("offers Find my car when the car reported where it is", () => {
+    expect(items({ ...EV, latitude: 51.5072, longitude: -0.1276 })).toContain(
+      "finder",
+    );
+  });
+
+  it("still offers it when the car has not reported a position", () => {
+    // Deliberately unlike the charge actions. A missing position is transient
+    // — asleep car, stale cache, no status yet — so the item must not come and
+    // going with it (that reads as a bug). Entering reaches the finder's
+    // "Car position unknown" state, which explains itself.
+    expect(items(EV)).toContain("finder");
+    expect(items({ ...EV, latitude: 51.5072 })).toContain("finder"); // half a fix
+    expect(items(null)).toContain("finder");
+  });
+
+  it("offers it for a fuel car too — the finder is powertrain-independent", () => {
+    expect(items({ ...HEV, latitude: 51.5072, longitude: -0.1276 })).toContain(
+      "finder",
+    );
+  });
+
+  it("keeps it out of the way of the everyday commands", () => {
+    // The selector lands at the top of the list; lock/climate are the daily
+    // actions and Find my car is occasional, so it sits below them. This also
+    // pins the item's index, which the QA walkthrough depends on.
+    const keys = items({ ...EV, latitude: 51.5072, longitude: -0.1276 });
+    expect(keys.indexOf("finder")).toBeGreaterThan(keys.indexOf("lock"));
+    expect(keys.indexOf("finder")).toBeLessThan(keys.indexOf("refresh"));
+  });
+});
+
+describe("formatFinder", () => {
+  const view = (over: Partial<FinderView> = {}): FinderView => ({
+    mode: "walking",
+    arrow: "↑",
+    headline: "140m",
+    detail: "",
+    hint: "Tap: back",
+    octant: 0,
+    ...over,
+  });
+
+  it("centres the arrow by measuring the glyph, not by a fixed offset", () => {
+    // The arrow set is not monospace: → and ← are 272 units, the diagonals
+    // 224. A fixed x-position twitches ~3px every time the direction crosses
+    // between a cardinal and a diagonal — constantly, while walking.
+    expect(getTextWidth(arrowCell("→"))).toBeCloseTo(
+      getTextWidth(arrowCell("↗")),
+      -1,
+    );
+  });
+
+  it("blanks the arrow cell rather than collapsing it", () => {
+    // The container keeps its row so the headline never jumps as the user
+    // starts and stops walking.
+    expect(arrowCell(null)).toBe(" ");
+  });
+
+  it("always renders a hint, so no finder state is a blank screen", () => {
+    const out = formatFinder(
+      view({ mode: "problem", arrow: null, headline: "No GPS signal", detail: "a\nb" }),
+    );
+    expect(out.main.trim()).toBe("No GPS signal");
+    expect(out.foot).toContain("Tap: back");
   });
 });

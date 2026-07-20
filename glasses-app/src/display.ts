@@ -2,7 +2,9 @@ import { getTextWidth, pxTruncate } from "@evenrealities/pretext";
 
 import type { VehicleStatus } from "./api";
 import { BRAND } from "./brand";
+import type { FinderView } from "./finder";
 import type { AppSettings } from "./settings";
+import { formatTemp, resolveTempUnit } from "./settings";
 
 // Two-layer UI on the 576x288 canvas:
 //   Layer 1 (HUD)  — one justified status row on top, charging/notes
@@ -21,6 +23,22 @@ export const CONNECT_CONTAINER = { containerID: 6, containerName: "connect" };
 export const CONNECT_SPIN_CONTAINER = {
   containerID: 7,
   containerName: "connectspin",
+};
+//   Layer 3 (finder) — "Find my car": an arrow cell, a headline, and a footer
+//                      block, each at a fixed y so nothing reflows when the
+//                      arrow appears and disappears mid-walk.
+export const FINDER_CONTAINER = { containerID: 8, containerName: "finder" };
+export const FINDER_ARROW_CONTAINER = {
+  containerID: 9,
+  containerName: "finderarrow",
+};
+export const FINDER_MAIN_CONTAINER = {
+  containerID: 10,
+  containerName: "findermain",
+};
+export const FINDER_FOOT_CONTAINER = {
+  containerID: 11,
+  containerName: "finderfoot",
 };
 
 // Geometry shared with main.ts. Sidebar is wide enough for the longest item
@@ -86,6 +104,7 @@ function centerBlock(text: string, innerW: number): string {
 
 export type MenuKey =
   | "hud"
+  | "finder"
   | "refresh"
   | "lock"
   | "unlock"
@@ -112,9 +131,9 @@ export function buildMenuItems(
   const unlock: MenuItem = { key: "unlock", label: "Unlock" };
   const climateOn: MenuItem = {
     key: "climateOn",
-    label: `Climate on (${s.climateTemp}°C${s.climateDefrost ? " +defrost" : ""}${
-      s.climateHeating ? " +heat" : ""
-    })`,
+    label: `Climate on (${formatTemp(s.climateTemp, resolveTempUnit(s))}${
+      s.climateDefrost ? " +defrost" : ""
+    }${s.climateHeating ? " +heat" : ""})`,
   };
   const climateOff: MenuItem = { key: "climateOff", label: "Climate off" };
   const chargeStart: MenuItem = { key: "chargeStart", label: "Start charging" };
@@ -138,6 +157,13 @@ export function buildMenuItems(
   if (charging != null && pt !== "HEV" && pt !== "ICE") {
     items.push(charging ? chargeStop : chargeStart);
   }
+
+  // Always offered, unlike the charging actions above — and deliberately so.
+  // A missing car position is transient (asleep car, stale cache, a status
+  // that hasn't landed yet), where charge actions on an ICE are permanently
+  // inapplicable. An item that comes and goes reads as a bug; the finder's
+  // "Car position unknown" state explains itself and is the better answer.
+  items.push({ key: "finder", label: "Find my car" });
 
   // Cached /status only — force refresh is deliberately not on the glasses.
   const updated = timeOf(status?.last_updated ?? null);
@@ -296,6 +322,55 @@ export function formatConnectFail(
   hint = "Tap to retry · double-tap to exit",
 ): string {
   return centerBlock(`${message}\n${hint}`, HUD_INNER_W);
+}
+
+// ---------------------------------------------------------------------------
+// Car finder screen. finder.ts decides *what* it says; this decides where the
+// characters land.
+
+// Fixed geometry: the arrow cell keeps its own row whether or not there's an
+// arrow in it, so the headline never jumps as the user starts and stops
+// walking.
+export const FINDER_ARROW_Y = 36;
+export const FINDER_ARROW_H = 72;
+export const FINDER_MAIN_Y = 108;
+export const FINDER_MAIN_H = 48;
+export const FINDER_FOOT_Y = 160;
+export const FINDER_FOOT_H = 128;
+
+export interface FinderContent {
+  main: string;
+  foot: string;
+}
+
+/**
+ * The finder's text containers. The direction indicator is NOT here — it is
+ * behind the DirectionIndicator interface in direction.ts, so the glyph
+ * renderer can be swapped for an image-container one without touching this.
+ */
+export function formatFinder(view: FinderView): FinderContent {
+  const footLines: string[] = [];
+  if (view.detail) footLines.push(view.detail);
+  footLines.push("");
+  footLines.push(view.hint);
+  return {
+    main: centerBlock(view.headline, HUD_INNER_W),
+    foot: centerBlock(footLines.join("\n"), HUD_INNER_W),
+  };
+}
+
+/**
+ * A single arrow glyph, centred by measuring the glyph itself rather than by
+ * a fixed offset: the arrow set is not monospace (→ and ← are 272 units, the
+ * six diagonals and verticals 224), so a fixed x-position visibly twitches
+ * ~3px every time the direction crosses between a cardinal and a diagonal —
+ * which is constantly, while walking. Measuring costs nothing and removes the
+ * tell entirely. A blank (never an empty string) keeps the row's height so
+ * the headline below it doesn't jump.
+ */
+export function arrowCell(glyph: string | null): string {
+  if (!glyph) return " ";
+  return padSpaces((HUD_INNER_W - getTextWidth(glyph)) / 2) + glyph;
 }
 
 // Right-hand info panel of the menu: compact status + feedback line.

@@ -2,7 +2,7 @@
   "package_id": "com.jackberry.kiaremote",
   "edition": "202601",
   "name": "Kia Remote",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",
@@ -18,6 +18,10 @@
         "https://github.com",
         "https://github.com/jack-berry/connect-remote#readme"
       ]
+    },
+    {
+      "name": "location",
+      "desc": "Used only by \"Find my car\": reads this phone's position to show the direction and distance to where your car last reported it parked. The calculation happens entirely on this phone - your location is never sent to any server and is not stored, and is read only while the finder is open."
     }
   ],
   "supported_languages": [
