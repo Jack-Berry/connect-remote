@@ -1,8 +1,11 @@
 """Shape capture: names + types only, never values — asserted, not assumed."""
 
 import json
+import logging
+import os
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 from hyundai_kia_connect_api.Vehicle import Vehicle
 
@@ -66,6 +69,65 @@ def test_hostile_vehicle_never_raises():
     store = ShapeStore()
     store.record("Kia", "USA", "EV", 42)  # no __dict__, not a dataclass
     assert store.snapshot() == {}
+
+
+# ---------------------------------------------------------------------------
+# Persistence failure modes — the prod incident class (16–19 Jul: root-owned
+# /data, every dump EACCES, three days of silent memory-only capture).
+
+
+def test_unwritable_dir_reproduces_prod_eacces(tmp_path, caplog):
+    """The actual droplet condition: directory exists, not writable by us —
+    open(.tmp) fails EACCES. Boot must announce DEGRADED; record must keep
+    capturing in memory without raising."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permissions")
+    data = tmp_path / "data"
+    data.mkdir()
+    data.chmod(0o555)  # r-x: what a root-owned volume looks like to appuser
+    try:
+        with caplog.at_level(logging.INFO, logger="app.shape_capture"):
+            store = ShapeStore(str(data / "shapes.json"))
+        assert "persistence DEGRADED" in caplog.text
+        store.record("Kia", "USA", "HEV", SimpleNamespace(fuel_level=27))
+        assert store.snapshot() == {"Kia:USA:HEV": {"fuel_level": "int"}}
+        assert not (data / "shapes.json").exists()
+    finally:
+        data.chmod(0o755)
+
+
+def test_writable_dir_logs_active_and_leaves_no_probe(tmp_path, caplog):
+    path = tmp_path / "shapes.json"
+    with caplog.at_level(logging.INFO, logger="app.shape_capture"):
+        ShapeStore(str(path))
+    assert "persistence ACTIVE" in caplog.text
+    assert list(tmp_path.iterdir()) == []  # probe removed, nothing else written
+
+
+def test_no_path_logs_memory_only(caplog):
+    with caplog.at_level(logging.INFO, logger="app.shape_capture"):
+        ShapeStore()
+    assert "memory-only" in caplog.text
+
+
+def test_corrupt_file_quarantined_then_capture_continues(tmp_path):
+    path = tmp_path / "shapes.json"
+    path.write_text("{definitely not json", encoding="utf-8")
+    store = ShapeStore(str(path))
+    # Boot survived, bad bytes preserved aside, live file gone until re-dump.
+    assert store.snapshot() == {}
+    assert (tmp_path / "shapes.json.corrupt").read_text() == "{definitely not json"
+    assert not path.exists()
+    store.record("Kia", "USA", "EV", SimpleNamespace(a=1))
+    assert json.loads(path.read_text()) == {"Kia:USA:EV": {"a": "int"}}
+
+
+def test_non_object_json_treated_as_corrupt(tmp_path):
+    path = tmp_path / "shapes.json"
+    path.write_text("[1, 2, 3]", encoding="utf-8")
+    store = ShapeStore(str(path))
+    assert store.snapshot() == {}
+    assert (tmp_path / "shapes.json.corrupt").exists()
 
 
 # ---------------------------------------------------------------------------

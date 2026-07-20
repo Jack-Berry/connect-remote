@@ -33,18 +33,55 @@ class ShapeStore:
         # key "Brand:Region:POWERTRAIN" -> {field_name: type_name}
         self._shapes: dict[str, dict[str, str]] = {}
         self._load()
+        self._check_persistence()
 
     def _load(self) -> None:
         if not self._path or not os.path.exists(self._path):
             return
         try:
             with open(self._path, encoding="utf-8") as f:
-                self._shapes = json.load(f)
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                raise ValueError(f"expected a JSON object, got {type(loaded).__name__}")
+            self._shapes = loaded
             logger.info(
                 "shape capture: loaded %d shapes from %s", len(self._shapes), self._path
             )
-        except (OSError, ValueError) as exc:
+        except ValueError as exc:
+            # Corrupt file: set it aside rather than leaving it in place for
+            # the next dump to silently overwrite — the bytes may still be
+            # recoverable, and the rename makes the incident visible.
+            quarantine = self._path + ".corrupt"
+            logger.warning(
+                "shape capture: corrupt %s (%s) — quarantining to %s",
+                self._path, exc, quarantine,
+            )
+            try:
+                os.replace(self._path, quarantine)
+            except OSError as exc2:
+                logger.warning("shape capture: could not quarantine: %s", exc2)
+        except OSError as exc:
             logger.warning("shape capture: could not load %s: %s", self._path, exc)
+
+    def _check_persistence(self) -> None:
+        """One unmissable boot line: is capture persistence actually working?
+        Prod wrote nothing 16–19 Jul (root-owned volume, every dump EACCES)
+        while in-memory capture kept the logs looking healthy. Never raises —
+        a failed probe must not stop startup, only announce degradation."""
+        if not self._path:
+            logger.info("shape capture: memory-only (SHAPE_CAPTURE_PATH unset)")
+            return
+        try:
+            probe = self._path + ".probe"
+            with open(probe, "w", encoding="utf-8"):
+                pass
+            os.remove(probe)
+            logger.info("shape capture persistence ACTIVE: %s", self._path)
+        except OSError as exc:
+            logger.warning(
+                "shape capture persistence DEGRADED (memory-only): cannot write %s: %s",
+                self._path, exc,
+            )
 
     def record(self, brand: str, region: str, powertrain: str, vehicle) -> None:
         """Record the field shape of a lib Vehicle (or any attribute bag).

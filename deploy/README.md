@@ -77,6 +77,13 @@ docker compose restart proxy    # drops session cache; users just re-login
 The proxy never logs request bodies, headers, or query strings — nothing
 credential-shaped reaches the logs. Keep it that way when adding log lines.
 
+On boot the proxy logs one shape-capture persistence line — `ACTIVE` or
+`DEGRADED (memory-only)` with the reason. Check it after every deploy. A
+fresh `proxy-shapes` volume is writable from first boot (the image owns
+`/data` as appuser); a volume created by a pre-Jul-19 image is root-owned
+and needs a one-time
+`docker compose exec -u root proxy chown appuser /data`.
+
 ## Rollback
 
 ```sh

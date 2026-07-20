@@ -16,7 +16,13 @@ COPY pyproject.toml ./
 COPY app ./app
 RUN pip install --no-cache-dir .
 
-RUN useradd --create-home appuser
+# /data is the shapes volume mount point (compose). Creating it appuser-owned
+# in the image matters: Docker initializes a FRESH named volume from the
+# image's directory — ownership included — so first boot on a clean host gets
+# a writable /data with no entrypoint chown. An EXISTING root-owned volume
+# keeps its ownership (this bit prod 16–19 Jul: every dump failed EACCES);
+# fix those once with:  docker compose exec -u root proxy chown appuser /data
+RUN useradd --create-home appuser && mkdir /data && chown appuser:appuser /data
 USER appuser
 
 # Surfaced by /healthz so a deploy can be confirmed live.
