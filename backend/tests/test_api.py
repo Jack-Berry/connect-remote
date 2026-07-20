@@ -34,6 +34,7 @@ def make_status(**kw) -> VehicleStatus:
         climate_on=False,
         latitude=51.5072,
         longitude=-0.1276,
+        location_last_updated=datetime(2026, 7, 7, 9, 30, tzinfo=timezone.utc),
         last_updated=datetime(2026, 7, 7, 12, 0, tzinfo=timezone.utc),
     )
     base.update(kw)
@@ -243,6 +244,16 @@ def test_status_returns_vehicle_state(client):
     assert payload["stale"] is False
     assert payload["latitude"] == 51.5072
     assert payload["longitude"] == -0.1276
+    # The car finder's staleness line ("parked 2h ago") reads this off /status;
+    # it is a separate, older timestamp than last_updated.
+    assert payload["location_last_updated"] == "2026-07-07T09:30:00Z"
+
+
+def test_status_omits_location_timestamp_when_the_car_never_reported_one():
+    """An older car (or an older upstream) yields null, not a bogus date —
+    the glasses omit the staleness line rather than claiming a parking time."""
+    status = make_status(location_last_updated=None)
+    assert status.model_dump(mode="json")["location_last_updated"] is None
 
 
 def test_status_serves_stale_cache_when_upstream_down(client, provider):

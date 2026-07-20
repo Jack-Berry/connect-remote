@@ -50,9 +50,13 @@ class VehicleStatus(BaseModel):
     charge_eta_minutes: LaxInt | None = None
     climate_on: bool | None = None
     doors_open: list[str] = []
-    # Last reported car position (exposed by the API; no glasses UI consumes it yet)
+    # Last reported car position — consumed by the glasses "Find my car" mode.
     latitude: float | None = None
     longitude: float | None = None
+    # When the car last reported that position. Distinct from last_updated
+    # (the whole status): a car parked hours ago still refreshes its status,
+    # so only this field can honestly answer "parked 2h ago".
+    location_last_updated: datetime | None = None
     last_updated: datetime | None = None
     # Current AC/DC charge targets as reported by the car (percent)
     charge_limit_ac: LaxInt | None = None

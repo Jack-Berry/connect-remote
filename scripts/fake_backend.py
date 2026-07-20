@@ -5,8 +5,9 @@ For simulator/dev testing without a Connected Services account. Serves on
 Commands mutate the fake car so re-polls show the change.
 """
 
+import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
@@ -38,8 +39,13 @@ class FakeProvider:
             charge_limit_dc=self.limit_dc,
             climate_on=self.climate_on,
             doors_open=[],
-            latitude=51.5072,
-            longitude=-0.1276,
+            latitude=None if os.environ.get('FAKE_NO_COORDS') else 51.5072,
+            longitude=None if os.environ.get('FAKE_NO_COORDS') else -0.1276,
+            # FAKE_PARKED_MINUTES_AGO drives the car finder's staleness line
+            # ("parked 2h ago", shown past 30 min) without waiting for time to
+            # pass. Unset = parked just now, so the line stays hidden.
+            location_last_updated=datetime.now(timezone.utc)
+            - timedelta(minutes=int(os.environ.get("FAKE_PARKED_MINUTES_AGO", "0"))),
             last_updated=datetime.now(timezone.utc),
         )
 

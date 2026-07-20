@@ -369,6 +369,11 @@ class GenesisProvider:
                 charge_limit_dc=getattr(v, "ev_charge_limits_dc", None),
                 latitude=getattr(v, "location_latitude", None),
                 longitude=getattr(v, "location_longitude", None),
+                # NAME TRAP: the public property is location_last_updated_at.
+                # `_location_last_set_time` is the private attribute behind it,
+                # so getattr for that name returns None forever and the
+                # "parked 2h ago" line would silently never appear.
+                location_last_updated=getattr(v, "location_last_updated_at", None),
                 last_updated=getattr(v, "last_updated_at", None),
             )
         except ValidationError as exc:

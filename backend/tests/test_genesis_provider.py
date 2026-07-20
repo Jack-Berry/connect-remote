@@ -6,6 +6,7 @@ the provider is constructed via __new__ and given a stub vehicle registry.
 """
 
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -52,6 +53,23 @@ def test_to_status_tolerates_floats_in_every_numeric_field():
     assert s.charge_limit_dc == 90
     assert s.latitude == 51.0
     assert s.longitude == 0.0
+
+
+def test_to_status_reads_location_timestamp_from_the_public_property():
+    """The car finder's "parked 2h ago" line depends on this exact name.
+
+    `location_last_updated_at` is the public property; `_location_last_set_time`
+    is the private attribute behind it. Reading the private name via getattr
+    would return None forever and the staleness line would silently never
+    appear — so assert the property name is the one being read, and that the
+    private name alone is not enough.
+    """
+    parked = datetime(2026, 7, 20, 8, 30, tzinfo=timezone.utc)
+    s = make_provider(location_last_updated_at=parked)._to_status()
+    assert s.location_last_updated == parked
+
+    decoy = make_provider(_location_last_set_time=parked)._to_status()
+    assert decoy.location_last_updated is None
 
 
 def test_to_status_missing_attributes_yield_none():
