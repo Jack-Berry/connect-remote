@@ -5,7 +5,7 @@ permalink: /privacy/
 
 # Connect Remote Privacy Policy
 
-_Last updated: 16 July 2026_
+_Last updated: 20 July 2026_
 
 Connect Remote is an open-source companion app for Genesis, Kia, and Hyundai
 vehicles, running on Even Realities G2 smart glasses. This policy explains what
@@ -67,6 +67,12 @@ The relay's source code is in this repository, so what it does is auditable.
   verification code each time. It can be cleared by changing your account
   username in the app's settings or by clearing the app's data.
 
+- **Your phone's location** is used on-device to show the direction and
+  distance to your car, and is never sent to any server. The app reads it only
+  while the "Find my car" screen is open, calculates the bearing and distance
+  on the phone using the car position your vehicle already reported, and stores
+  nothing.
+
 - **Relay logs** contain only the request method, path, status code and
   latency, never request contents, headers, credentials, or vehicle data.
   The web server in front of the relay has access logging disabled. Client IP
@@ -78,7 +84,8 @@ The relay's source code is in this repository, so what it does is auditable.
 
 The app requests network permission for exactly one host: the relay at
 `car-proxy.berrydev.co.uk`. The app contacts no other server and no third
-party.
+party. The location permission involves no network access at all: nothing the
+app sends to the relay contains your phone's position.
 
 ## Third parties
 
