@@ -5,12 +5,18 @@ Regression for the real-world failure where ev_battery_percentage arrived as
 the provider is constructed via __new__ and given a stub vehicle registry.
 """
 
+import threading
 from types import SimpleNamespace
 
 import pytest
 from hyundai_kia_connect_api.exceptions import AuthenticationError, PINMissingError
 
-from app.providers.base import AuthError, ProviderDataError, UpstreamError
+from app.providers.base import (
+    AuthError,
+    ClimateSettings,
+    ProviderDataError,
+    UpstreamError,
+)
 from app.providers.genesis import GenesisProvider
 
 
@@ -141,3 +147,52 @@ def test_scrub_replaces_overlapping_credentials_longest_first(monkeypatch):
     )
     provider._scrub_values = sorted(["ab", "abcd"], key=len, reverse=True)
     assert provider._scrub(Exception("abcd and ab")) == "<credential> and <credential>"
+
+
+# The set_climate -> ClimateRequestOptions mapping was previously untested, so
+# nothing observed what actually reached the library — which is how the
+# Celsius-into-a-Fahrenheit-field bug survived. These tests capture the real
+# payload. Unit rules live in test_climate_units.py.
+def make_climate_provider(region: int, temperature_range=None) -> GenesisProvider:
+    provider = GenesisProvider.__new__(GenesisProvider)
+    provider._lock = threading.Lock()
+    provider._vehicle_id = "v1"
+    provider._region = region
+    provider._region_name = "test"
+    provider._vm = SimpleNamespace(
+        api=SimpleNamespace(temperature_range=temperature_range),
+        start_climate=lambda vid, options: captured.append(options),
+        stop_climate=lambda vid: captured.append("stop"),
+    )
+    provider._prepare = lambda: "v1"
+    return provider
+
+
+captured: list = []
+
+
+@pytest.fixture(autouse=True)
+def _clear_captured():
+    captured.clear()
+
+
+def test_set_climate_sends_fahrenheit_in_the_us():
+    provider = make_climate_provider(3, range(62, 83))
+    provider.set_climate(ClimateSettings(on=True, temp=21.0, defrost=False, heating=False))
+    assert captured[0].set_temp == 70
+    # Guards the Kia US "LOW" coercion for values under 62.
+    assert captured[0].set_temp >= 62
+
+
+def test_set_climate_sends_celsius_in_europe():
+    provider = make_climate_provider(1, [x * 0.5 for x in range(28, 60)])
+    provider.set_climate(ClimateSettings(on=True, temp=22.5, defrost=True, heating=True))
+    assert captured[0].set_temp == 22.5
+    assert captured[0].defrost is True
+    assert captured[0].heating == 1
+
+
+def test_set_climate_off_ignores_temperature():
+    provider = make_climate_provider(3, range(62, 83))
+    provider.set_climate(ClimateSettings(on=False, temp=21.0, defrost=False, heating=False))
+    assert captured == ["stop"]

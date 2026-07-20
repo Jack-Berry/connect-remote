@@ -13,6 +13,7 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Sequence
 
 from hyundai_kia_connect_api import ClimateRequestOptions, VehicleManager
 from hyundai_kia_connect_api.const import BRANDS, OTP_NOTIFY_TYPE, REGIONS
@@ -25,6 +26,7 @@ from hyundai_kia_connect_api.Token import Token
 from pydantic import ValidationError
 
 from .. import shape_capture
+from ..climate_units import wire_temp, wire_unit
 from .base import (
     AuthError,
     ClimateSettings,
@@ -130,6 +132,8 @@ class GenesisProvider:
             token=stored_token,
         )
         self._vehicle_id: str | None = None
+        # Decides the wire unit for climate targets — US wants Fahrenheit.
+        self._region = region
         # Classified on the first status fetch of this provider's life (== one
         # proxy session — the session cache owns provider lifetime), then
         # reused: a mid-session data blip must not flip the classification.
@@ -462,13 +466,32 @@ class GenesisProvider:
     def set_charge_limits(self, ac: int, dc: int) -> None:
         self._command("charge_limits", lambda vid: self._vm.set_charge_limits(vid, ac, dc))
 
+    def _temperature_range(self) -> Sequence[float] | None:
+        """The current implementation's accepted temperature values, if it
+        publishes a flat list. None for Canada (year-dependent ranges) and
+        before login, where wire_temp falls back to a 0.5°C grid."""
+        return getattr(getattr(self._vm, "api", None), "temperature_range", None)
+
     def set_climate(self, req: ClimateSettings) -> None:
         def run(vid: str) -> None:
             if req.on:
+                # req.temp is Celsius (the proxy's API contract); the library
+                # wants whatever its region impl uses and converts nothing
+                # itself. See app/climate_units.py.
+                set_temp = wire_temp(
+                    req.temp, self._region, self._temperature_range()
+                )
+                logger.info(
+                    "climate target %.1f°C -> %s%s (region %s)",
+                    req.temp,
+                    set_temp,
+                    wire_unit(self._region),
+                    self._region_name,
+                )
                 self._vm.start_climate(
                     vid,
                     ClimateRequestOptions(
-                        set_temp=req.temp,
+                        set_temp=set_temp,
                         climate=True,
                         defrost=req.defrost,
                         # 1 = steering wheel + rear window/mirror heat
