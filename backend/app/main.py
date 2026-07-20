@@ -10,7 +10,6 @@ Logging policy: method, path, status code, latency. Never request bodies,
 headers, or query strings — bodies carry car-unlocking credentials.
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -18,14 +17,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 
-from fastapi import (
-    FastAPI,
-    HTTPException,
-    Request,
-    Response,
-    WebSocket,
-    WebSocketDisconnect,
-)
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from hyundai_kia_connect_api.const import BRANDS, REGIONS
 from pydantic import BaseModel, Field, field_validator
@@ -267,59 +259,6 @@ def healthz() -> dict:
     commit (GIT_COMMIT baked in at image build) so a deploy can be confirmed
     live."""
     return {"ok": True, "commit": os.environ.get("GIT_COMMIT")}
-
-
-# Keepalive WebSocket (glasses car-finder). The socket carries NO data in
-# either direction — its only job is existing: iOS keeps a WKWebView's JS
-# running under screen lock when the page holds a live socket, and the finder
-# needs its GPS watch to survive exactly that. Hence: no auth (there is
-# nothing to protect), a server heartbeat so intermediaries never see an idle
-# stream, and a hard per-IP connection cap since slowapi's HTTP rate limiter
-# does not see WebSocket handshakes.
-WS_HEARTBEAT_SECONDS = 20.0
-WS_MAX_CONNECTIONS_PER_IP = 4
-_ws_connections: dict[str, int] = {}
-
-
-def _ws_client_ip(ws: WebSocket) -> str:
-    forwarded = ws.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return ws.client.host if ws.client else "unknown"
-
-
-@app.websocket("/ws")
-async def keepalive_ws(ws: WebSocket) -> None:
-    ip = _ws_client_ip(ws)
-    if _ws_connections.get(ip, 0) >= WS_MAX_CONNECTIONS_PER_IP:
-        # 1013 "try again later" — a well-behaved client backs off.
-        await ws.close(code=1013)
-        return
-    await ws.accept()
-    _ws_connections[ip] = _ws_connections.get(ip, 0) + 1
-    try:
-        while True:
-            # Listen (so a disconnect is noticed immediately, not at the next
-            # heartbeat) and send the heartbeat on the listen timeout.
-            try:
-                message = await asyncio.wait_for(
-                    ws.receive(), timeout=WS_HEARTBEAT_SECONDS
-                )
-            except asyncio.TimeoutError:
-                await ws.send_text("ka")
-                continue
-            if message.get("type") == "websocket.disconnect":
-                break
-            # Any client payload is ignored — this socket carries nothing.
-    except (WebSocketDisconnect, RuntimeError):
-        # Disconnect surfaces as either, depending on who noticed first.
-        pass
-    finally:
-        remaining = _ws_connections.get(ip, 1) - 1
-        if remaining > 0:
-            _ws_connections[ip] = remaining
-        else:
-            _ws_connections.pop(ip, None)
 
 
 @app.post("/status", response_model=VehicleStatus)
