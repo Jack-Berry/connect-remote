@@ -170,6 +170,11 @@ export function createImageIndicator(
           // The fallback glyph cell, vertically centred over the image band.
           // Blank unless a push fails; blank text over a black frame is
           // invisible, so carrying both costs nothing.
+          // NOTE: SDK 0.0.12's zOrderIndex is deliberately NOT used anywhere
+          // on this page — the simulator's (and potentially older hosts')
+          // strict PB decoder rejects the unknown field and the whole page
+          // rebuild dies. Stacking stays implicit until the fleet's minimum
+          // host version is known to accept it.
           new TextContainerProperty({
             xPosition: 0,
             yPosition: FINDER_IMG_Y + 36,

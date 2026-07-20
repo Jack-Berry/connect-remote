@@ -249,8 +249,32 @@ export function formatParkedAge(
 // is moving" into the exact strings on the glasses. The renderer only centres
 // them; the state machine is entirely here, entirely testable.
 
-/** Below this the guidance stops pretending to be precise. */
-export const ARRIVAL_RADIUS_M = 22;
+// ---------------------------------------------------------------------------
+// Arrival — accuracy-adaptive
+//
+// A fixed radius lies in both directions: with a 5m fix it gives up 22m from
+// a car the user can see isn't there, with a 40m fix it can never trigger at
+// all. So the radius follows the fix quality, and one noisy fix is never
+// allowed to end the walk on its own.
+
+/** The radius never shrinks below this — GPS is not a tape measure. */
+export const ARRIVAL_MIN_RADIUS_M = 10;
+/** Radius = this × the fix's reported accuracy (when that exceeds the min). */
+export const ARRIVAL_ACCURACY_FACTOR = 1.5;
+/** Consecutive qualifying fixes required before arrival is declared. */
+export const ARRIVAL_STREAK = 2;
+/** Fixes at/below this accuracy earn "You're here"; above it the honest
+ *  claim is "You're close" — the radius that triggered could be 40m+ wide. */
+export const ARRIVAL_CONFIDENT_ACCURACY_M = 20;
+
+/** Arrival progress threaded between renders (like `prevOctant`): how many
+ *  consecutive fixes have been inside the arrival radius, and which fix was
+ *  counted last — the 1 Hz tick re-renders the same fix, and a re-render
+ *  must never count twice. */
+export interface ArrivalProgress {
+  streak: number;
+  lastFixAt: number;
+}
 
 export type FinderMode =
   | "stationary"
@@ -274,6 +298,8 @@ export interface FinderView {
   hint: string;
   /** Chosen direction index, fed back in as `prevOctant` for hysteresis. */
   octant: number | null;
+  /** Arrival progress, fed back in as `arrival` on the next render. */
+  arrival: ArrivalProgress;
 }
 
 export interface FinderInput {
@@ -290,6 +316,8 @@ export interface FinderInput {
   parkedAt?: string | null;
   /** Direction shown last frame, so the arrow doesn't flicker at a boundary. */
   prevOctant?: number | null;
+  /** Arrival progress from the previous render (see ArrivalProgress). */
+  arrival?: ArrivalProgress | null;
   /** Set when the phone position is unavailable for a known reason. */
   problem?: FinderProblem | null;
 }
@@ -305,10 +333,18 @@ export function finderView(input: FinderInput): FinderView {
     unit = null,
     parkedAt = null,
     prevOctant = null,
+    arrival: prevArrival = null,
     problem = null,
   } = input;
 
-  const base = { arrow: null, octant: null, hint: HINT_BACK } as const;
+  // No usable fix ⇒ no arrival progress; the streak restarts from zero.
+  const noArrival: ArrivalProgress = { streak: 0, lastFixAt: 0 };
+  const base = {
+    arrow: null,
+    octant: null,
+    hint: HINT_BACK,
+    arrival: noArrival,
+  } as const;
 
   // Problem states first: every one of them renders a sentence explaining
   // itself. A blank screen inside a feature reads as a crash (and is a store
@@ -346,15 +382,33 @@ export function finderView(input: FinderInput): FinderView {
   const distance = formatDistance(metres, unit);
   const parked = formatParkedAge(parkedAt, now) ?? "";
 
-  // Arrival. Deliberately not "you have arrived": the car's own coordinates
-  // are only worth ±10–30m and floors are invisible to GPS, so claiming
-  // precision we don't have would send people looking at the wrong bay on the
-  // wrong level. "Check nearby" is the honest instruction.
-  if (metres <= ARRIVAL_RADIUS_M) {
+  // Arrival bookkeeping. The radius follows the fix's own accuracy, and one
+  // fix is never enough: the streak must reach ARRIVAL_STREAK across
+  // *distinct* fixes (a re-render of the same fix changes nothing).
+  const radius = Math.max(
+    ARRIVAL_MIN_RADIUS_M,
+    ARRIVAL_ACCURACY_FACTOR * fix.accuracy,
+  );
+  const qualifying = metres <= radius;
+  const prev = prevArrival ?? noArrival;
+  const arrival: ArrivalProgress =
+    fix.at === prev.lastFixAt
+      ? prev
+      : { streak: qualifying ? prev.streak + 1 : 0, lastFixAt: fix.at };
+
+  // Deliberately not "you have arrived": the car's own coordinates are only
+  // worth ±10–30m and floors are invisible to GPS. With a tight fix "here"
+  // is defensible; with a wide one the trigger circle could be 40m+ across,
+  // so the claim honestly downgrades to "close". Both say "Check nearby".
+  if (arrival.streak >= ARRIVAL_STREAK) {
     return {
       ...base,
+      arrival,
       mode: "arrived",
-      headline: "You're here",
+      headline:
+        fix.accuracy <= ARRIVAL_CONFIDENT_ACCURACY_M
+          ? "You're here"
+          : "You're close",
       detail: "Check nearby",
     };
   }
@@ -371,6 +425,7 @@ export function finderView(input: FinderInput): FinderView {
       detail: parked,
       hint: HINT_BACK,
       octant: index,
+      arrival,
     };
   }
 
@@ -387,5 +442,6 @@ export function finderView(input: FinderInput): FinderView {
     // Deliberately not carried into hysteresis: this is an absolute bearing,
     // not the relative angle the arrow uses, so it must not seed it.
     octant: null,
+    arrival,
   };
 }

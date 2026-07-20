@@ -309,6 +309,7 @@ describe("formatFinder", () => {
     detail: "",
     hint: "Tap: back",
     octant: 0,
+    arrival: { streak: 0, lastFixAt: 0 },
     ...over,
   });
 

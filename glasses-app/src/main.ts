@@ -2,6 +2,7 @@ import {
   waitForEvenAppBridge,
   CreateStartUpPageContainer,
   ImageRawDataUpdate,
+  ImageRawDataUpdateResult,
   ListContainerProperty,
   ListItemContainerProperty,
   OsEventTypeList,
@@ -13,7 +14,6 @@ import {
 import {
   ApiError,
   BackendClient,
-  PROXY_URL,
   TimeoutError,
   type VehicleStatus,
 } from "./api";
@@ -58,6 +58,7 @@ import {
 } from "./display";
 import { createGlyphIndicator, createImageIndicator } from "./direction";
 import {
+  type ArrivalProgress,
   CourseTracker,
   type Fix,
   type FinderProblem,
@@ -65,17 +66,12 @@ import {
   formatParkedAge,
 } from "./finder";
 import {
-  type KeepaliveSocket,
-  type SocketTelemetry,
-  createSocketTelemetry,
-  openKeepaliveSocket,
-} from "./finder-socket";
-import {
   type FinderWatch,
   type FinderWatchTelemetry,
   createFinderTelemetry,
   createFinderWatch,
 } from "./finder-watch";
+import { type AppLocationBridge, startPositionWatch } from "./geo";
 import {
   type AppSettings,
   type Bridge,
@@ -448,10 +444,10 @@ const ARRIVAL_HOLD_MS = 3000;
 const FINDER_TICK_MS = 1000;
 
 // Telemetry strip on the finder screen (top edge) plus the Finder line in the
-// diagnostic report. ON for the 1.3.x hardware-debug builds — the 1.3.0 walk
-// froze with zero ways to tell which link died. Flip to false for a store
-// release; the report line stays either way.
-const FINDER_DEBUG = true;
+// diagnostic report. OFF for release builds — the strip and its container
+// vanish entirely; the diagnostic-report line stays either way. Flip to true
+// for hardware-debug builds (the 1.3.x rounds lived on it).
+const FINDER_DEBUG = false;
 // The circled-arrow image indicator (Round 3). false = the 1.3.1 glyph
 // layout, kept as the fallback build if the image path misbehaves over BLE.
 const FINDER_IMAGE_ARROW = true;
@@ -459,22 +455,19 @@ const FINDER_IMAGE_ARROW = true;
 // experiment. The simulator normalises greys, so only a hardware walk can
 // judge it; flip false if it's illegible.
 const STALE_DIM_ENABLED = true;
-// Round 3 spike: hold a do-nothing WebSocket open while the finder runs, to
-// test whether a live socket keeps iOS from suspending the WebView on screen
-// lock (it does for AbleShow). Costs one idle connection; carries no data.
-const FINDER_KEEPALIVE_SOCKET = true;
-const KEEPALIVE_WS_URL =
-  PROXY_URL.replace(/\/$/, "").replace(/^http/, "ws") + "/ws";
+// The bridge App Location source, OFF after walk 5: it stalled under screen
+// lock exactly like WebView geolocation (suspended JS can't receive host
+// pushes) and delivered a worse fix cadence screen-on. The code path stays —
+// an Even app update could change the suspension behaviour, and re-running
+// the experiment is this one flag (plus an SDK 0.0.11+ host).
+const FINDER_BRIDGE_LOCATION = false;
 
-// Shown briefly when a screen-wake restart fires: honest guidance that works
-// on any backend, whatever the socket spike concludes.
-const KEEP_UNLOCKED_NOTE = "Keep phone unlocked while finding your car";
+// Shown briefly on every finder entry (and again after a screen-wake
+// restart): the one honest instruction while no JS-side source survives a
+// locked phone. Self-clears — the tick repaints past the deadline.
+const KEEP_UNLOCKED_NOTE = "Keep your phone unlocked while finding your car";
 const FINDER_NOTE_MS = 6000;
 let finderNoteUntil = 0;
-
-let finderSocket: KeepaliveSocket | null = null;
-// Like finderTelem: survives finder exit for the diagnostic report.
-let socketTelem: SocketTelemetry | null = null;
 
 let finderWatch: FinderWatch | null = null;
 // One per finder session (created on entry, kept across watchdog/screen-wake
@@ -489,6 +482,8 @@ let finderArrival: ReturnType<typeof setTimeout> | null = null;
 let finderFix: Fix | null = null;
 let finderProblem: FinderProblem | null = null;
 let finderOctant: number | null = null;
+// Threaded through finderView like finderOctant: consecutive in-radius fixes.
+let finderArrivalProgress: ArrivalProgress | null = null;
 const finderCourse = new CourseTracker();
 // Last rendered content, so the 1 Hz tick only touches containers that
 // actually changed — an unchanged upgrade is a wasted bridge call. (The
@@ -506,9 +501,20 @@ function pushImage(
 ) {
   // Same serialization chain as text upgrades: the SDK is explicit that
   // image transmissions must not overlap anything on the BLE link.
-  return enqueue(() =>
-    bridge.updateImageRawData(new ImageRawDataUpdate({ ...ids, imageData })),
-  );
+  return enqueue(async () => {
+    const result = await bridge.updateImageRawData(
+      new ImageRawDataUpdate({ ...ids, imageData }),
+    );
+    // The host reports image failures in the RESOLVED value — the promise
+    // does not reject (spike finding, relearned the hard way on the 1.3.3
+    // walk: pushes "succeeded" while the panel stayed blank and the glyph
+    // fallback never armed). Throwing here is what arms it.
+    const verdict = ImageRawDataUpdateResult.normalize(result);
+    if (!ImageRawDataUpdateResult.isSuccess(verdict)) {
+      throw new Error(`host rejected image push: ${verdict}`);
+    }
+    return result;
+  });
 }
 const directionIndicator = FINDER_IMAGE_ARROW
   ? createImageIndicator(pushImage, upgradeText, renderArrowFrames)
@@ -599,9 +605,11 @@ function finderContent() {
       unit: lastStatus?.range_unit ?? null,
       parkedAt: lastStatus?.location_last_updated ?? null,
       prevOctant: finderOctant,
+      arrival: finderArrivalProgress,
       problem: finderProblem,
     });
     finderOctant = v.octant;
+    finderArrivalProgress = v.arrival;
     // The screen-wake guidance note borrows the detail line briefly; problem
     // states keep their own explanation (it outranks advice).
     const detail =
@@ -635,6 +643,7 @@ function finderContent() {
         detail: SAFE_NOTE,
         hint: "Tap: back · 2x tap: close app",
         octant: null,
+        arrival: { streak: 0, lastFixAt: 0 },
       }, FINDER_GEOM.compact),
     };
   }
@@ -653,19 +662,14 @@ function finderDebugLine(mode: string): string {
     ? `${Math.max(0, Math.round((Date.now() - t.lastFixAt) / 1000))}s`
     : "–";
   const rejected = t.rawFixes - t.usableFixes;
-  // Socket glyphs: ✓ open, … connecting, ✗ closed/stopped; the count after
-  // ✗ is reconnect attempts (the drop count, i.e. how flaky the link is).
-  const s = socketTelem;
-  const ws = !s
-    ? ""
-    : ` · ws${s.state === "open" ? "✓" : s.state === "connecting" ? "…" : "✗"}${
-        s.reconnects ? s.reconnects : ""
-      }`;
+  // Which location source is live: br = host bridge session (the one that
+  // should survive screen lock), wk = WebView geolocation, fk = DEV fake.
+  const src =
+    t.source === "bridge" ? "br" : t.source === "webkit" ? "wk" : t.source === "fake" ? "fk" : "?";
   return (
-    `fx ${t.rawFixes}${rejected ? `(-${rejected})` : ""} ${age}` +
+    `${src} fx ${t.rawFixes}${rejected ? `(-${rejected})` : ""} ${age}` +
     ` · rp ${finderRenders.done}/${finderRenders.started}` +
     ` · rs ${t.restarts}+${t.resumes}` +
-    ws +
     ` · ${mode}` +
     (t.lastProblem ? ` !${t.lastProblem}` : "")
   );
@@ -715,10 +719,7 @@ async function renderFinder() {
 
 /** The one place the GPS watch and its timers are torn down. Every exit path
  *  — finder exit, arrival, foreground exit, system exit — calls this, and the
- *  watch logs a line when it stops (handoff §4.6). The keepalive socket
- *  follows the same discipline, except across watch restarts (reason
- *  "restart"): tearing a healthy socket down to replace a GPS watch would
- *  sabotage the very keep-alive behaviour the socket exists to test. */
+ *  watch logs a line when it stops (handoff §4.6). */
 function stopFinderWatch(reason: string) {
   if (finderWatch) {
     finderWatch.stop(reason);
@@ -728,13 +729,26 @@ function stopFinderWatch(reason: string) {
   finderTick = null;
   if (finderArrival) clearTimeout(finderArrival);
   finderArrival = null;
-  if (reason !== "restart" && finderSocket) {
-    finderSocket.stop(reason);
-    finderSocket = null;
+}
+
+// Re-entrancy latch: a watch source that delivers its first fix synchronously
+// (the DEV fake walker did) fires onFix → renderFinder before `finderWatch`
+// is assigned, and renderFinder's auto-start branch would call back in here —
+// infinite recursion. Found by the 1.3.3 simulator sweep; latent since 1.3.0
+// (real GPS always delivered asynchronously, which is why no walk ever hit it).
+let startingFinderWatch = false;
+
+function startFinderWatch() {
+  if (startingFinderWatch) return;
+  startingFinderWatch = true;
+  try {
+    startFinderWatchInner();
+  } finally {
+    startingFinderWatch = false;
   }
 }
 
-function startFinderWatch() {
+function startFinderWatchInner() {
   stopFinderWatch("restart");
   // The 1 Hz repaint runs regardless: it is what lets the course go stale,
   // what notices a car position arriving on a later poll — and now what rides
@@ -743,13 +757,6 @@ function startFinderWatch() {
     finderWatch?.poke(Date.now());
     void renderFinder();
   }, FINDER_TICK_MS);
-  // The keepalive socket spans the whole finder session (see stopFinderWatch)
-  // and reopens here after a foreground/screen-wake re-entry. Telemetry
-  // accumulates across reopens within the session.
-  if (FINDER_KEEPALIVE_SOCKET && !finderSocket) {
-    socketTelem ??= createSocketTelemetry();
-    finderSocket = openKeepaliveSocket(KEEPALIVE_WS_URL, socketTelem);
-  }
   // No car position ⇒ nothing to compute a bearing to, so don't ask for the
   // location permission at all. Prompting for a sensor we can't use yet is a
   // bad trade; the screen already explains what's missing, and the tick above
@@ -773,6 +780,16 @@ function startFinderWatch() {
     },
     carPosition(),
     finderTelem,
+    // Bridge source parked (FINDER_BRIDGE_LOCATION above): passing null
+    // sends geo.ts straight down the proven WebView-geolocation path.
+    (handlers, car) =>
+      startPositionWatch(
+        handlers,
+        car,
+        FINDER_BRIDGE_LOCATION
+          ? (bridge as unknown as AppLocationBridge)
+          : null,
+      ),
   );
 }
 
@@ -800,14 +817,17 @@ async function enterFinder() {
   finderFix = null;
   finderProblem = null;
   finderOctant = null;
+  finderArrivalProgress = null;
   finderShown = null;
   finderDebugShown = null;
-  finderNoteUntil = 0;
   // Fresh telemetry per session; kept after exit so the diagnostic report can
   // describe the walk that just failed.
   finderTelem = createFinderTelemetry(Date.now());
-  socketTelem = FINDER_KEEPALIVE_SOCKET ? createSocketTelemetry() : null;
   finderRenders = { started: 0, done: 0 };
+  // First thing every finder session says: the one limitation no JS can
+  // remove (three hardware rounds of evidence). Replaces the detail line for
+  // a few seconds, then the tick repaints it away.
+  finderNoteUntil = Date.now() + FINDER_NOTE_MS;
   finderCourse.reset();
   // Pre-render the arrow frames before the page goes up: a one-off ~tens of
   // ms on entry, so the first direction push has frames to draw from.
@@ -1692,21 +1712,14 @@ function bindPhoneUi() {
       // which counter stopped. No coordinates — counts and ages only.
       `Finder: ${
         finderTelem
-          ? `fixes ${finderTelem.rawFixes} raw / ${finderTelem.usableFixes} usable` +
+          ? `source ${finderTelem.source ?? "none"}` +
+            `, fixes ${finderTelem.rawFixes} raw / ${finderTelem.usableFixes} usable` +
             `${finderTelem.lastRejectedAccuracy != null ? ` (last reject ±${Math.round(finderTelem.lastRejectedAccuracy)}m)` : ""}` +
             `, last fix ${finderTelem.lastFixAt ? `${Math.round((Date.now() - finderTelem.lastFixAt) / 1000)}s ago` : "never"}` +
             `, problems ${finderTelem.problems}${finderTelem.lastProblem ? ` (${finderTelem.lastProblem})` : ""}` +
             `, restarts ${finderTelem.restarts} watchdog / ${finderTelem.resumes} screen-wake` +
             `, repaints ${finderRenders.done}/${finderRenders.started}`
           : "not opened this session"
-      }`,
-      // The keepalive-socket spike, summarised: did the socket hold, and did
-      // holding it change what the fixes did (compare with the line above).
-      `Keepalive: ${
-        socketTelem
-          ? `${socketTelem.state}, opens ${socketTelem.opens}, drops ${socketTelem.reconnects}` +
-            `${socketTelem.lastCloseCode != null ? ` (last close ${socketTelem.lastCloseCode})` : ""}`
-          : "off"
       }`,
       ``,
     ];

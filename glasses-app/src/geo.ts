@@ -1,26 +1,60 @@
 /**
  * Phone position for the car finder — the only place this app touches
- * geolocation.
+ * location, from either of two sources:
  *
- * Two responsibilities:
- *  1. Wrap `navigator.geolocation.watchPosition` so the rest of the app sees
- *     plain `Fix` objects and a small set of named problems.
- *  2. Guarantee the watch can be stopped, loudly. A leaked GPS watch drains
- *     the user's phone in their pocket long after they've walked away, so
- *     every stop path logs a line and every caller has exactly one function
- *     to call. (Handoff §4.6 — the log line is the proof.)
+ *  1. `navigator.geolocation.watchPosition` — the ACTIVE source. Proven on
+ *     hardware screen-on; suspends with the WebView on screen lock, which no
+ *     JS-side source escapes (see below).
+ *  2. The Even app's bridge App Location API (SDK 0.0.11+ hosts) — PARKED
+ *     behind main.ts's FINDER_BRIDGE_LOCATION=false after the walk-5
+ *     verdict: it stalled under screen lock exactly like WebView geolocation
+ *     (the host may run CoreLocation, but suspended JS can't receive the
+ *     pushes), and screen-on it delivered a worse fix cadence. Kept because
+ *     the suspension behaviour is the HOST's choice — an Even app update
+ *     could make this path win, and re-running the experiment is one flag.
  *
- * A DEV-only fake walker lives at the bottom: real geolocation only works in
+ * Both are wrapped so the rest of the app sees plain `Fix` objects and a
+ * small set of named problems, plus which source is feeding it (telemetry).
+ * Every stop path logs a line — a leaked location session drains the phone
+ * in a pocket long after the user walked away (handoff §4.6).
+ *
+ * A DEV-only fake walker lives at the bottom: real location only works in
  * Even Hub builds (never QR sideload), so without it every finder state would
  * cost an upload-and-walk-outside cycle to look at.
  */
 
 import type { Fix, FinderProblem, LatLon } from "./finder";
 
+// Bridge App Location types, declared structurally rather than imported: the
+// installed SDK is 0.0.10 (pre-location, deliberately — see DECISIONS-LOG
+// 2026-07-20 revert entry), so these mirror the 0.0.11+ shapes for the day
+// the experiment is worth re-running on a newer host.
+export interface AppLocationLike {
+  latitude: number;
+  longitude: number;
+  accuracy?: number;
+  altitude?: number;
+  speed?: number;
+  heading?: number;
+  timestamp?: number;
+}
+export interface AppLocationUpdateOptions {
+  /** "low" | "medium" | "high" — AppLocationAccuracy enum values. */
+  accuracy?: string;
+  timeoutMs?: number;
+  distanceFilter?: number;
+  intervalMs?: number;
+}
+
+/** Where fixes are coming from, for the debug strip and diagnostic report. */
+export type PositionSource = "bridge" | "webkit" | "fake";
+
 export interface WatchHandlers {
   onFix(fix: Fix): void;
   /** Called instead of onFix when there is no position to be had. */
   onProblem(problem: FinderProblem): void;
+  /** Reports the active source; called again if a fallback switches it. */
+  onSource?(source: PositionSource): void;
 }
 
 export interface PositionWatch {
@@ -28,28 +62,176 @@ export interface PositionWatch {
   stop(reason: string): void;
 }
 
+/** The three bridge methods this module needs — structural, so tests can
+ *  fake the host and main.ts can hand over the real EvenAppBridge as-is. */
+export interface AppLocationBridge {
+  startAppLocationUpdates(options?: AppLocationUpdateOptions): Promise<boolean>;
+  stopAppLocationUpdates(): Promise<boolean>;
+  onAppLocationChanged(
+    callback: (location: AppLocationLike) => void,
+  ): () => void;
+}
+
 // enableHighAccuracy: this is a walk-to-your-car aid; coarse network location
-// would be worthless. maximumAge 0: a cached fix from when the user parked is
-// the one answer guaranteed to be wrong.
+// would be worthless. maximumAge 60s: the OS's cached fix seeds the screen
+// instantly at entry (a minute of walking is ≤~85m of error, corrected by the
+// first live fix seconds later) while still excluding the fix cached from
+// when the user PARKED — hours old, taken standing at the car, and therefore
+// the one answer guaranteed to be wrong. That parked-fix hazard is why this
+// was previously 0, at the cost of an every-entry "Locating…" wait.
 const WATCH_OPTIONS: PositionOptions = {
   enableHighAccuracy: true,
-  maximumAge: 0,
+  maximumAge: 60_000,
   timeout: 30_000,
 };
+
+// High + 1 Hz, matching what the webkit path delivered. Deliberately NO
+// distanceFilter: fixes must keep arriving while the user stands still, or
+// the finder's stall watchdog would read stillness as a dead watch.
+const BRIDGE_OPTIONS: AppLocationUpdateOptions = {
+  accuracy: "high",
+  intervalMs: 1000,
+};
+
+/** No bridge fix at all for this long after starting ⇒ this host's location
+ *  path doesn't actually work (old Even app that defines the method but not
+ *  the handler, permission quirk, …) ⇒ fall back to WebView geolocation.
+ *  Shorter than the finder's 45s stall watchdog so the fallback wins the
+ *  race and the watchdog never thrashes a watch that never worked. */
+const BRIDGE_FIRST_FIX_TIMEOUT_MS = 20_000;
 
 export function startPositionWatch(
   handlers: WatchHandlers,
   car: LatLon | null,
+  bridge?: AppLocationBridge | null,
 ): PositionWatch {
   // Constant-folded away in production builds, so none of the fake walker
   // below ships in a packed .ehpk.
   if (import.meta.env.DEV && import.meta.env.VITE_FAKE_GPS) {
+    handlers.onSource?.("fake");
     return startFakeWatch(handlers, car, String(import.meta.env.VITE_FAKE_GPS));
+  }
+  if (
+    bridge &&
+    typeof bridge.startAppLocationUpdates === "function" &&
+    typeof bridge.stopAppLocationUpdates === "function" &&
+    typeof bridge.onAppLocationChanged === "function"
+  ) {
+    return startBridgeWatch(handlers, bridge);
   }
   return startRealWatch(handlers);
 }
 
+/** pos.timestamp / AppLocation.timestamp is trusted only when it is plausibly
+ *  "now". Embedded WebViews have shipped wrong epochs (seconds, 2001-based),
+ *  and a wrong `at` silently kills the course: CourseTracker compares it
+ *  against Date.now() and concludes every fix is ancient, so the arrow never
+ *  appears. Arrival time is within a second of the fix time at walking pace,
+ *  so it is a safe substitute. */
+function saneAt(timestamp: unknown): number {
+  const wallNow = Date.now();
+  return typeof timestamp === "number" &&
+    Math.abs(timestamp - wallNow) <= 60_000
+    ? timestamp
+    : wallNow;
+}
+
+/** Bridge AppLocation → Fix, or null when the coordinates are junk. Missing
+ *  accuracy maps to Infinity — same honesty rule as the webkit path; if a
+ *  host omits it the rejection is counted, visible, and one threshold away
+ *  from a fix, rather than silently trusted. */
+function fixFromAppLocation(loc: AppLocationLike): Fix | null {
+  if (!Number.isFinite(loc?.latitude) || !Number.isFinite(loc?.longitude)) {
+    return null;
+  }
+  return {
+    lat: loc.latitude,
+    lon: loc.longitude,
+    accuracy:
+      typeof loc.accuracy === "number" && loc.accuracy >= 0
+        ? loc.accuracy
+        : Infinity,
+    at: saneAt(loc.timestamp),
+    heading: typeof loc.heading === "number" ? loc.heading : null,
+    speed: typeof loc.speed === "number" ? loc.speed : null,
+  };
+}
+
+/**
+ * Host-side location session. Failure handling is belt-and-braces because the
+ * bridge has no error channel worth the name: `startAppLocationUpdates`
+ * resolving false or rejecting falls back to webkit immediately, and a start
+ * that "succeeds" but never delivers a fix falls back after 20s — the SDK
+ * wrapper always defines these methods, so `typeof` checks cannot tell
+ * whether the installed Even app actually implements them.
+ */
+function startBridgeWatch(
+  handlers: WatchHandlers,
+  bridge: AppLocationBridge,
+): PositionWatch {
+  let stopped = false;
+  let gotFix = false;
+  let fallback: PositionWatch | null = null;
+  let firstFixTimer: ReturnType<typeof setTimeout> | null = null;
+
+  handlers.onSource?.("bridge");
+
+  const stopBridgeSide = () => {
+    if (firstFixTimer) clearTimeout(firstFixTimer);
+    firstFixTimer = null;
+    unsubscribe();
+    bridge.stopAppLocationUpdates().catch(() => undefined);
+  };
+
+  const fallBack = (why: string) => {
+    if (stopped || fallback) return;
+    console.log(`finder: bridge location ${why} — falling back to WebView geolocation`);
+    stopBridgeSide();
+    fallback = startRealWatch(handlers);
+  };
+
+  const unsubscribe = bridge.onAppLocationChanged((loc) => {
+    if (stopped || fallback) return;
+    const fix = fixFromAppLocation(loc);
+    if (!fix) return;
+    if (!gotFix) {
+      gotFix = true;
+      if (firstFixTimer) clearTimeout(firstFixTimer);
+      firstFixTimer = null;
+    }
+    handlers.onFix(fix);
+  });
+
+  firstFixTimer = setTimeout(() => {
+    firstFixTimer = null;
+    if (!gotFix) fallBack(`delivered nothing in ${BRIDGE_FIRST_FIX_TIMEOUT_MS / 1000}s`);
+  }, BRIDGE_FIRST_FIX_TIMEOUT_MS);
+
+  bridge.startAppLocationUpdates(BRIDGE_OPTIONS).then(
+    (ok) => {
+      if (!ok) fallBack("refused to start");
+    },
+    (err) => {
+      fallBack(`failed to start (${err})`);
+    },
+  );
+
+  return {
+    stop(reason) {
+      if (stopped) return;
+      stopped = true;
+      if (fallback) {
+        fallback.stop(reason);
+        return;
+      }
+      stopBridgeSide();
+      console.log(`finder: GPS watch stopped (${reason})`);
+    },
+  };
+}
+
 function startRealWatch(handlers: WatchHandlers): PositionWatch {
+  handlers.onSource?.("webkit");
   if (!("geolocation" in navigator)) {
     handlers.onProblem("unavailable");
     return { stop: () => {} };
@@ -58,25 +240,13 @@ function startRealWatch(handlers: WatchHandlers): PositionWatch {
   const watchId = navigator.geolocation.watchPosition(
     (pos) => {
       const c = pos.coords;
-      // pos.timestamp is trusted only when it is plausibly "now". Embedded
-      // WebViews have shipped it in the wrong epoch (seconds, or 2001-based),
-      // and a wrong `at` silently kills the course: CourseTracker compares it
-      // against Date.now() and concludes every fix is ancient, so the arrow
-      // never appears. Arrival time is within a second of the fix time at
-      // walking pace, so it is a safe substitute.
-      const wallNow = Date.now();
-      const at =
-        typeof pos.timestamp === "number" &&
-        Math.abs(pos.timestamp - wallNow) <= 60_000
-          ? pos.timestamp
-          : wallNow;
       handlers.onFix({
         lat: c.latitude,
         lon: c.longitude,
         // A platform that won't say how accurate it is gets treated as
         // useless rather than perfect — Infinity fails isUsableFix.
         accuracy: typeof c.accuracy === "number" ? c.accuracy : Infinity,
-        at,
+        at: saneAt(pos.timestamp),
         heading: typeof c.heading === "number" ? c.heading : null,
         speed: typeof c.speed === "number" ? c.speed : null,
       });
@@ -239,13 +409,18 @@ function startFakeWatch(
   );
   window.addEventListener("keydown", onKey);
   const timer = setInterval(tick, FAKE_FIX_INTERVAL_MS);
-  emit();
+  // Async like every real source: a synchronous first fix re-enters the
+  // finder's watch setup before it has finished (recursion, found by the
+  // 1.3.3 simulator sweep). Real geolocation never delivers synchronously,
+  // so the fake must not either.
+  const firstEmit = setTimeout(emit, 0);
 
   let stopped = false;
   return {
     stop(reason) {
       if (stopped) return;
       stopped = true;
+      clearTimeout(firstEmit);
       clearInterval(timer);
       window.removeEventListener("keydown", onKey);
       console.log(`finder: GPS watch stopped (${reason})`);

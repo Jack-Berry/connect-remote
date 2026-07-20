@@ -356,15 +356,17 @@ export const FINDER_FOOT_H = 128;
 // else packs around it on the 288px panel:
 //   0–36    debug strip (blank in release builds)
 //   36–180  circled arrow, centred
-//   180–228 distance headline
-//   228–288 detail + hint (two lines — formatFinder's compact mode)
+//   180–224 distance headline (single line)
+//   224–288 detail + hint — 64px, because two ~32px text lines in a 60px box
+//           trip LVGL's overflow scrollbar (a 4px bar at the right edge,
+//           caught by the release-round simulator sweep)
 export const FINDER_IMG_SIZE = 144;
 export const FINDER_IMG_X = (576 - FINDER_IMG_SIZE) / 2;
 export const FINDER_IMG_Y = 36;
 export const FINDER_IMG_MAIN_Y = 180;
-export const FINDER_IMG_MAIN_H = 48;
-export const FINDER_IMG_FOOT_Y = 228;
-export const FINDER_IMG_FOOT_H = 60;
+export const FINDER_IMG_MAIN_H = 44;
+export const FINDER_IMG_FOOT_Y = 224;
+export const FINDER_IMG_FOOT_H = 64;
 
 export interface FinderContent {
   main: string;

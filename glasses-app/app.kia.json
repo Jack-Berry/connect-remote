@@ -2,7 +2,7 @@
   "package_id": "com.jackberry.kiaremote",
   "edition": "202601",
   "name": "Kia Remote",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",

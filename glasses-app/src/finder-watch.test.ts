@@ -15,6 +15,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  type ArrivalProgress,
   CourseTracker,
   type Fix,
   type FinderProblem,
@@ -119,6 +120,7 @@ function finderHarness() {
     fix: null as Fix | null,
     problem: null as FinderProblem | null,
     octant: null as number | null,
+    arrival: null as ArrivalProgress | null,
   };
   const frames: { mode: string; headline: string }[] = [];
   const handlers: WatchHandlers = {
@@ -141,9 +143,11 @@ function finderHarness() {
       now: Date.now(),
       unit: "km",
       prevOctant: state.octant,
+      arrival: state.arrival,
       problem: state.problem,
     });
     state.octant = v.octant;
+    state.arrival = v.arrival;
     frames.push({ mode: v.mode, headline: v.headline });
   }
   return { handlers, frames };
@@ -370,226 +374,165 @@ describe("startPositionWatch production shape", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Keepalive socket (Round 3 spike): the socket's only job is existing, so the
-// whole contract is lifecycle — open, survive drops with backoff, stop dead.
+// Bridge App Location source (Round 4): the Navigaze path. geo.ts must prefer
+// the host's location session, map AppLocation → Fix faithfully, and fall
+// back to WebView geolocation on hosts where the bridge is a dead letter.
 
-import {
-  type SocketLike,
-  createSocketTelemetry,
-  openKeepaliveSocket,
-} from "./finder-socket";
+import type { AppLocationBridge } from "./geo";
 
-class FakeWebSocket implements SocketLike {
-  onopen: (() => void) | null = null;
-  onclose: ((ev: { code?: number }) => void) | null = null;
-  onerror: (() => void) | null = null;
-  closed = false;
-  close(): void {
-    this.closed = true;
+class FakeLocationBridge implements AppLocationBridge {
+  cb: ((loc: never) => void) | null = null;
+  startCalls = 0;
+  stopCalls = 0;
+  unsubscribes = 0;
+  startResult: () => Promise<boolean> = () => Promise.resolve(true);
+
+  startAppLocationUpdates(): Promise<boolean> {
+    this.startCalls++;
+    return this.startResult();
   }
-  open(): void {
-    this.onopen?.();
+  stopAppLocationUpdates(): Promise<boolean> {
+    this.stopCalls++;
+    return Promise.resolve(true);
   }
-  drop(code: number): void {
-    this.onclose?.({ code });
-  }
-}
-
-function socketFactory() {
-  const sockets: FakeWebSocket[] = [];
-  const make = () => {
-    const s = new FakeWebSocket();
-    sockets.push(s);
-    return s;
-  };
-  return { sockets, make };
-}
-
-describe("keepalive socket lifecycle", () => {
-  it("opens, drops, backs off, reconnects — and counts all of it", async () => {
-    const { sockets, make } = socketFactory();
-    const telemetry = createSocketTelemetry();
-    const socket = openKeepaliveSocket("wss://example/ws", telemetry, make);
-
-    expect(sockets).toHaveLength(1);
-    expect(telemetry.state).toBe("connecting");
-    sockets[0].open();
-    expect(telemetry.state).toBe("open");
-    expect(telemetry.opens).toBe(1);
-
-    // Network drop: closed, one reconnect scheduled 5s out.
-    sockets[0].drop(1006);
-    expect(telemetry.state).toBe("closed");
-    expect(telemetry.lastCloseCode).toBe(1006);
-    expect(telemetry.reconnects).toBe(1);
-    expect(sockets).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(sockets).toHaveLength(2);
-
-    // Recovery resets the backoff ladder.
-    sockets[1].open();
-    expect(telemetry.opens).toBe(2);
-    expect(telemetry.state).toBe("open");
-
-    socket.stop("test done");
-  });
-
-  it("escalates the backoff on consecutive failures and never gives up", async () => {
-    const { sockets, make } = socketFactory();
-    const telemetry = createSocketTelemetry();
-    const socket = openKeepaliveSocket("wss://example/ws", telemetry, make);
-
-    // Fail every attempt without ever opening: delays 5, 10, 20, 30, 30…
-    const expectAfter = async (ms: number, count: number) => {
-      await vi.advanceTimersByTimeAsync(ms);
-      expect(sockets).toHaveLength(count);
+  onAppLocationChanged(cb: (loc: never) => void): () => void {
+    this.cb = cb as never;
+    return () => {
+      this.unsubscribes++;
+      this.cb = null;
     };
-    sockets[0].drop(1006);
-    await expectAfter(5_000, 2);
-    sockets[1].drop(1006);
-    await expectAfter(10_000, 3);
-    sockets[2].drop(1006);
-    await expectAfter(20_000, 4);
-    sockets[3].drop(1006);
-    await expectAfter(30_000, 5);
-    sockets[4].drop(1006);
-    await expectAfter(30_000, 6); // capped, still trying
-    expect(telemetry.reconnects).toBe(5);
-
-    socket.stop("test done");
-  });
-
-  it("stop closes the socket, cancels the retry, and ignores the echo", async () => {
-    const { sockets, make } = socketFactory();
-    const telemetry = createSocketTelemetry();
-    const socket = openKeepaliveSocket("wss://example/ws", telemetry, make);
-    sockets[0].open();
-
-    socket.stop("finder exit");
-    socket.stop("again"); // idempotent
-    expect(sockets[0].closed).toBe(true);
-    expect(telemetry.state).toBe("stopped");
-
-    // The close event caused by our own close() must not count as a drop,
-    // and no reconnect may ever fire again.
-    sockets[0].drop(1000);
-    await vi.advanceTimersByTimeAsync(300_000);
-    expect(telemetry.reconnects).toBe(0);
-    expect(sockets).toHaveLength(1);
-  });
-
-  it("treats a constructor throw as a drop and retries", async () => {
-    const { sockets, make } = socketFactory();
-    let failFirst = true;
-    const flaky = () => {
-      if (failFirst) {
-        failFirst = false;
-        throw new Error("blocked scheme");
-      }
-      return make();
-    };
-    const telemetry = createSocketTelemetry();
-    const socket = openKeepaliveSocket("wss://example/ws", telemetry, flaky);
-
-    expect(telemetry.state).toBe("closed");
-    expect(telemetry.reconnects).toBe(1);
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(sockets).toHaveLength(1);
-    sockets[0].open();
-    expect(telemetry.state).toBe("open");
-
-    socket.stop("test done");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Image direction indicator: frame selection, no-op skipping, and the live
-// glyph fallback when the host rejects a push (the unverified-over-BLE case).
-
-import type { ArrowFrames } from "./arrow-frames";
-import { createImageIndicator } from "./direction";
-import { ARROWS } from "./finder";
-
-function stubFrames(): ArrowFrames {
-  return {
-    // Tag frames so a test can read back exactly what was pushed:
-    // [octant|98=ring, dim] and [255] for blank.
-    get: (octant, dim) => [octant ?? 98, dim ? 1 : 0],
-    blank: () => [255],
-    renderMs: 0,
-  };
+  }
+  emit(loc: Record<string, unknown>): void {
+    (this.cb as unknown as ((l: unknown) => void) | null)?.(loc);
+  }
 }
 
-function indicatorHarness(opts: { failPushes?: boolean; failRender?: boolean } = {}) {
-  const pushes: number[][] = [];
-  const glyphs: string[] = [];
-  const indicator = createImageIndicator(
-    async (_ids, data) => {
-      if (opts.failPushes) throw new Error("host rejected image");
-      pushes.push(data);
-    },
-    async (_ids, content) => {
-      glyphs.push(content);
-    },
-    () => {
-      if (opts.failRender) throw new Error("no canvas");
-      return stubFrames();
-    },
+function bridgeWatch(host: FakeLocationBridge) {
+  const { handlers, frames } = finderHarness();
+  const telemetry = createFinderTelemetry(Date.now());
+  const watch = createFinderWatch(handlers, CAR, telemetry, (h, c) =>
+    startPositionWatch(h, c, host),
   );
-  return { indicator, pushes, glyphs };
+  return { watch, telemetry, frames };
 }
 
-describe("image direction indicator", () => {
-  it("pushes on change only, and encodes ring/dim/blank states", async () => {
-    const { indicator, pushes } = indicatorHarness();
-    indicator.prepare?.();
+describe("bridge location source", () => {
+  it("prefers the bridge and maps AppLocation into Fix (heading/speed included)", async () => {
+    const host = new FakeLocationBridge();
+    const { watch, telemetry, frames } = bridgeWatch(host);
+    expect(telemetry.source).toBe("bridge");
+    expect(host.startCalls).toBe(1);
+    expect(geo.watchCalls).toBe(0); // webkit untouched
 
-    await indicator.update(null, { ring: true, dim: false }); // locating: ring
-    await indicator.update(null, { ring: true, dim: false }); // no-op
-    expect(pushes).toEqual([[98, 0]]);
+    const here = offset(CAR, 180, 150);
+    host.emit({
+      latitude: here.lat,
+      longitude: here.lon,
+      accuracy: 7,
+      speed: 1.4,
+      heading: 0, // walking due north, straight at the car
+      timestamp: Date.now(),
+    });
+    expect(telemetry.usableFixes).toBe(1);
+    // Device heading + speed above the gate ⇒ instant course ⇒ walking mode
+    // on the very first fix — the opportunistic upgrade the bridge enables.
+    expect(frames.at(-1)?.mode).toBe("walking");
 
-    await indicator.update(2, { ring: true, dim: false }); // walking east
-    await indicator.update(2, { ring: true, dim: false }); // no-op
-    expect(pushes).toEqual([[98, 0], [2, 0]]);
-
-    await indicator.update(2, { ring: true, dim: true }); // stale → dim
-    expect(pushes.at(-1)).toEqual([2, 1]);
-
-    await indicator.update(null, { ring: false, dim: false }); // problem → blank
-    expect(pushes.at(-1)).toEqual([255]);
+    watch.stop("test done");
+    expect(host.unsubscribes).toBe(1);
+    expect(host.stopCalls).toBe(1);
   });
 
-  it("re-pushes after reset (page rebuilt underneath)", async () => {
-    const { indicator, pushes } = indicatorHarness();
-    indicator.prepare?.();
-    await indicator.update(3, { ring: true, dim: false });
-    indicator.reset();
-    await indicator.update(3, { ring: true, dim: false });
-    expect(pushes).toEqual([[3, 0], [3, 0]]);
+  it("treats missing accuracy as Infinity and counts the rejection", async () => {
+    const host = new FakeLocationBridge();
+    const { watch, telemetry } = bridgeWatch(host);
+    const here = offset(CAR, 180, 150);
+    host.emit({ latitude: here.lat, longitude: here.lon, timestamp: Date.now() });
+    expect(telemetry.rawFixes).toBe(1);
+    expect(telemetry.usableFixes).toBe(0);
+    expect(telemetry.lastRejectedAccuracy).toBe(Infinity);
+    watch.stop("test done");
   });
 
-  it("falls back to the glyph cell when the host rejects a push", async () => {
-    const { indicator, pushes, glyphs } = indicatorHarness({ failPushes: true });
-    indicator.prepare?.();
-
-    await indicator.update(4, { ring: true, dim: false });
-    expect(pushes).toHaveLength(0);
-    expect(glyphs).toHaveLength(1);
-    expect(glyphs[0]).toContain(ARROWS[4]); // ↓
-
-    // Fallback keeps diffing like the real glyph renderer.
-    await indicator.update(4, { ring: true, dim: false });
-    expect(glyphs).toHaveLength(1);
-    await indicator.update(6, { ring: true, dim: false });
-    expect(glyphs).toHaveLength(2);
-    expect(glyphs[1]).toContain(ARROWS[6]); // ←
+  it("sanitises a wrong-epoch bridge timestamp", async () => {
+    const host = new FakeLocationBridge();
+    const { watch, frames } = bridgeWatch(host);
+    // Seconds epoch + walking fixes: course must still form.
+    for (let i = 0; i < 40; i++) {
+      const p = offset(CAR, 180, 150 - i * 1.4);
+      host.emit({
+        latitude: p.lat,
+        longitude: p.lon,
+        accuracy: 8,
+        timestamp: Math.floor(Date.now() / 1000),
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(frames.map((f) => f.mode)).toContain("walking");
+    watch.stop("test done");
   });
 
-  it("falls back to the glyph when the canvas render itself fails", async () => {
-    const { indicator, glyphs } = indicatorHarness({ failRender: true });
-    indicator.prepare?.(); // must not throw
-    await indicator.update(0, { ring: true, dim: false });
-    expect(glyphs).toHaveLength(1);
-    expect(glyphs[0]).toContain(ARROWS[0]); // ↑
+  it("ignores junk coordinates without crashing", async () => {
+    const host = new FakeLocationBridge();
+    const { watch, telemetry } = bridgeWatch(host);
+    host.emit({ latitude: NaN, longitude: -0.12, accuracy: 5 });
+    host.emit({});
+    expect(telemetry.rawFixes).toBe(0);
+    watch.stop("test done");
+  });
+
+  it("falls back to webkit when the host refuses to start", async () => {
+    const host = new FakeLocationBridge();
+    host.startResult = () => Promise.resolve(false);
+    const { watch, telemetry } = bridgeWatch(host);
+    await vi.advanceTimersByTimeAsync(0); // let the start promise settle
+    expect(telemetry.source).toBe("webkit");
+    expect(host.unsubscribes).toBe(1);
+    expect(host.stopCalls).toBe(1); // bridge side torn down
+    expect(geo.watchCalls).toBe(1); // webkit watch took over
+
+    geo.emit(offset(CAR, 180, 100), 10);
+    expect(telemetry.usableFixes).toBe(1);
+    watch.stop("test done");
+    expect(geo.cleared).toHaveLength(1); // stop reaches the fallback watch
+  });
+
+  it("falls back to webkit when the start call rejects", async () => {
+    const host = new FakeLocationBridge();
+    host.startResult = () => Promise.reject(new Error("Flutter handler not available"));
+    const { watch, telemetry } = bridgeWatch(host);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(telemetry.source).toBe("webkit");
+    expect(geo.watchCalls).toBe(1);
+    watch.stop("test done");
+  });
+
+  it("falls back to webkit when the bridge starts but never delivers", async () => {
+    const host = new FakeLocationBridge();
+    const { watch, telemetry } = bridgeWatch(host);
+    expect(telemetry.source).toBe("bridge");
+    // 20s of silence: the host said yes and did nothing (old app that
+    // half-implements the handler). Must not wait for the 45s watchdog.
+    await vi.advanceTimersByTimeAsync(20_500);
+    expect(telemetry.source).toBe("webkit");
+    expect(geo.watchCalls).toBe(1);
+
+    geo.emit(offset(CAR, 180, 100), 10);
+    expect(telemetry.usableFixes).toBe(1);
+    watch.stop("test done");
+  });
+
+  it("does not fall back while bridge fixes are flowing", async () => {
+    const host = new FakeLocationBridge();
+    const { watch, telemetry } = bridgeWatch(host);
+    for (let i = 0; i < 60; i++) {
+      const p = offset(CAR, 180, 150 - i);
+      host.emit({ latitude: p.lat, longitude: p.lon, accuracy: 8, timestamp: Date.now() });
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(telemetry.source).toBe("bridge");
+    expect(telemetry.usableFixes).toBe(60);
+    expect(geo.watchCalls).toBe(0);
+    watch.stop("test done");
   });
 });

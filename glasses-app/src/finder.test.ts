@@ -295,18 +295,93 @@ describe("finderView", () => {
     );
   });
 
-  it("stops claiming precision once the user is on top of the car", () => {
-    const v = finderView({
+  it("arrives only after two consecutive fixes inside the accuracy-scaled radius", () => {
+    // accuracy 8 ⇒ radius max(10, 1.5×8) = 12m; standing 8m out qualifies.
+    const near = (at: number) => fix(offset(CAR, 45, 8), at);
+    const first = finderView({ ...base, fix: near(1000), course: 45 });
+    // One qualifying fix is never enough — GPS noise must not end the walk.
+    expect(first.mode).toBe("walking");
+    expect(first.arrival.streak).toBe(1);
+    const second = finderView({
       ...base,
-      fix: fix(offset(CAR, 45, 15), now),
+      fix: near(2000),
       course: 45,
+      arrival: first.arrival,
     });
-    expect(v.mode).toBe("arrived");
-    expect(v.headline).toBe("You're here");
+    expect(second.mode).toBe("arrived");
+    expect(second.headline).toBe("You're here");
     // Not "you have arrived": GPS can't see which floor of the car park
     // you're on, and the car's own coordinates are worth ±10-30m.
-    expect(v.detail).toBe("Check nearby");
-    expect(v.arrow).toBeNull();
+    expect(second.detail).toBe("Check nearby");
+    expect(second.arrow).toBeNull();
+  });
+
+  it("does not let the 1 Hz tick count the same fix twice", () => {
+    const f = fix(offset(CAR, 45, 8), 1000);
+    const first = finderView({ ...base, fix: f, course: 45 });
+    const rerender = finderView({
+      ...base,
+      fix: f,
+      course: 45,
+      arrival: first.arrival,
+    });
+    expect(rerender.mode).toBe("walking");
+    expect(rerender.arrival.streak).toBe(1);
+  });
+
+  it("widens the radius for a poor fix and honestly says 'close', not 'here'", () => {
+    // accuracy 30 ⇒ radius 45m: 40m out triggers, but claiming "here" off a
+    // ±30m fix would send people to the wrong bay with confidence.
+    const wide = (at: number) =>
+      fix(offset(CAR, 45, 40), at, { accuracy: 30 });
+    const first = finderView({ ...base, fix: wide(1000), course: null });
+    const second = finderView({
+      ...base,
+      fix: wide(2000),
+      course: null,
+      arrival: first.arrival,
+    });
+    expect(second.mode).toBe("arrived");
+    expect(second.headline).toBe("You're close");
+    expect(second.detail).toBe("Check nearby");
+  });
+
+  it("resets the streak when a fix wanders back out of the radius", () => {
+    const a = finderView({
+      ...base,
+      fix: fix(offset(CAR, 45, 8), 1000),
+      course: null,
+    });
+    const b = finderView({
+      ...base,
+      fix: fix(offset(CAR, 45, 60), 2000),
+      course: null,
+      arrival: a.arrival,
+    });
+    expect(b.arrival.streak).toBe(0);
+    const c = finderView({
+      ...base,
+      fix: fix(offset(CAR, 45, 8), 3000),
+      course: null,
+      arrival: b.arrival,
+    });
+    expect(c.mode).not.toBe("arrived"); // streak restarted at 1
+  });
+
+  it("never arrives off fixes too tight for the distance", () => {
+    // 30m away with 10m accuracy ⇒ radius 15m: no number of fixes arrives.
+    const a = finderView({
+      ...base,
+      fix: fix(offset(CAR, 45, 30), 1000, { accuracy: 10 }),
+      course: null,
+    });
+    const b = finderView({
+      ...base,
+      fix: fix(offset(CAR, 45, 30), 2000, { accuracy: 10 }),
+      course: null,
+      arrival: a.arrival,
+    });
+    expect(b.mode).toBe("stationary");
   });
 
   it("adds the parked age only when the position is genuinely old", () => {

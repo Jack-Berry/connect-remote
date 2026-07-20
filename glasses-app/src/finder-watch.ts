@@ -18,6 +18,7 @@
 import type { FinderProblem, LatLon } from "./finder";
 import { isUsableFix } from "./finder";
 import {
+  type PositionSource,
   type PositionWatch,
   type WatchHandlers,
   startPositionWatch,
@@ -54,6 +55,9 @@ export interface FinderWatchTelemetry {
   restarts: number;
   /** Fresh watches forced by the phone screen coming back (main.ts). */
   resumes: number;
+  /** Which source is feeding fixes (bridge/webkit/fake); null before the
+   *  first watch reports in. Changes if a bridge watch falls back. */
+  source: PositionSource | null;
   startedAt: number;
 }
 
@@ -71,6 +75,7 @@ export function createFinderTelemetry(now: number): FinderWatchTelemetry {
     lastSignalAt: 0,
     restarts: 0,
     resumes: 0,
+    source: null,
     startedAt: now,
   };
 }
@@ -113,6 +118,10 @@ export function createFinderWatch(
       telemetry.lastProblem = problem;
       telemetry.lastSignalAt = now();
       handlers.onProblem(problem);
+    },
+    onSource(source) {
+      telemetry.source = source;
+      handlers.onSource?.(source);
     },
   };
 
