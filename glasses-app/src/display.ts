@@ -40,6 +40,19 @@ export const FINDER_FOOT_CONTAINER = {
   containerID: 11,
   containerName: "finderfoot",
 };
+// Debug-build telemetry strip along the finder's empty top edge (see
+// FINDER_DEBUG in main.ts). Not part of the release layout.
+export const FINDER_DEBUG_CONTAINER = {
+  containerID: 12,
+  containerName: "finderdebug",
+};
+// The circled-arrow image (Round 3). Lives beside the glyph containers: the
+// page carries both, and the glyph cell is the live fallback if the host
+// rejects image pushes over real BLE (formally unverified until this build).
+export const FINDER_IMG_CONTAINER = {
+  containerID: 13,
+  containerName: "finderimg",
+};
 
 // Geometry shared with main.ts. Sidebar is wide enough for the longest item
 // label ("Refresh · updated 14:12" ≈ 200px + list item padding).
@@ -338,6 +351,21 @@ export const FINDER_MAIN_H = 48;
 export const FINDER_FOOT_Y = 160;
 export const FINDER_FOOT_H = 128;
 
+// Image-arrow layout (Round 3, owner's mockup: big circled arrow dominant,
+// distance beneath). The 144px image is the SDK's height cap; everything
+// else packs around it on the 288px panel:
+//   0–36    debug strip (blank in release builds)
+//   36–180  circled arrow, centred
+//   180–228 distance headline
+//   228–288 detail + hint (two lines — formatFinder's compact mode)
+export const FINDER_IMG_SIZE = 144;
+export const FINDER_IMG_X = (576 - FINDER_IMG_SIZE) / 2;
+export const FINDER_IMG_Y = 36;
+export const FINDER_IMG_MAIN_Y = 180;
+export const FINDER_IMG_MAIN_H = 48;
+export const FINDER_IMG_FOOT_Y = 228;
+export const FINDER_IMG_FOOT_H = 60;
+
 export interface FinderContent {
   main: string;
   foot: string;
@@ -347,11 +375,16 @@ export interface FinderContent {
  * The finder's text containers. The direction indicator is NOT here — it is
  * behind the DirectionIndicator interface in direction.ts, so the glyph
  * renderer can be swapped for an image-container one without touching this.
+ *
+ * `compact` is the image-arrow layout's foot: 60px fits two lines, so the
+ * blank spacer goes and multi-line problem details fold onto one line (they
+ * all fit 576px single-lined).
  */
-export function formatFinder(view: FinderView): FinderContent {
+export function formatFinder(view: FinderView, compact = false): FinderContent {
+  const detail = compact ? view.detail.replace(/\n/g, " ") : view.detail;
   const footLines: string[] = [];
-  if (view.detail) footLines.push(view.detail);
-  footLines.push("");
+  if (detail) footLines.push(detail);
+  if (!compact) footLines.push("");
   footLines.push(view.hint);
   return {
     main: centerBlock(view.headline, HUD_INNER_W),

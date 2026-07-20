@@ -1,6 +1,7 @@
 import {
   waitForEvenAppBridge,
   CreateStartUpPageContainer,
+  ImageRawDataUpdate,
   ListContainerProperty,
   ListItemContainerProperty,
   OsEventTypeList,
@@ -12,9 +13,11 @@ import {
 import {
   ApiError,
   BackendClient,
+  PROXY_URL,
   TimeoutError,
   type VehicleStatus,
 } from "./api";
+import { renderArrowFrames } from "./arrow-frames";
 import { BRAND, applyBrand } from "./brand";
 import {
   CONNECTING_TEXT,
@@ -23,9 +26,14 @@ import {
   CONNECT_SPIN_W,
   CONNECT_SPIN_X,
   FINDER_CONTAINER,
+  FINDER_DEBUG_CONTAINER,
   FINDER_FOOT_CONTAINER,
   FINDER_FOOT_H,
   FINDER_FOOT_Y,
+  FINDER_IMG_FOOT_H,
+  FINDER_IMG_FOOT_Y,
+  FINDER_IMG_MAIN_H,
+  FINDER_IMG_MAIN_Y,
   FINDER_MAIN_CONTAINER,
   FINDER_MAIN_H,
   FINDER_MAIN_Y,
@@ -48,15 +56,26 @@ import {
   sameMenu,
   spinnerFrame,
 } from "./display";
-import { createGlyphIndicator } from "./direction";
+import { createGlyphIndicator, createImageIndicator } from "./direction";
 import {
   CourseTracker,
   type Fix,
   type FinderProblem,
   finderView,
-  isUsableFix,
+  formatParkedAge,
 } from "./finder";
-import { type PositionWatch, startPositionWatch } from "./geo";
+import {
+  type KeepaliveSocket,
+  type SocketTelemetry,
+  createSocketTelemetry,
+  openKeepaliveSocket,
+} from "./finder-socket";
+import {
+  type FinderWatch,
+  type FinderWatchTelemetry,
+  createFinderTelemetry,
+  createFinderWatch,
+} from "./finder-watch";
 import {
   type AppSettings,
   type Bridge,
@@ -428,7 +447,43 @@ const ARRIVAL_HOLD_MS = 3000;
  *  expiring (user stopped walking) flips back to cardinal text promptly. */
 const FINDER_TICK_MS = 1000;
 
-let finderWatch: PositionWatch | null = null;
+// Telemetry strip on the finder screen (top edge) plus the Finder line in the
+// diagnostic report. ON for the 1.3.x hardware-debug builds — the 1.3.0 walk
+// froze with zero ways to tell which link died. Flip to false for a store
+// release; the report line stays either way.
+const FINDER_DEBUG = true;
+// The circled-arrow image indicator (Round 3). false = the 1.3.1 glyph
+// layout, kept as the fallback build if the image path misbehaves over BLE.
+const FINDER_IMAGE_ARROW = true;
+// Dim-grey ring/arrow when the car position is stale — the staleness-channel
+// experiment. The simulator normalises greys, so only a hardware walk can
+// judge it; flip false if it's illegible.
+const STALE_DIM_ENABLED = true;
+// Round 3 spike: hold a do-nothing WebSocket open while the finder runs, to
+// test whether a live socket keeps iOS from suspending the WebView on screen
+// lock (it does for AbleShow). Costs one idle connection; carries no data.
+const FINDER_KEEPALIVE_SOCKET = true;
+const KEEPALIVE_WS_URL =
+  PROXY_URL.replace(/\/$/, "").replace(/^http/, "ws") + "/ws";
+
+// Shown briefly when a screen-wake restart fires: honest guidance that works
+// on any backend, whatever the socket spike concludes.
+const KEEP_UNLOCKED_NOTE = "Keep phone unlocked while finding your car";
+const FINDER_NOTE_MS = 6000;
+let finderNoteUntil = 0;
+
+let finderSocket: KeepaliveSocket | null = null;
+// Like finderTelem: survives finder exit for the diagnostic report.
+let socketTelem: SocketTelemetry | null = null;
+
+let finderWatch: FinderWatch | null = null;
+// One per finder session (created on entry, kept across watchdog/screen-wake
+// watch replacements, and after exit for the diagnostic report).
+let finderTelem: FinderWatchTelemetry | null = null;
+// Repaints attempted vs completed. A growing gap is the signature of the
+// bridge serialization chain jamming on a call that never settled — on-screen
+// it is indistinguishable from GPS death, which is why it's counted.
+let finderRenders = { started: 0, done: 0 };
 let finderTick: ReturnType<typeof setInterval> | null = null;
 let finderArrival: ReturnType<typeof setTimeout> | null = null;
 let finderFix: Fix | null = null;
@@ -439,11 +494,43 @@ const finderCourse = new CourseTracker();
 // actually changed — an unchanged upgrade is a wasted bridge call. (The
 // direction indicator does its own diffing behind its interface.)
 let finderShown: { main: string; foot: string } | null = null;
+let finderDebugShown: string | null = null;
 
-// The arrow, behind a swappable interface: the glyph renderer ships now and
-// stays as the fallback; an image-container renderer (large arrow in a circle)
-// drops in here once the hot-swap spike says whether that's viable.
-const directionIndicator = createGlyphIndicator(upgradeText);
+// The arrow, behind the DirectionIndicator seam. Round 3 default is the
+// image renderer (large circled arrow, the owner's mockup); the glyph
+// renderer remains both the flag fallback (FINDER_IMAGE_ARROW=false) and the
+// image renderer's own live fallback if a push fails over real BLE.
+function pushImage(
+  ids: { containerID: number; containerName: string },
+  imageData: number[],
+) {
+  // Same serialization chain as text upgrades: the SDK is explicit that
+  // image transmissions must not overlap anything on the BLE link.
+  return enqueue(() =>
+    bridge.updateImageRawData(new ImageRawDataUpdate({ ...ids, imageData })),
+  );
+}
+const directionIndicator = FINDER_IMAGE_ARROW
+  ? createImageIndicator(pushImage, upgradeText, renderArrowFrames)
+  : createGlyphIndicator(upgradeText);
+
+// Geometry shifts when the image dominates the screen (image layout packs
+// headline+foot below the 144px arrow; text layout is the 1.3.1 one).
+const FINDER_GEOM = FINDER_IMAGE_ARROW
+  ? {
+      mainY: FINDER_IMG_MAIN_Y,
+      mainH: FINDER_IMG_MAIN_H,
+      footY: FINDER_IMG_FOOT_Y,
+      footH: FINDER_IMG_FOOT_H,
+      compact: true,
+    }
+  : {
+      mainY: FINDER_MAIN_Y,
+      mainH: FINDER_MAIN_H,
+      footY: FINDER_FOOT_Y,
+      footH: FINDER_FOOT_H,
+      compact: false,
+    };
 
 function finderPage(content: { main: string; foot: string }) {
   const cell = (
@@ -467,7 +554,7 @@ function finderPage(content: { main: string; foot: string }) {
 
   const direction = directionIndicator.containers();
   return {
-    containerTotalNum: 3 + direction.count,
+    containerTotalNum: 3 + direction.count + (FINDER_DEBUG ? 1 : 0),
     textObject: [
       new TextContainerProperty({
         xPosition: 0,
@@ -482,8 +569,11 @@ function finderPage(content: { main: string; foot: string }) {
         isEventCapture: 1,
       }),
       ...direction.textObject,
-      cell(FINDER_MAIN_CONTAINER, FINDER_MAIN_Y, FINDER_MAIN_H, content.main),
-      cell(FINDER_FOOT_CONTAINER, FINDER_FOOT_Y, FINDER_FOOT_H, content.foot),
+      cell(FINDER_MAIN_CONTAINER, FINDER_GEOM.mainY, FINDER_GEOM.mainH, content.main),
+      cell(FINDER_FOOT_CONTAINER, FINDER_GEOM.footY, FINDER_GEOM.footH, content.foot),
+      // Telemetry strip in the otherwise-empty top band (arrow row starts at
+      // y=36). Painted by renderFinder; " " keeps the first frame clean.
+      ...(FINDER_DEBUG ? [cell(FINDER_DEBUG_CONTAINER, 0, 36, " ")] : []),
     ],
     ...(direction.imageObject?.length
       ? { imageObject: direction.imageObject }
@@ -512,16 +602,32 @@ function finderContent() {
       problem: finderProblem,
     });
     finderOctant = v.octant;
+    // The screen-wake guidance note borrows the detail line briefly; problem
+    // states keep their own explanation (it outranks advice).
+    const detail =
+      v.mode !== "problem" && Date.now() < finderNoteUntil
+        ? KEEP_UNLOCKED_NOTE
+        : v.detail;
     return {
       arrived: v.mode === "arrived",
       octant: v.octant,
-      content: formatFinder(v),
+      mode: v.mode as string,
+      // Stale car position drives the dim-grey experiment on the image ring.
+      stale:
+        STALE_DIM_ENABLED &&
+        formatParkedAge(
+          lastStatus?.location_last_updated ?? null,
+          Date.now(),
+        ) != null,
+      content: formatFinder({ ...v, detail }, FINDER_GEOM.compact),
     };
   } catch (err) {
     recordError("render/finder", err);
     return {
       arrived: false,
       octant: null,
+      mode: "crash",
+      stale: false,
       content: formatFinder({
         mode: "problem",
         arrow: null,
@@ -529,9 +635,40 @@ function finderContent() {
         detail: SAFE_NOTE,
         hint: "Tap: back · 2x tap: close app",
         octant: null,
-      }),
+      }, FINDER_GEOM.compact),
     };
   }
+}
+
+/** One line that tells the walker which link is dead while it's dead:
+ *  raw-fix count (platform delivering?), usable count (filter passing?),
+ *  seconds since the last fix, repaints done/attempted (bridge alive?),
+ *  watch replacements (watchdog+screen-wake), and the current mode. The
+ *  age counter changing every second doubles as a JS-alive heartbeat —
+ *  if this line freezes, the whole WebView is suspended. */
+function finderDebugLine(mode: string): string {
+  const t = finderTelem;
+  if (!t) return "no watch";
+  const age = t.lastFixAt
+    ? `${Math.max(0, Math.round((Date.now() - t.lastFixAt) / 1000))}s`
+    : "–";
+  const rejected = t.rawFixes - t.usableFixes;
+  // Socket glyphs: ✓ open, … connecting, ✗ closed/stopped; the count after
+  // ✗ is reconnect attempts (the drop count, i.e. how flaky the link is).
+  const s = socketTelem;
+  const ws = !s
+    ? ""
+    : ` · ws${s.state === "open" ? "✓" : s.state === "connecting" ? "…" : "✗"}${
+        s.reconnects ? s.reconnects : ""
+      }`;
+  return (
+    `fx ${t.rawFixes}${rejected ? `(-${rejected})` : ""} ${age}` +
+    ` · rp ${finderRenders.done}/${finderRenders.started}` +
+    ` · rs ${t.restarts}+${t.resumes}` +
+    ws +
+    ` · ${mode}` +
+    (t.lastProblem ? ` !${t.lastProblem}` : "")
+  );
 }
 
 async function renderFinder() {
@@ -539,8 +676,14 @@ async function renderFinder() {
   // Entered before the car reported a position, and a later poll has now
   // supplied one: this is the point where asking for GPS finally makes sense.
   if (carPosition() && !finderWatch && finderTick) startFinderWatch();
-  const { arrived, octant, content } = finderContent();
-  await directionIndicator.update(octant);
+  finderRenders.started++;
+  const { arrived, octant, mode, stale, content } = finderContent();
+  // Ring shows for every located state (walking arrow, stationary/arrived/
+  // locating ring-only); problem and crash states clear the image entirely.
+  await directionIndicator.update(octant, {
+    ring: mode !== "problem" && mode !== "crash",
+    dim: stale,
+  });
   if (content.main !== finderShown?.main) {
     await upgradeText(FINDER_MAIN_CONTAINER, content.main);
   }
@@ -548,6 +691,14 @@ async function renderFinder() {
     await upgradeText(FINDER_FOOT_CONTAINER, content.foot);
   }
   finderShown = content;
+  if (FINDER_DEBUG) {
+    const line = finderDebugLine(mode);
+    if (line !== finderDebugShown) {
+      finderDebugShown = line;
+      await upgradeText(FINDER_DEBUG_CONTAINER, line);
+    }
+  }
+  finderRenders.done++;
 
   // Arrival ends the feature: the job is done, so the watcher stops right
   // here (not on the way out) and the screen holds briefly before returning
@@ -564,7 +715,10 @@ async function renderFinder() {
 
 /** The one place the GPS watch and its timers are torn down. Every exit path
  *  — finder exit, arrival, foreground exit, system exit — calls this, and the
- *  watch logs a line when it stops (handoff §4.6). */
+ *  watch logs a line when it stops (handoff §4.6). The keepalive socket
+ *  follows the same discipline, except across watch restarts (reason
+ *  "restart"): tearing a healthy socket down to replace a GPS watch would
+ *  sabotage the very keep-alive behaviour the socket exists to test. */
 function stopFinderWatch(reason: string) {
   if (finderWatch) {
     finderWatch.stop(reason);
@@ -574,24 +728,39 @@ function stopFinderWatch(reason: string) {
   finderTick = null;
   if (finderArrival) clearTimeout(finderArrival);
   finderArrival = null;
+  if (reason !== "restart" && finderSocket) {
+    finderSocket.stop(reason);
+    finderSocket = null;
+  }
 }
 
 function startFinderWatch() {
   stopFinderWatch("restart");
-  // The 1 Hz repaint runs regardless: it is what lets the course go stale, and
-  // what notices a car position arriving on a later poll.
-  finderTick = setInterval(() => void renderFinder(), FINDER_TICK_MS);
+  // The 1 Hz repaint runs regardless: it is what lets the course go stale,
+  // what notices a car position arriving on a later poll — and now what rides
+  // the stall watchdog, so a watch that died without an error gets replaced.
+  finderTick = setInterval(() => {
+    finderWatch?.poke(Date.now());
+    void renderFinder();
+  }, FINDER_TICK_MS);
+  // The keepalive socket spans the whole finder session (see stopFinderWatch)
+  // and reopens here after a foreground/screen-wake re-entry. Telemetry
+  // accumulates across reopens within the session.
+  if (FINDER_KEEPALIVE_SOCKET && !finderSocket) {
+    socketTelem ??= createSocketTelemetry();
+    finderSocket = openKeepaliveSocket(KEEPALIVE_WS_URL, socketTelem);
+  }
   // No car position ⇒ nothing to compute a bearing to, so don't ask for the
   // location permission at all. Prompting for a sensor we can't use yet is a
   // bad trade; the screen already explains what's missing, and the tick above
   // starts the watch the moment coordinates turn up.
   if (!carPosition()) return;
-  finderWatch = startPositionWatch(
+  finderTelem ??= createFinderTelemetry(Date.now());
+  // The vague-fix filter lives inside createFinderWatch, where a rejection is
+  // a counted event instead of an invisible return.
+  finderWatch = createFinderWatch(
     {
       onFix(fix) {
-        // A fix too vague to trust is worse than no fix: it would move the
-        // distance around by tens of metres and invent a course out of noise.
-        if (!isUsableFix(fix)) return;
         finderProblem = null;
         finderFix = fix;
         finderCourse.push(fix);
@@ -603,8 +772,28 @@ function startFinderWatch() {
       },
     },
     carPosition(),
+    finderTelem,
   );
 }
+
+// Phone screen coming back. FOREGROUND_* events cover the glasses dashboard;
+// they say nothing about the phone's own screen — and a locked phone can
+// suspend the WebView's geolocation (or all of its JS). The 1.3.0 hardware
+// walk froze exactly this way: one fix at entry, nothing after pocketing the
+// phone. A suspended watch may never deliver again after resume, so a fresh
+// one is the only guarantee; the tick/watchdog stay as the belt to this brace.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (backgrounded || view !== "finder" || !finderTick) return;
+  if (finderTelem) finderTelem.resumes++;
+  // The honest guidance, at the exact moment it's true: the finder just lost
+  // (at least) a screen-lock's worth of updates. Shown briefly, then the
+  // normal detail line returns.
+  finderNoteUntil = Date.now() + FINDER_NOTE_MS;
+  console.log("finder: page visible again — replacing GPS watch");
+  startFinderWatch();
+  void renderFinder();
+});
 
 async function enterFinder() {
   view = "finder";
@@ -612,7 +801,17 @@ async function enterFinder() {
   finderProblem = null;
   finderOctant = null;
   finderShown = null;
+  finderDebugShown = null;
+  finderNoteUntil = 0;
+  // Fresh telemetry per session; kept after exit so the diagnostic report can
+  // describe the walk that just failed.
+  finderTelem = createFinderTelemetry(Date.now());
+  socketTelem = FINDER_KEEPALIVE_SOCKET ? createSocketTelemetry() : null;
+  finderRenders = { started: 0, done: 0 };
   finderCourse.reset();
+  // Pre-render the arrow frames before the page goes up: a one-off ~tens of
+  // ms on entry, so the first direction push has frames to draw from.
+  directionIndicator.prepare?.();
   directionIndicator.reset();
   // Paint the first frame ("Locating…", or the explanation if the car never
   // reported a position) before asking for GPS — the permission prompt can
@@ -1489,6 +1688,26 @@ function bindPhoneUi() {
       `Region: ${regionName}`,
       `Device token stored: ${!!settings.kiaUsDeviceToken}`,
       `Last error: ${lastError ? `${lastError.endpoint} → ${lastError.status} (${lastError.detail})` : "none"}`,
+      // The car-finder walk, summarised: which link died is readable from
+      // which counter stopped. No coordinates — counts and ages only.
+      `Finder: ${
+        finderTelem
+          ? `fixes ${finderTelem.rawFixes} raw / ${finderTelem.usableFixes} usable` +
+            `${finderTelem.lastRejectedAccuracy != null ? ` (last reject ±${Math.round(finderTelem.lastRejectedAccuracy)}m)` : ""}` +
+            `, last fix ${finderTelem.lastFixAt ? `${Math.round((Date.now() - finderTelem.lastFixAt) / 1000)}s ago` : "never"}` +
+            `, problems ${finderTelem.problems}${finderTelem.lastProblem ? ` (${finderTelem.lastProblem})` : ""}` +
+            `, restarts ${finderTelem.restarts} watchdog / ${finderTelem.resumes} screen-wake` +
+            `, repaints ${finderRenders.done}/${finderRenders.started}`
+          : "not opened this session"
+      }`,
+      // The keepalive-socket spike, summarised: did the socket hold, and did
+      // holding it change what the fixes did (compare with the line above).
+      `Keepalive: ${
+        socketTelem
+          ? `${socketTelem.state}, opens ${socketTelem.opens}, drops ${socketTelem.reconnects}` +
+            `${socketTelem.lastCloseCode != null ? ` (last close ${socketTelem.lastCloseCode})` : ""}`
+          : "off"
+      }`,
       ``,
     ];
 

@@ -58,13 +58,25 @@ function startRealWatch(handlers: WatchHandlers): PositionWatch {
   const watchId = navigator.geolocation.watchPosition(
     (pos) => {
       const c = pos.coords;
+      // pos.timestamp is trusted only when it is plausibly "now". Embedded
+      // WebViews have shipped it in the wrong epoch (seconds, or 2001-based),
+      // and a wrong `at` silently kills the course: CourseTracker compares it
+      // against Date.now() and concludes every fix is ancient, so the arrow
+      // never appears. Arrival time is within a second of the fix time at
+      // walking pace, so it is a safe substitute.
+      const wallNow = Date.now();
+      const at =
+        typeof pos.timestamp === "number" &&
+        Math.abs(pos.timestamp - wallNow) <= 60_000
+          ? pos.timestamp
+          : wallNow;
       handlers.onFix({
         lat: c.latitude,
         lon: c.longitude,
         // A platform that won't say how accurate it is gets treated as
         // useless rather than perfect — Infinity fails isUsableFix.
         accuracy: typeof c.accuracy === "number" ? c.accuracy : Infinity,
-        at: pos.timestamp || Date.now(),
+        at,
         heading: typeof c.heading === "number" ? c.heading : null,
         speed: typeof c.speed === "number" ? c.speed : null,
       });
