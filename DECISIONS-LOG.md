@@ -3,6 +3,69 @@
 Significant product/architecture decisions, newest first. One entry per
 decision: what changed, why, and what it rules out.
 
+## 2026-07-24 — All bridge calls go through `enqueue`; view transitions are atomic
+
+**Decision:** two invariants, both now enforced in code after 1.4.0-TEST killed
+glasses gestures app-wide on hardware. (1) **Every** bridge call goes through the
+`enqueue` serialization chain — including the finder engine's KV
+(`getLocalStorage`/`setLocalStorage`), which 1.4.0 called directly. (2) A `view`
+transition commits **only once its page rebuild lands**, and rolls back if it
+rejects (`commitView` in the new `glasses-input.ts`). The event router is
+extracted from `main.ts` into that module as a pure function. Genesis → 1.4.2.
+
+**Why:** unserialized bridge traffic jammed the BLE link, so the menu rebuild
+never landed — but `view` had already been set to `"menu"`, leaving the router
+reading a page that wasn't on screen. From there single taps matched no branch
+and every double-tap fell through to the system exit dialog. The router itself
+was byte-identical to the working build; the bug was entirely in the state it
+read.
+
+**What it rules out:** "the simulator sweep passed" is not evidence for anything
+touching the bridge — there is no BLE there, so unserialized calls are invisible
+by construction. That class must be prevented structurally, not observed. And a
+green suite meant nothing here because the router was welded behind main.ts's
+top-level await: the gesture matrix had zero coverage, and no test had ever
+exercised a *rejecting* rebuild. Both closed — see
+`docs-internal/QA-CARFINDER-GESTURE-FIX.md`.
+
+## 2026-07-24 — Shared finder engine; phone radar; "Run background services" is portal-only
+
+**Decision:** extract the car finder's loop into `finder-engine.ts` — one GPS
+watch and state, any number of `FinderRenderer`s attached (ref-counted). The
+glasses become one renderer; a new phone radar (`radar.ts`, standalone-capable)
+is the other. Added an honest first-run permission state (`awaiting`, +
+`location-permission.ts` with a granted-once bridge-KV flag). Genesis → 1.4.0.
+
+**Why:**
+- *Phone finder:* the phone already holds the car coords and talks to the proxy;
+  a radar there works glasses-off and, when both are open, renders the same walk
+  from one watch. "One loop, two renderers" avoids a second GPS session and any
+  mode conflict, and made the orchestration unit-testable for the first time.
+- *Permission honesty:* a field walk showed the iOS prompt sitting invisible on a
+  locked phone while the glasses hung on "Locating…". `awaiting` says "Unlock your
+  phone to allow location access" instead; the phone walkthrough/denied screens
+  carry the recovery. Detection is opportunistic `navigator.permissions` + a
+  granted-once heuristic (the WebView's Permissions-API support is unverified).
+
+**"Run background services" — ruled out as a manifest permission.** The portal
+checkbox is submission metadata, not an `app.json` string: `evenhub pack`
+validates against a closed six-permission enum (network, location, g2-microphone,
+phone-microphone, album, camera); anything else fails packing. The only
+manifest-free background lever is the SDK `setBackgroundState`/`onBackgroundRestore`
+keep-alive.
+
+**Bridge-location test build — deferred, not shipped.** SDK 0.0.10 exposes no App
+Location methods, so `FINDER_BRIDGE_LOCATION=true` is behaviour-identical to
+release (falls back to webkit) — an inert, misleading artifact. Left the flag but
+env-gated it (`VITE_BRIDGE_LOCATION=1`) so the flip is one step *after* an SDK
+0.0.11+ bump. A real locked-pocket bridge walk needs all three: SDK bump (see the
+2026-07-20 revert below), the flag, and the portal toggle enabled.
+
+**Revisit when:** the owner enables the portal toggle and decides the SDK 0.0.11+
+bridge walk is worth re-opening; and on a hardware walk, confirm WebView
+`navigator.permissions` behaviour and bridge-KV persistence of the granted-once
+flag.
+
 ## 2026-07-20 — Bridge-location experiment closed negative; SDK back to 0.0.10
 
 **Decision:** revert to SDK 0.0.10 and WebView geolocation as the finder's

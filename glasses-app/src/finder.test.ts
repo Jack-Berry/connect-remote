@@ -443,6 +443,53 @@ describe("finderView", () => {
     }
   });
 
+  it("distinguishes a waiting permission dialog from acquiring a fix", () => {
+    // The field-tested stuck state: a bare "Locating…" lies while the iOS
+    // prompt sits unanswered on a locked phone. Awaiting says the true thing.
+    const awaiting = finderView({
+      ...base,
+      fix: null,
+      course: null,
+      awaitingPermission: true,
+    });
+    expect(awaiting.mode).toBe("awaiting");
+    expect(awaiting.headline).toBe("Unlock your phone");
+    expect(awaiting.detail).toContain("location access");
+
+    // Permission granted, fix merely still coming ⇒ honest "Locating…".
+    const locating = finderView({
+      ...base,
+      fix: null,
+      course: null,
+      awaitingPermission: false,
+    });
+    expect(locating.mode).toBe("locating");
+    expect(locating.headline).toBe("Locating…");
+  });
+
+  it("stops guessing about permission the moment a fix arrives", () => {
+    // awaitingPermission is a heuristic; a real fix is ground truth and wins.
+    const v = finderView({
+      ...base,
+      fix: fix(offset(CAR, 225, 200), now),
+      course: null,
+      awaitingPermission: true,
+    });
+    expect(v.mode).toBe("stationary");
+  });
+
+  it("lets a hard denial outrank the awaiting-permission guess", () => {
+    const v = finderView({
+      ...base,
+      fix: null,
+      course: null,
+      awaitingPermission: true,
+      problem: "denied",
+    });
+    expect(v.mode).toBe("problem");
+    expect(v.headline).toBe("Location not allowed");
+  });
+
   it("reports a missing car position even when GPS is also broken", () => {
     // Nothing to point at beats "turn your GPS on" — fixing the phone would
     // not help.

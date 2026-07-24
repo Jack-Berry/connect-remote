@@ -281,6 +281,7 @@ export type FinderMode =
   | "walking"
   | "arrived"
   | "locating"
+  | "awaiting"
   | "problem";
 
 /** Why there's no usable phone position. Each one renders an explanation. */
@@ -320,6 +321,13 @@ export interface FinderInput {
   arrival?: ArrivalProgress | null;
   /** Set when the phone position is unavailable for a known reason. */
   problem?: FinderProblem | null;
+  /** The permission dialog is (probably) still waiting to be answered — a
+   *  first-run phone with the finder started from the glasses shows the iOS
+   *  prompt invisibly on a locked screen. Distinct from `locating` (permission
+   *  already granted, a fix is merely still coming) so the copy can say the
+   *  honest thing: unlock the phone, not "Locating…". Ignored once a fix or a
+   *  real `problem` arrives — both outrank a guess about a pending dialog. */
+  awaitingPermission?: boolean | null;
 }
 
 const HINT_BACK = "Tap: back · 2x tap: close app";
@@ -335,6 +343,7 @@ export function finderView(input: FinderInput): FinderView {
     prevOctant = null,
     arrival: prevArrival = null,
     problem = null,
+    awaitingPermission = null,
   } = input;
 
   // No usable fix ⇒ no arrival progress; the streak restarts from zero.
@@ -372,6 +381,19 @@ export function finderView(input: FinderInput): FinderView {
       mode: "problem",
       headline: "No GPS signal",
       detail: "Move somewhere with a\nclearer view of the sky",
+    };
+  }
+  // Waiting on the permission dialog, not on a fix. A first-run phone shows the
+  // iOS prompt invisibly on a locked screen, and a bare "Locating…" then lies
+  // for however long the phone stays pocketed (the field-tested stuck state).
+  // Only reachable with no fix and no hard problem yet — both branches above
+  // and the fix below outrank it.
+  if (awaitingPermission && !fix) {
+    return {
+      ...base,
+      mode: "awaiting",
+      headline: "Unlock your phone",
+      detail: "to allow location access",
     };
   }
   if (!fix) {

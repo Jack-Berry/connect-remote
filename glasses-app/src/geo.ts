@@ -284,7 +284,9 @@ function startRealWatch(handlers: WatchHandlers): PositionWatch {
 //   ↑ walk / stop      ← → turn 15°       c  jump to 15m from the car
 //   f  jump to 400m from the car          x  toggle a GPS dropout
 //
-// `VITE_FAKE_GPS=denied` and `=unavailable` reproduce the two failure screens.
+// `VITE_FAKE_GPS=denied`, `=unavailable` and `=awaiting` reproduce the failure
+// and first-run-permission screens (awaiting also needs the DEV probe override
+// in main.ts).
 
 /** Where the fake car is when /status hasn't given us one (fake backend's). */
 const FAKE_CAR: LatLon = { lat: 51.5072, lon: -0.1276 };
@@ -320,6 +322,15 @@ function startFakeWatch(
   if (mode === "denied" || mode === "unavailable") {
     handlers.onProblem(mode);
     console.log(`finder: DEV fake GPS — reporting "${mode}"`);
+    return { stop: (reason) => console.log(`finder: GPS watch stopped (${reason})`) };
+  }
+
+  // Delivers nothing on purpose: with the engine's probePermission forced to
+  // "prompt" in DEV (main.ts), no fix + no error keeps it in the awaiting-
+  // permission state, so the first-run walkthrough is inspectable without a
+  // real iOS dialog.
+  if (mode === "awaiting") {
+    console.log('finder: DEV fake GPS — "awaiting permission" (no fixes)');
     return { stop: (reason) => console.log(`finder: GPS watch stopped (${reason})`) };
   }
 

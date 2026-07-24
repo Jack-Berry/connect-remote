@@ -104,6 +104,80 @@
       details li { margin: 6px 0; }
       details p { margin: 10px 0; color: #bdbdbd; }
       details a { color: #8fbc8f; }
+
+      /* Find-my-car full-screen overlay. Hidden by default; shown as a flex
+         column when the finder is open. */
+      #finder-screen {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: #232323;
+        flex-direction: column;
+        z-index: 10;
+        padding: calc(8px + env(safe-area-inset-top)) 20px
+          calc(16px + env(safe-area-inset-bottom));
+        box-sizing: border-box;
+      }
+      .finder-top {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-height: 40px;
+      }
+      .finder-back {
+        margin: 0;
+        width: auto;
+        padding: 8px 12px;
+        background: transparent;
+        color: #8fbc8f;
+        font-size: 16px;
+      }
+      .finder-title {
+        font-size: 15px;
+        font-weight: 600;
+        color: #bdbdbd;
+      }
+      .finder-body {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        text-align: center;
+      }
+      .finder-radar {
+        display: block;
+        touch-action: none;
+      }
+      .finder-headline {
+        margin: 12px 0 0;
+        font-size: 30px;
+        font-weight: 600;
+        color: #E5E5E5;
+        min-height: 1.2em;
+      }
+      .finder-detail {
+        margin: 0;
+        font-size: 14px;
+        color: #9a9a9a;
+        min-height: 1.4em;
+      }
+      .finder-message {
+        display: none;
+        max-width: 300px;
+        font-size: 16px;
+        line-height: 1.5;
+        color: #cfcfcf;
+        white-space: pre-line;
+      }
+      .finder-done {
+        margin-top: 24px;
+        width: auto;
+        min-width: 160px;
+        padding: 12px 24px;
+        display: none;
+      }
     </style>
   </head>
   <body>
@@ -210,6 +284,12 @@
       <p class="hint">If something isn't working, copy a diagnostic report and send it to the developer. No passwords or tokens are included.</p>
       <button id="diag-btn" type="button" class="secondary">Copy diagnostic report</button>
       <p id="diag-status" class="status"></p>
+
+      <!-- Deliberately last: glasses-initiated finding is the primary path;
+           this is a bonus companion view that also works without the glasses. -->
+      <h2>Find my car</h2>
+      <p class="hint">Open a radar on this phone that points you back to your car. Works with the glasses on or off. Uses your phone's location on-device only.</p>
+      <button id="finder-open" type="button" class="secondary">Find my car</button>
     </div>
     <!-- Save stays visible regardless of scroll position — on a long form a
          bottom-of-form Save ends up off-screen. -->
@@ -217,6 +297,24 @@
       <div class="inner">
         <button id="save-btn" type="button">Save</button>
         <p id="save-status" class="status"></p>
+      </div>
+    </div>
+
+    <!-- Full-screen finder overlay. Hidden until "Find my car" is tapped; the
+         radar canvas, headline and staleness live here, with a message block
+         that replaces the radar for the walkthrough / permission / no-signal
+         states. Driven by the shared finder engine (src/main.ts). -->
+    <div id="finder-screen">
+      <div class="finder-top">
+        <button id="finder-back" type="button" class="finder-back">‹ Back</button>
+        <span class="finder-title">Find my car</span>
+      </div>
+      <div class="finder-body">
+        <canvas id="finder-radar" class="finder-radar" width="280" height="280"></canvas>
+        <p id="finder-headline" class="finder-headline"></p>
+        <p id="finder-detail" class="finder-detail"></p>
+        <div id="finder-message" class="finder-message"></div>
+        <button id="finder-done" type="button" class="finder-done">Done</button>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

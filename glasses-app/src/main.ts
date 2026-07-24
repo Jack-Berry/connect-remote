@@ -5,7 +5,6 @@ import {
   ImageRawDataUpdateResult,
   ListContainerProperty,
   ListItemContainerProperty,
-  OsEventTypeList,
   RebuildPageContainer,
   TextContainerProperty,
   TextContainerUpgrade,
@@ -56,22 +55,33 @@ import {
   sameMenu,
   spinnerFrame,
 } from "./display";
-import { createGlyphIndicator, createImageIndicator } from "./direction";
 import {
-  type ArrivalProgress,
-  CourseTracker,
-  type Fix,
-  type FinderProblem,
-  finderView,
-  formatParkedAge,
-} from "./finder";
+  type DirectionIndicator,
+  createGlyphIndicator,
+  createImageIndicator,
+} from "./direction";
+import { formatDistance, formatParkedAge } from "./finder";
 import {
-  type FinderWatch,
-  type FinderWatchTelemetry,
-  createFinderTelemetry,
-  createFinderWatch,
-} from "./finder-watch";
+  KEEP_UNLOCKED_NOTE,
+  type FinderFrame,
+  type FinderRenderer,
+  createFinderEngine,
+} from "./finder-engine";
 import { type AppLocationBridge, startPositionWatch } from "./geo";
+import {
+  type GlassesView,
+  type RouterState,
+  commitView,
+  createInputTrace,
+  describeRawEvent,
+  routeGlassesEvent,
+} from "./glasses-input";
+import {
+  loadGrantedOnce,
+  probePermission,
+  saveGrantedOnce,
+} from "./location-permission";
+import { type RadarLayout, drawRadar, layoutFor } from "./radar";
 import {
   type AppSettings,
   type Bridge,
@@ -101,7 +111,11 @@ let client: BackendClient | null = null;
 let lastStatus: VehicleStatus | null = null;
 // 'connect' until the first successful /status (no HUD of empty values);
 // then two-layer UI: 'hud' is glanceable status only, 'menu' holds controls.
-let view: "connect" | "hud" | "menu" | "finder" = "connect";
+let view: GlassesView = "connect";
+// Last ~10 glasses events (raw shape, router branch, believed state) for the
+// diagnostic report — the 1.4.0 gesture regression cost a hardware walk and a
+// guess because nothing recorded what the router actually saw.
+const inputTrace = createInputTrace(10);
 let connectState: "connecting" | "failed" = "connecting";
 // Deliberate single-tap "glasses off" mode: the HUD renders nothing but the
 // app keeps running and polling. Distinct from connect/error states, which
@@ -266,7 +280,87 @@ function connectPage(content: string, spin: string) {
   };
 }
 
-function menuListContainer(items: MenuItem[]) {
+/**
+ * Menu page shapes, plainest last.
+ *
+ * Hardware (1.4.3) refused EVERY menu page rebuild — "host rejected menu page",
+ * four for four — while the HUD page was accepted every time. The menu is the
+ * only page with a list container, the only one setting `borderRadius`, and the
+ * only one whose text carries non-ASCII (`°`, `·`). All three are valid per the
+ * SDK 0.0.10 types and all three render in the simulator, so the host is
+ * stricter than both. Rather than guess which, we try progressively plainer
+ * variants and record the first the host accepts: the user gets a menu, and
+ * `Menu variant:` in the diagnostic report names the culprit. (Precedent: the
+ * RC round found an unknown PB field kills a whole page rebuild — hence the
+ * standing ban on `zOrderIndex`.)
+ */
+const MENU_VARIANTS = [
+  { name: "full", radius: true, ascii: false, maxItems: 0 },
+  // 1.4.4 hardware verdict: every 7-item variant was refused and the 3-item one
+  // was accepted, so the host's limit is ITEM COUNT (or total payload size) —
+  // not borderRadius and not the non-ASCII labels. The ladder therefore walks
+  // the count down, keeping the styling that already works.
+  { name: "6-items", radius: true, ascii: false, maxItems: 6 },
+  { name: "5-items", radius: true, ascii: false, maxItems: 5 },
+  { name: "4-items", radius: true, ascii: false, maxItems: 4 },
+  { name: "3-items", radius: true, ascii: false, maxItems: 3 },
+  // Only after the count is as low as it goes do the styling/text suspects get
+  // stripped — they were exonerated above, but cost nothing as a backstop.
+  { name: "3-items+plain", radius: false, ascii: true, maxItems: 3 },
+  { name: "2-items+plain", radius: false, ascii: true, maxItems: 2 },
+] as const;
+
+/**
+ * Which items survive when the host will only take a short list, best first.
+ * "Find my car" ranks second — immediately after the way back — because a
+ * truncated menu that can't reach the finder is a menu that can't do the one
+ * thing this round exists for. (1.4.4 shipped a blind `slice(0, 3)`, which cut
+ * exactly that item and stranded the owner.)
+ */
+const MENU_PRIORITY: string[] = [
+  "hud",
+  "finder",
+  // Quit is third so it survives even a three-slot menu. Double-tap reaches the
+  // same dialog, but a list with no visible way out reads as broken — the owner
+  // called its absence out on the 1.4.4 hardware round.
+  "quit",
+  "unlock",
+  "lock",
+  "climateOn",
+  "climateOff",
+  "refresh",
+  "chargeStart",
+  "chargeStop",
+];
+
+/** Keep the `max` highest-priority items, in priority order. */
+function prioritiseMenu(items: MenuItem[], max: number): MenuItem[] {
+  if (!max || items.length <= max) return items;
+  const rank = (i: MenuItem) => {
+    const r = MENU_PRIORITY.indexOf(i.key);
+    return r === -1 ? MENU_PRIORITY.length : r;
+  };
+  return [...items].sort((a, b) => rank(a) - rank(b)).slice(0, max);
+}
+
+/** Which variant the host accepted last (null = none tried / all refused). */
+let menuVariantUsed: string | null = null;
+
+/** Non-ASCII → nearest plain equivalent, for the ascii variants. */
+function toAsciiLabel(s: string): string {
+  return s
+    .replace(/°/g, "")
+    .replace(/·/g, "-")
+    .replace(/…/g, "...")
+    // Anything else outside printable ASCII goes entirely.
+    .replace(/[^\x20-\x7E]/g, "")
+    .trim();
+}
+
+function menuListContainer(
+  items: MenuItem[],
+  opts: { radius: boolean; ascii: boolean } = { radius: true, ascii: false },
+) {
   return new ListContainerProperty({
     xPosition: 0,
     yPosition: 0,
@@ -274,7 +368,9 @@ function menuListContainer(items: MenuItem[]) {
     height: 288,
     borderWidth: 1,
     borderColor: 8,
-    borderRadius: 6,
+    // Omitted entirely (not set to 0) in the no-radius variants: an unknown or
+    // unwanted PB field is refused by its presence, not its value.
+    ...(opts.radius ? { borderRadius: 6 } : {}),
     paddingLength: 4,
     ...MENU_LIST_CONTAINER,
     isEventCapture: 1,
@@ -282,7 +378,7 @@ function menuListContainer(items: MenuItem[]) {
       itemCount: items.length,
       itemWidth: 0, // auto fill container width
       isItemSelectBorderEn: 1,
-      itemName: items.map((i) => i.label),
+      itemName: items.map((i) => (opts.ascii ? toAsciiLabel(i.label) : i.label)),
     }),
   });
 }
@@ -302,19 +398,64 @@ function menuInfoContainer(content: string) {
   });
 }
 
+/**
+ * The host reports page/text failures in the RESOLVED value — these APIs return
+ * `Promise<boolean>` and NEVER reject. Exactly the trap `updateImageRawData` set
+ * in 1.3.3 (pushes "succeeded" while the panel stayed blank), relearned here the
+ * hard way: an unchecked `false` from `rebuildPageContainer` let `view` commit to
+ * a page that was never built, after which no tap branch matched and every
+ * double-tap fell through to the exit dialog. Converting `false` into a throw is
+ * what lets commitView roll back and what makes the failure visible at all.
+ *
+ * Every result is also recorded for the diagnostic report — "did the page
+ * actually go up?" must be answerable from one hardware minute.
+ */
+let lastHostOp: { what: string; ok: boolean; at: number } | null = null;
+let hostOpFailures = 0;
+
+async function recordHostOp(
+  what: string,
+  call: () => Promise<boolean>,
+): Promise<boolean> {
+  const ok = await call();
+  lastHostOp = { what, ok, at: Date.now() };
+  if (!ok) {
+    hostOpFailures++;
+    console.log(`glasses: host rejected ${what} (returned false)`);
+  }
+  return ok;
+}
+
+/**
+ * Rebuild the whole page. THROWS when the host says no, which is the whole
+ * point: only a throw reaches commitView's rollback, and only the rollback
+ * keeps `view` honest about what is actually on screen.
+ */
+async function rebuildPage(what: string, container: RebuildPageContainer) {
+  const ok = await recordHostOp(what, () =>
+    enqueue(() => bridge.rebuildPageContainer(container)),
+  );
+  if (!ok) throw new Error(`host rejected ${what}`);
+}
+
 // Flicker-free in-place updates; only valid while the matching page is shown.
+// Records failures but deliberately does NOT throw: a missed text upgrade is
+// cosmetic and its callers are fire-and-forget, so throwing would only add
+// unhandled rejections. The counter in the diagnostic report is the signal.
 function upgradeText(
   ids: { containerID: number; containerName: string },
   content: string,
 ) {
-  return enqueue(() =>
-    bridge.textContainerUpgrade(
-      new TextContainerUpgrade({
-        ...ids,
-        content,
-        contentOffset: 0,
-        contentLength: 0,
-      }),
+  return recordHostOp(`upgrade ${ids.containerName}`, () =>
+    enqueue(() =>
+      bridge.textContainerUpgrade(
+        new TextContainerUpgrade({
+          ...ids,
+          content,
+          contentOffset: 0,
+          contentLength: 0,
+        }),
+      ),
     ),
   );
 }
@@ -380,20 +521,85 @@ function updateMenuInfo(content: string) {
   return upgradeText(MENU_INFO_CONTAINER, content);
 }
 
+// Every view transition commits only once its page rebuild actually lands (see
+// commitView). Assigning `view` and hoping was the 1.4.0 gesture-death
+// amplifier: one rejected rebuild left the router reading a page that wasn't on
+// screen, after which no tap branch matched and every double-tap fell through
+// to the system exit dialog.
+const setView = (v: GlassesView) => {
+  view = v;
+};
+
 function showHud(note = "") {
-  view = "hud";
+  const previous = view;
   // Explicit navigation to the HUD always shows it — landing from the menu
   // (or a fresh connect) on an invisible page would look broken.
   hudHidden = false;
-  return enqueue(() =>
-    bridge.rebuildPageContainer(new RebuildPageContainer(hudPage(note))),
+  return commitView(
+    "hud",
+    previous,
+    setView,
+    () => rebuildPage("hud page", new RebuildPageContainer(hudPage(note))),
+    (err) => recordError("render/hud", err),
   );
+}
+
+/**
+ * Build the menu page, walking MENU_VARIANTS until the host accepts one.
+ * Throws only when every variant is refused, so commitView still rolls the view
+ * back rather than stranding it on a page that never went up.
+ */
+async function rebuildMenuPage(note: string): Promise<void> {
+  const info = safeText(
+    "render/menu",
+    () => formatMenuInfo(lastStatus, note),
+    SAFE_NOTE,
+  );
+  // Try the shape that worked last time first. Each refusal is a real BLE round
+  // trip, and blindly re-walking the ladder on every menu open cost 34 rejected
+  // ops in one hardware session — slow, and it buries the real signal.
+  const ordered = menuVariantUsed
+    ? [
+        ...MENU_VARIANTS.filter((v) => v.name === menuVariantUsed),
+        ...MENU_VARIANTS.filter((v) => v.name !== menuVariantUsed),
+      ]
+    : [...MENU_VARIANTS];
+  for (const variant of ordered) {
+    const items = prioritiseMenu(menuItems, variant.maxItems);
+    try {
+      await rebuildPage(
+        `menu page (${variant.name})`,
+        new RebuildPageContainer({
+          containerTotalNum: 2,
+          listObject: [
+            menuListContainer(items, {
+              radius: variant.radius,
+              ascii: variant.ascii,
+            }),
+          ],
+          textObject: [menuInfoContainer(variant.ascii ? toAsciiLabel(info) : info)],
+        }),
+      );
+      // Accepted. Keep menuItems in step with what is actually on screen, or a
+      // tap would select the wrong action.
+      menuItems = items;
+      menuVariantUsed = variant.name;
+      if (variant.name !== "full") {
+        console.log(`glasses: menu accepted only as "${variant.name}"`);
+      }
+      return;
+    } catch {
+      // Refused — fall through to the next, plainer shape.
+    }
+  }
+  menuVariantUsed = null;
+  throw new Error("host refused every menu variant");
 }
 
 // List containers cannot be updated in-place, so entering the menu (or
 // changing its context-aware items) is a full page rebuild.
 function showMenu(note = "") {
-  view = "menu";
+  const previous = view;
   try {
     menuItems = buildMenuItems(lastStatus, settings);
   } catch (err) {
@@ -406,22 +612,12 @@ function showMenu(note = "") {
       { key: "quit", label: "Quit" },
     ];
   }
-  return enqueue(() =>
-    bridge.rebuildPageContainer(
-      new RebuildPageContainer({
-        containerTotalNum: 2,
-        listObject: [menuListContainer(menuItems)],
-        textObject: [
-          menuInfoContainer(
-            safeText(
-              "render/menu",
-              () => formatMenuInfo(lastStatus, note),
-              SAFE_NOTE,
-            ),
-          ),
-        ],
-      }),
-    ),
+  return commitView(
+    "menu",
+    previous,
+    setView,
+    () => rebuildMenuPage(note),
+    (err) => recordError("render/menu", err),
   );
 }
 
@@ -439,9 +635,6 @@ function showMenu(note = "") {
 
 /** How long the arrival screen holds before returning to the HUD. */
 const ARRIVAL_HOLD_MS = 3000;
-/** Re-render cadence: slow enough to be free, fast enough that the course
- *  expiring (user stopped walking) flips back to cardinal text promptly. */
-const FINDER_TICK_MS = 1000;
 
 // Telemetry strip on the finder screen (top edge) plus the Finder line in the
 // diagnostic report. OFF for release builds — the strip and its container
@@ -458,38 +651,30 @@ const STALE_DIM_ENABLED = true;
 // The bridge App Location source, OFF after walk 5: it stalled under screen
 // lock exactly like WebView geolocation (suspended JS can't receive host
 // pushes) and delivered a worse fix cadence screen-on. The code path stays —
-// an Even app update could change the suspension behaviour, and re-running
-// the experiment is this one flag (plus an SDK 0.0.11+ host).
-const FINDER_BRIDGE_LOCATION = false;
+// an Even app update could change the suspension behaviour, and re-running the
+// experiment now takes one env var: `VITE_BRIDGE_LOCATION=1 npm run build`
+// (never set for a real distributable, like VITE_BACKEND_URL). NOTE: this alone
+// is inert on the pinned SDK 0.0.10, which exposes no App Location methods, so
+// startPositionWatch falls straight back to WebView geolocation — the bridge
+// walk also needs an SDK 0.0.11+ bump (deliberately reverted, DECISIONS-LOG
+// 2026-07-20) and the portal's "Run background services" toggle enabled.
+const FINDER_BRIDGE_LOCATION = import.meta.env.VITE_BRIDGE_LOCATION === "1";
 
-// Shown briefly on every finder entry (and again after a screen-wake
-// restart): the one honest instruction while no JS-side source survives a
-// locked phone. Self-clears — the tick repaints past the deadline.
-const KEEP_UNLOCKED_NOTE = "Keep your phone unlocked while finding your car";
-const FINDER_NOTE_MS = 6000;
-let finderNoteUntil = 0;
+// The finder loop itself lives in finder-engine.ts; the state below is only the
+// glasses renderer's (diffing + arrival hold + repaint telemetry). The engine
+// is created once the page functions it depends on are defined (below).
 
-let finderWatch: FinderWatch | null = null;
-// One per finder session (created on entry, kept across watchdog/screen-wake
-// watch replacements, and after exit for the diagnostic report).
-let finderTelem: FinderWatchTelemetry | null = null;
-// Repaints attempted vs completed. A growing gap is the signature of the
-// bridge serialization chain jamming on a call that never settled — on-screen
-// it is indistinguishable from GPS death, which is why it's counted.
-let finderRenders = { started: 0, done: 0 };
-let finderTick: ReturnType<typeof setInterval> | null = null;
-let finderArrival: ReturnType<typeof setTimeout> | null = null;
-let finderFix: Fix | null = null;
-let finderProblem: FinderProblem | null = null;
-let finderOctant: number | null = null;
-// Threaded through finderView like finderOctant: consecutive in-radius fixes.
-let finderArrivalProgress: ArrivalProgress | null = null;
-const finderCourse = new CourseTracker();
-// Last rendered content, so the 1 Hz tick only touches containers that
-// actually changed — an unchanged upgrade is a wasted bridge call. (The
-// direction indicator does its own diffing behind its interface.)
+// Last rendered content, so a frame only touches containers that actually
+// changed — an unchanged upgrade is a wasted bridge call. (The direction
+// indicator does its own diffing behind its interface.)
 let finderShown: { main: string; foot: string } | null = null;
 let finderDebugShown: string | null = null;
+// Repaints attempted vs completed. A growing gap is the signature of the bridge
+// serialization chain jamming on a call that never settled — on-screen it is
+// indistinguishable from GPS death, which is why it's counted. Reset on entry.
+let finderRenders = { started: 0, done: 0 };
+// Arrival's hold-then-return-to-HUD timer (glasses only; the phone shows Done).
+let finderArrival: ReturnType<typeof setTimeout> | null = null;
 
 // The arrow, behind the DirectionIndicator seam. Round 3 default is the
 // image renderer (large circled arrow, the owner's mockup); the glyph
@@ -516,9 +701,31 @@ function pushImage(
     return result;
   });
 }
-const directionIndicator = FINDER_IMAGE_ARROW
-  ? createImageIndicator(pushImage, upgradeText, renderArrowFrames)
-  : createGlyphIndicator(upgradeText);
+/** Contributes no containers at all — the last-resort finder layout for a host
+ *  that refuses the richer pages (hardware 1.4.4 refused anything with too many
+ *  containers/payload). Distance and direction still read out in the text. */
+function createNullIndicator(): DirectionIndicator {
+  return {
+    containers: () => ({ count: 0, textObject: [] }),
+    async update() {},
+    reset() {},
+  };
+}
+
+// Swappable: enterFinder walks these downward if the host refuses a page.
+const imageIndicator = createImageIndicator(
+  pushImage,
+  upgradeText,
+  renderArrowFrames,
+);
+const glyphIndicator = createGlyphIndicator(upgradeText);
+const nullIndicator = createNullIndicator();
+
+let directionIndicator: DirectionIndicator = FINDER_IMAGE_ARROW
+  ? imageIndicator
+  : glyphIndicator;
+/** Which finder layout the host accepted, for the diagnostic report. */
+let finderLayoutUsed: string | null = null;
 
 // Geometry shifts when the image dominates the screen (image layout packs
 // headline+foot below the 144px arrow; text layout is the 1.3.1 one).
@@ -593,61 +800,43 @@ function carPosition() {
   return lat != null && lon != null ? { lat, lon } : null;
 }
 
-/** Build the current finder strings. Crash-safe like every other formatter
- *  here: a maths bug must still leave a readable screen with a way out. */
-function finderContent() {
-  try {
-    const v = finderView({
-      car: carPosition(),
-      fix: finderFix,
-      course: finderCourse.course(Date.now()),
-      now: Date.now(),
-      unit: lastStatus?.range_unit ?? null,
-      parkedAt: lastStatus?.location_last_updated ?? null,
-      prevOctant: finderOctant,
-      arrival: finderArrivalProgress,
-      problem: finderProblem,
-    });
-    finderOctant = v.octant;
-    finderArrivalProgress = v.arrival;
-    // The screen-wake guidance note borrows the detail line briefly; problem
-    // states keep their own explanation (it outranks advice).
-    const detail =
-      v.mode !== "problem" && Date.now() < finderNoteUntil
-        ? KEEP_UNLOCKED_NOTE
-        : v.detail;
-    return {
-      arrived: v.mode === "arrived",
-      octant: v.octant,
-      mode: v.mode as string,
-      // Stale car position drives the dim-grey experiment on the image ring.
-      stale:
-        STALE_DIM_ENABLED &&
-        formatParkedAge(
-          lastStatus?.location_last_updated ?? null,
-          Date.now(),
-        ) != null,
-      content: formatFinder({ ...v, detail }, FINDER_GEOM.compact),
-    };
-  } catch (err) {
-    recordError("render/finder", err);
-    return {
-      arrived: false,
-      octant: null,
-      mode: "crash",
-      stale: false,
-      content: formatFinder({
-        mode: "problem",
-        arrow: null,
-        headline: "Finder unavailable",
-        detail: SAFE_NOTE,
-        hint: "Tap: back · 2x tap: close app",
-        octant: null,
-        arrival: { streak: 0, lastFixAt: 0 },
-      }, FINDER_GEOM.compact),
-    };
-  }
-}
+// The shared finder loop. Its side effects are injected so it stays free of
+// bridge/DOM and unit-testable: the car position and status metadata come from
+// lastStatus, the position source is startPositionWatch (bridge path parked
+// behind the flag), and the permission bits go through location-permission.ts
+// over bridge KV. main.ts is one of its renderers (the glasses); the phone
+// radar is the other. Every coordinate still stays on the device.
+const finderEngine = createFinderEngine({
+  getCar: () => carPosition(),
+  getMeta: () => ({
+    unit: lastStatus?.range_unit ?? null,
+    parkedAt: lastStatus?.location_last_updated ?? null,
+  }),
+  startWatch: (handlers, car) =>
+    startPositionWatch(
+      handlers,
+      car,
+      // Bridge source parked (FINDER_BRIDGE_LOCATION above): null sends geo.ts
+      // straight down the proven WebView-geolocation path.
+      FINDER_BRIDGE_LOCATION ? (bridge as unknown as AppLocationBridge) : null,
+    ),
+  // THROUGH `enqueue`, like every other bridge call in this file. These are
+  // real BLE traffic (getLocalStorage/setLocalStorage), and the engine fires
+  // them on session start and first fix — i.e. concurrently with whatever page
+  // rebuild is in flight. Calling them directly is what broke 1.4.0's gestures
+  // on hardware: a concurrent bridge call jammed the link, the menu rebuild
+  // never landed, and `view` was left naming a page that wasn't on screen. The
+  // simulator has no BLE, so nothing showed there.
+  loadGrantedOnce: () => enqueue(() => loadGrantedOnce(bridge)),
+  saveGrantedOnce: () => enqueue(() => saveGrantedOnce(bridge)),
+  // DEV: `VITE_FAKE_GPS=awaiting` forces the pending-prompt verdict so the
+  // first-run walkthrough is inspectable without a real permission dialog.
+  probePermission:
+    import.meta.env.DEV && import.meta.env.VITE_FAKE_GPS === "awaiting"
+      ? async () => "prompt" as const
+      : () => probePermission(),
+  onError: (where, err) => recordError(where, err),
+});
 
 /** One line that tells the walker which link is dead while it's dead:
  *  raw-fix count (platform delivering?), usable count (filter passing?),
@@ -655,8 +844,8 @@ function finderContent() {
  *  watch replacements (watchdog+screen-wake), and the current mode. The
  *  age counter changing every second doubles as a JS-alive heartbeat —
  *  if this line freezes, the whole WebView is suspended. */
-function finderDebugLine(mode: string): string {
-  const t = finderTelem;
+function finderDebugLine(frame: FinderFrame): string {
+  const t = frame.telemetry;
   if (!t) return "no watch";
   const age = t.lastFixAt
     ? `${Math.max(0, Math.round((Date.now() - t.lastFixAt) / 1000))}s`
@@ -670,184 +859,187 @@ function finderDebugLine(mode: string): string {
     `${src} fx ${t.rawFixes}${rejected ? `(-${rejected})` : ""} ${age}` +
     ` · rp ${finderRenders.done}/${finderRenders.started}` +
     ` · rs ${t.restarts}+${t.resumes}` +
-    ` · ${mode}` +
+    ` · ${frame.view.mode}` +
     (t.lastProblem ? ` !${t.lastProblem}` : "")
   );
 }
 
-async function renderFinder() {
-  if (backgrounded || view !== "finder") return;
-  // Entered before the car reported a position, and a later poll has now
-  // supplied one: this is the point where asking for GPS finally makes sense.
-  if (carPosition() && !finderWatch && finderTick) startFinderWatch();
-  finderRenders.started++;
-  const { arrived, octant, mode, stale, content } = finderContent();
-  // Ring shows for every located state (walking arrow, stationary/arrived/
-  // locating ring-only); problem and crash states clear the image entirely.
-  await directionIndicator.update(octant, {
-    ring: mode !== "problem" && mode !== "crash",
-    dim: stale,
-  });
-  if (content.main !== finderShown?.main) {
-    await upgradeText(FINDER_MAIN_CONTAINER, content.main);
-  }
-  if (content.foot !== finderShown?.foot) {
-    await upgradeText(FINDER_FOOT_CONTAINER, content.foot);
-  }
-  finderShown = content;
-  if (FINDER_DEBUG) {
-    const line = finderDebugLine(mode);
-    if (line !== finderDebugShown) {
-      finderDebugShown = line;
-      await upgradeText(FINDER_DEBUG_CONTAINER, line);
+// The glasses renderer: a FinderFrame → container upgrades. Crash-safe like
+// every other formatter here — a maths bug must still leave a readable screen
+// with a way out, never a blank (a store-review reject). The engine has already
+// applied the note/stale/arrival logic; this only lays the characters down.
+const glassesFinderRenderer: FinderRenderer = {
+  async render(frame: FinderFrame) {
+    if (backgrounded || view !== "finder") return;
+    finderRenders.started++;
+    try {
+      const v = frame.view;
+      // The keep-unlocked note borrows the detail line briefly; problem and
+      // awaiting states keep their own explanation (it outranks advice).
+      const detail = frame.noteActive ? KEEP_UNLOCKED_NOTE : v.detail;
+      const content = formatFinder({ ...v, detail }, FINDER_GEOM.compact);
+      const mode = v.mode;
+      // Ring shows for every located state (walking arrow, stationary/arrived/
+      // locating ring-only); problem and awaiting states clear the image.
+      await directionIndicator.update(v.octant, {
+        ring: mode !== "problem" && mode !== "awaiting",
+        dim: STALE_DIM_ENABLED && frame.stale,
+      });
+      if (content.main !== finderShown?.main) {
+        await upgradeText(FINDER_MAIN_CONTAINER, content.main);
+      }
+      if (content.foot !== finderShown?.foot) {
+        await upgradeText(FINDER_FOOT_CONTAINER, content.foot);
+      }
+      finderShown = content;
+      if (FINDER_DEBUG) {
+        const line = finderDebugLine(frame);
+        if (line !== finderDebugShown) {
+          finderDebugShown = line;
+          await upgradeText(FINDER_DEBUG_CONTAINER, line);
+        }
+      }
+      finderRenders.done++;
+
+      // Arrival ends the feature: the engine has already stopped the watch, so
+      // the glasses just hold briefly and return to the HUD. No other state has
+      // a timeout — nothing yanks the user back mid-walk. (The phone shows Done
+      // instead, since it has nowhere to return to.)
+      if (mode === "arrived" && !finderArrival) {
+        finderArrival = setTimeout(() => {
+          finderArrival = null;
+          if (view === "finder" && !backgrounded) void showHud();
+        }, ARRIVAL_HOLD_MS);
+      }
+    } catch (err) {
+      // Don't repaint from the catch — that risks a loop; log and leave the
+      // last good frame up.
+      recordError("render/finder", err);
     }
-  }
-  finderRenders.done++;
+  },
+};
 
-  // Arrival ends the feature: the job is done, so the watcher stops right
-  // here (not on the way out) and the screen holds briefly before returning
-  // to the HUD. No other state has a timeout — nothing yanks the user back
-  // mid-walk.
-  if (arrived) {
-    stopFinderWatch("arrived");
-    finderArrival = setTimeout(() => {
-      finderArrival = null;
-      if (view === "finder" && !backgrounded) void showHud();
-    }, ARRIVAL_HOLD_MS);
-  }
-}
+// The phone radar renderer, wired to its DOM in bindPhoneFinder. Kept at module
+// scope with its attach/detach so the visibility + system-exit handlers below
+// can reach them; the watch is provably stopped whenever the last surface
+// leaves (engine ref-counting).
+let phoneFinderRenderer: FinderRenderer | null = null;
+let phoneFinderOpen = false;
+let phoneFinderAttached = false;
 
-/** The one place the GPS watch and its timers are torn down. Every exit path
- *  — finder exit, arrival, foreground exit, system exit — calls this, and the
- *  watch logs a line when it stops (handoff §4.6). */
-function stopFinderWatch(reason: string) {
-  if (finderWatch) {
-    finderWatch.stop(reason);
-    finderWatch = null;
-  }
-  if (finderTick) clearInterval(finderTick);
-  finderTick = null;
-  if (finderArrival) clearTimeout(finderArrival);
-  finderArrival = null;
-}
-
-// Re-entrancy latch: a watch source that delivers its first fix synchronously
-// (the DEV fake walker did) fires onFix → renderFinder before `finderWatch`
-// is assigned, and renderFinder's auto-start branch would call back in here —
-// infinite recursion. Found by the 1.3.3 simulator sweep; latent since 1.3.0
-// (real GPS always delivered asynchronously, which is why no walk ever hit it).
-let startingFinderWatch = false;
-
-function startFinderWatch() {
-  if (startingFinderWatch) return;
-  startingFinderWatch = true;
-  try {
-    startFinderWatchInner();
-  } finally {
-    startingFinderWatch = false;
+function attachPhoneFinder() {
+  if (phoneFinderRenderer && !phoneFinderAttached) {
+    finderEngine.attach(phoneFinderRenderer);
+    phoneFinderAttached = true;
   }
 }
-
-function startFinderWatchInner() {
-  stopFinderWatch("restart");
-  // The 1 Hz repaint runs regardless: it is what lets the course go stale,
-  // what notices a car position arriving on a later poll — and now what rides
-  // the stall watchdog, so a watch that died without an error gets replaced.
-  finderTick = setInterval(() => {
-    finderWatch?.poke(Date.now());
-    void renderFinder();
-  }, FINDER_TICK_MS);
-  // No car position ⇒ nothing to compute a bearing to, so don't ask for the
-  // location permission at all. Prompting for a sensor we can't use yet is a
-  // bad trade; the screen already explains what's missing, and the tick above
-  // starts the watch the moment coordinates turn up.
-  if (!carPosition()) return;
-  finderTelem ??= createFinderTelemetry(Date.now());
-  // The vague-fix filter lives inside createFinderWatch, where a rejection is
-  // a counted event instead of an invisible return.
-  finderWatch = createFinderWatch(
-    {
-      onFix(fix) {
-        finderProblem = null;
-        finderFix = fix;
-        finderCourse.push(fix);
-        void renderFinder();
-      },
-      onProblem(problem) {
-        finderProblem = problem;
-        void renderFinder();
-      },
-    },
-    carPosition(),
-    finderTelem,
-    // Bridge source parked (FINDER_BRIDGE_LOCATION above): passing null
-    // sends geo.ts straight down the proven WebView-geolocation path.
-    (handlers, car) =>
-      startPositionWatch(
-        handlers,
-        car,
-        FINDER_BRIDGE_LOCATION
-          ? (bridge as unknown as AppLocationBridge)
-          : null,
-      ),
-  );
+function detachPhoneFinder() {
+  if (phoneFinderRenderer && phoneFinderAttached) {
+    finderEngine.detach(phoneFinderRenderer);
+    phoneFinderAttached = false;
+  }
 }
-
-// Phone screen coming back. FOREGROUND_* events cover the glasses dashboard;
-// they say nothing about the phone's own screen — and a locked phone can
-// suspend the WebView's geolocation (or all of its JS). The 1.3.0 hardware
-// walk froze exactly this way: one fix at entry, nothing after pocketing the
-// phone. A suspended watch may never deliver again after resume, so a fresh
-// one is the only guarantee; the tick/watchdog stay as the belt to this brace.
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible") return;
-  if (backgrounded || view !== "finder" || !finderTick) return;
-  if (finderTelem) finderTelem.resumes++;
-  // The honest guidance, at the exact moment it's true: the finder just lost
-  // (at least) a screen-lock's worth of updates. Shown briefly, then the
-  // normal detail line returns.
-  finderNoteUntil = Date.now() + FINDER_NOTE_MS;
-  console.log("finder: page visible again — replacing GPS watch");
-  startFinderWatch();
-  void renderFinder();
-});
 
 async function enterFinder() {
-  view = "finder";
-  finderFix = null;
-  finderProblem = null;
-  finderOctant = null;
-  finderArrivalProgress = null;
+  const previous = view;
   finderShown = null;
   finderDebugShown = null;
-  // Fresh telemetry per session; kept after exit so the diagnostic report can
-  // describe the walk that just failed.
-  finderTelem = createFinderTelemetry(Date.now());
   finderRenders = { started: 0, done: 0 };
-  // First thing every finder session says: the one limitation no JS can
-  // remove (three hardware rounds of evidence). Replaces the detail line for
-  // a few seconds, then the tick repaints it away.
-  finderNoteUntil = Date.now() + FINDER_NOTE_MS;
-  finderCourse.reset();
-  // Pre-render the arrow frames before the page goes up: a one-off ~tens of
-  // ms on entry, so the first direction push has frames to draw from.
-  directionIndicator.prepare?.();
-  directionIndicator.reset();
-  // Paint the first frame ("Locating…", or the explanation if the car never
-  // reported a position) before asking for GPS — the permission prompt can
-  // take seconds and the glasses must not sit blank behind it.
-  const { content } = finderContent();
-  finderShown = content;
-  await enqueue(() =>
-    bridge.rebuildPageContainer(new RebuildPageContainer(finderPage(content))),
+  if (finderArrival) {
+    clearTimeout(finderArrival);
+    finderArrival = null;
+  }
+  // Paint a placeholder before attaching (and before GPS spins up) — the
+  // permission prompt can take seconds and the glasses must not sit blank
+  // behind it. The engine's synchronous first emit on attach replaces this
+  // with the real state (Locating…, the car-unknown explanation, or a frame
+  // the phone already started) within the same turn.
+  const placeholder = formatFinder(
+    {
+      mode: "locating",
+      arrow: null,
+      headline: "Locating…",
+      detail: "",
+      hint: "Tap: back · 2x tap: close app",
+      octant: null,
+      arrival: { streak: 0, lastFixAt: 0 },
+    },
+    FINDER_GEOM.compact,
   );
-  startFinderWatch();
+  finderShown = placeholder;
+  // Same lesson as the menu: the host refuses pages that are too heavy, so walk
+  // the layout down until one is accepted. Image arrow (5 containers) → glyph
+  // arrow (4) → text only (3). A plain finder that opens beats a pretty one
+  // that doesn't.
+  const layouts: { name: string; indicator: DirectionIndicator }[] = [
+    ...(FINDER_IMAGE_ARROW
+      ? [{ name: "image", indicator: imageIndicator }]
+      : []),
+    { name: "glyph", indicator: glyphIndicator },
+    { name: "text-only", indicator: nullIndicator },
+  ];
+  const landed = await commitView(
+    "finder",
+    previous,
+    setView,
+    async () => {
+      let lastErr: unknown = null;
+      for (const layout of layouts) {
+        directionIndicator = layout.indicator;
+        directionIndicator.prepare?.();
+        directionIndicator.reset();
+        try {
+          await rebuildPage(
+            `finder page (${layout.name})`,
+            new RebuildPageContainer(finderPage(placeholder)),
+          );
+          finderLayoutUsed = layout.name;
+          if (layout.name !== layouts[0].name) {
+            console.log(`glasses: finder accepted only as "${layout.name}"`);
+          }
+          return;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      finderLayoutUsed = null;
+      throw lastErr ?? new Error("host refused every finder layout");
+    },
+    (err) => recordError("render/finder", err),
+  );
+  // The finder page never went up: don't attach a renderer that would paint
+  // into containers that don't exist, and don't ask for GPS for a screen the
+  // user can't see. The view has already rolled back to wherever we were.
+  if (!landed) return;
+  // Attach to the shared loop — starts a fresh session, or joins one the phone
+  // already started (one loop, both surfaces, no mode conflict).
+  finderEngine.attach(glassesFinderRenderer);
 }
 
 function exitFinder() {
-  stopFinderWatch("finder exit");
+  finderEngine.detach(glassesFinderRenderer);
+  if (finderArrival) {
+    clearTimeout(finderArrival);
+    finderArrival = null;
+  }
   return showHud();
 }
+
+// Phone screen coming back (unlock / WebView resume). The glasses FOREGROUND_*
+// events cover the glasses dashboard; they say nothing about the phone's own
+// screen — and a locked phone can suspend all of the WebView's JS (the 1.3.0
+// walk froze exactly this way). A suspended watch may never deliver again, so
+// the engine REPLACES it on resume; the tick/watchdog are the belt to this
+// brace. This also drives the phone finder's own attach/detach, so its watch is
+// provably stopped when the screen goes away and restarted when it returns.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    if (phoneFinderOpen) attachPhoneFinder();
+    finderEngine.pokeVisible();
+  } else if (phoneFinderOpen) {
+    detachPhoneFinder();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Status polling (cached backend state only — no force refresh on glasses)
@@ -926,9 +1118,10 @@ async function renderCurrent(note = "") {
   if (backgrounded) return;
   try {
     if (view === "finder") {
-      // A fresh status can carry a newer car position; the finder recomputes
-      // from lastStatus on every render, so there is nothing else to do.
-      await renderFinder();
+      // A fresh status can carry a newer car position; the engine recomputes
+      // from lastStatus, so a refresh repaints both surfaces immediately (and
+      // starts the watch if the car position has only just arrived).
+      finderEngine.refresh();
     } else if (view === "hud") {
       await updateHud(note);
     } else if (sameMenu(buildMenuItems(lastStatus, settings), menuItems)) {
@@ -1033,6 +1226,11 @@ function startSpinner() {
   stopSpinner();
   spinIndex = 0;
   spinTimer = setInterval(() => {
+    // The spinner's container only exists on the connect page. A tick that
+    // lands after we've moved on is refused by the host and would otherwise
+    // inflate the diagnostic's rejection counter with pure noise — and that
+    // counter is now the signal for real page failures.
+    if (view !== "connect" || backgrounded) return;
     spinIndex = (spinIndex + 1) % 4;
     void upgradeText(CONNECT_SPIN_CONTAINER, spinnerFrame(spinIndex));
   }, 1000);
@@ -1083,8 +1281,19 @@ async function connectToBackend() {
 // Opening the menu auto-fetches cached /status once so the context-aware
 // items reflect reality without any manual refresh action.
 async function openMenu() {
-  await showMenu();
-  await pollStatus();
+  if (await showMenu()) {
+    // Only chase a status refresh if the menu is genuinely up — polling into a
+    // page that never landed is how a failed rebuild used to cascade.
+    await pollStatus();
+    return;
+  }
+  // The host refused the menu page. A refused rebuild can leave the panel with
+  // no event-capture container at all, which is what killed single taps on
+  // hardware while system-level double-taps kept arriving. Re-assert a
+  // known-good page so the user gets their gestures back instead of a screen
+  // that looks alive and answers nothing.
+  console.log("glasses: menu rebuild refused — falling back to the HUD");
+  await showHud();
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,129 +1383,98 @@ let unsubscribe: () => void = () => {};
 
 function subscribeEvents() {
   unsubscribe = bridge.onEvenHubEvent((event) => {
-    // Protobuf drops zero-value fields: CLICK_EVENT (0) and item index 0
-    // arrive as undefined, so coalesce with ?? 0 — but only when the
-    // envelope itself is present.
-    const sysType = event.sysEvent ? (event.sysEvent.eventType ?? 0) : null;
-    const textType = event.textEvent ? (event.textEvent.eventType ?? 0) : null;
-    const listIndex = event.listEvent
-      ? (event.listEvent.currentSelectItemIndex ?? 0)
-      : null;
+    // The decision lives in glasses-input.ts (pure, unit-tested against the
+    // real payload shapes — including proto3's elided CLICK_EVENT). This
+    // function is only the effects half. Keeping them apart is what makes the
+    // whole gesture matrix testable without hardware.
+    const snapshot: RouterState = {
+      view,
+      connectState,
+      hasClient: client != null,
+      lastDoubleClickAt,
+      now: Date.now(),
+    };
+    const { action, acceptedDoubleClickAt, branch } = routeGlassesEvent(
+      event,
+      snapshot,
+    );
+    if (acceptedDoubleClickAt != null) lastDoubleClickAt = acceptedDoubleClickAt;
+    // One line per event, kept for the diagnostic report — raw shape, branch
+    // taken, and the state the router believed. A gesture regression is then
+    // one hardware minute to diagnose instead of a walk and a guess.
+    inputTrace.record(event, branch, snapshot);
+    // Mirrored to the console so the simulator can show the same evidence the
+    // hardware diagnostic report carries.
+    console.log(`glasses-event: ${describeRawEvent(event)} → ${branch} (view ${snapshot.view})`);
 
-    // Double-tap: HUD (hidden or not) → open the actions menu (the standard
-    // gesture across Even Hub apps; the menu's Quit item and its double-tap
-    // both reach the system exit dialog). Everywhere else — unconfigured,
-    // connecting, failed, menu — the system "close app?" Yes/No dialog.
-    // Cleanup happens on SYSTEM_EXIT/ABNORMAL_EXIT, not here — the user can
-    // still cancel the dialog. (The simulator does not render the dialog and
-    // just blanks the panel; hardware shows Yes/No.)
-    if (
-      sysType === OsEventTypeList.DOUBLE_CLICK_EVENT ||
-      textType === OsEventTypeList.DOUBLE_CLICK_EVENT
-    ) {
-      // Debounce: without it, HUD→menu can immediately chain into
-      // menu→close-app.
-      const now = Date.now();
-      if (now - lastDoubleClickAt < 800) return;
-      lastDoubleClickAt = now;
-      if (view === "hud") {
+    switch (action.kind) {
+      case "openMenu":
         void openMenu();
-      } else {
+        return;
+      case "exitDialog":
+        // Cleanup happens on SYSTEM_EXIT, not here — the user can still
+        // cancel. (The simulator just blanks the panel; hardware shows Yes/No.)
         void bridge.shutDownPageContainer(1);
-      }
-      return;
-    }
+        return;
 
-    if (
-      sysType === OsEventTypeList.SYSTEM_EXIT_EVENT ||
-      sysType === OsEventTypeList.ABNORMAL_EXIT_EVENT
-    ) {
-      if (repollTimer) clearTimeout(repollTimer);
-      stopSpinner();
-      clearNoteTimer();
-      // The app is going away with the GPS watch possibly still running —
-      // this is the path that would otherwise leak it into the user's pocket.
-      stopFinderWatch("system exit");
-      unsubscribe();
-      return;
-    }
+      case "systemExit":
+        if (repollTimer) clearTimeout(repollTimer);
+        stopSpinner();
+        clearNoteTimer();
+        // The app is going away with the GPS watch possibly still running —
+        // this is the path that would otherwise leak it into the user's
+        // pocket. Detach both surfaces so the engine tears the watch down.
+        finderEngine.detach(glassesFinderRenderer);
+        detachPhoneFinder();
+        unsubscribe();
+        return;
 
-    if (sysType === OsEventTypeList.FOREGROUND_ENTER_EVENT) {
-      backgrounded = false;
-      if (view === "finder") {
-        // The watch was stopped on the way out; resume it and repaint from
-        // whatever the last status said.
-        startFinderWatch();
-        void renderFinder();
-      } else if (view === "connect") {
-        // Restart the attempt outright: a fetch suspended mid-flight may never
-        // settle, and the old attempt was invalidated on FOREGROUND_EXIT — a
-        // resume must never leave an indefinite spinner. (Unconfigured just
-        // re-renders the not-configured message.)
+      case "foregroundEnter":
+        backgrounded = false;
+        if (view === "finder") {
+          // The glasses renderer was detached on the way out; re-attach it. If
+          // the phone kept the session alive it rejoins the same loop;
+          // otherwise a fresh session starts, painting at once either way.
+          finderEngine.attach(glassesFinderRenderer);
+        } else if (view === "connect") {
+          // Restart the attempt outright: a fetch suspended mid-flight may
+          // never settle, and the old attempt was invalidated on
+          // FOREGROUND_EXIT — a resume must never leave an endless spinner.
+          void connectToBackend();
+        } else {
+          void pollStatus();
+        }
+        return;
+
+      case "foregroundExit":
+        // Backgrounded: stop driving the display and the network. Everything
+        // resumes via FOREGROUND_ENTER. Settings are already durable.
+        backgrounded = true;
+        connectGen++;
+        stopSpinner();
+        if (repollTimer) clearTimeout(repollTimer);
+        repollTimer = null;
+        clearNoteTimer();
+        // GPS is the expensive one: a watch left running while the phone is in
+        // a pocket is a battery complaint. The watch stops unless the phone
+        // finder is also open (it keeps its own session).
+        finderEngine.detach(glassesFinderRenderer);
+        return;
+
+      case "selectMenuItem":
+        void selectMenuItem(action.index);
+        return;
+      case "retryConnect":
         void connectToBackend();
-      } else {
-        void pollStatus();
-      }
-      return;
-    }
-
-    if (sysType === OsEventTypeList.FOREGROUND_EXIT_EVENT) {
-      // Backgrounded: stop driving the display and the network — no container
-      // upgrades, no polls. Everything resumes via FOREGROUND_ENTER (immediate
-      // re-poll / connect restart). Settings are written on Save and are
-      // already durable, so there is nothing else to flush.
-      backgrounded = true;
-      connectGen++;
-      stopSpinner();
-      if (repollTimer) clearTimeout(repollTimer);
-      repollTimer = null;
-      clearNoteTimer();
-      // GPS is the expensive one: a watch left running while the phone is in
-      // a pocket is a battery complaint. FOREGROUND_ENTER restarts it.
-      stopFinderWatch("foreground exit");
-      return;
-    }
-
-    // Menu: the firmware scrolls the list natively; a single tap reports the
-    // selected item. R1 ring gestures arrive through the same events.
-    if (listIndex !== null && view === "menu") {
-      void selectMenuItem(listIndex);
-      return;
-    }
-
-    // Connect page: single tap retries after a failure (double-tap is exit).
-    // Mid-connect and unconfigured taps do nothing — there's nothing to retry.
-    if (
-      view === "connect" &&
-      (sysType === OsEventTypeList.CLICK_EVENT ||
-        textType === OsEventTypeList.CLICK_EVENT)
-    ) {
-      if (client && connectState === "failed") void connectToBackend();
-      return;
-    }
-
-    // Finder: single tap goes back to the HUD (and stops the GPS watch).
-    // Double-tap is the system exit dialog, handled above with everywhere
-    // else that isn't the HUD.
-    if (
-      view === "finder" &&
-      (sysType === OsEventTypeList.CLICK_EVENT ||
-        textType === OsEventTypeList.CLICK_EVENT)
-    ) {
-      void exitFinder();
-      return;
-    }
-
-    // HUD: single tap toggles "glasses off" (hide/show everything).
-    // Double-tap opens the menu from either state, handled above. Swipes
-    // do nothing.
-    if (
-      view === "hud" &&
-      (sysType === OsEventTypeList.CLICK_EVENT ||
-        textType === OsEventTypeList.CLICK_EVENT)
-    ) {
-      void toggleHudHidden();
-      return;
+        return;
+      case "exitFinder":
+        void exitFinder();
+        return;
+      case "toggleHud":
+        void toggleHudHidden();
+        return;
+      case "ignore":
+        return;
     }
   });
 }
@@ -1700,6 +1878,10 @@ function bindPhoneUi() {
       REGIONS.find((r) => r.code === Number(regionEl.value))?.label ??
       regionEl.value;
 
+    // Finder telemetry survives session end in the engine, so a failed walk is
+    // still describable here.
+    const finderTelemetry = finderEngine.telemetry();
+
     // App-side info (always available, even if the backend is down).
     const lines: string[] = [
       `--- Connect Remote Diagnostic Report ---`,
@@ -1711,16 +1893,37 @@ function bindPhoneUi() {
       // The car-finder walk, summarised: which link died is readable from
       // which counter stopped. No coordinates — counts and ages only.
       `Finder: ${
-        finderTelem
-          ? `source ${finderTelem.source ?? "none"}` +
-            `, fixes ${finderTelem.rawFixes} raw / ${finderTelem.usableFixes} usable` +
-            `${finderTelem.lastRejectedAccuracy != null ? ` (last reject ±${Math.round(finderTelem.lastRejectedAccuracy)}m)` : ""}` +
-            `, last fix ${finderTelem.lastFixAt ? `${Math.round((Date.now() - finderTelem.lastFixAt) / 1000)}s ago` : "never"}` +
-            `, problems ${finderTelem.problems}${finderTelem.lastProblem ? ` (${finderTelem.lastProblem})` : ""}` +
-            `, restarts ${finderTelem.restarts} watchdog / ${finderTelem.resumes} screen-wake` +
+        finderTelemetry
+          ? `source ${finderTelemetry.source ?? "none"}` +
+            `, fixes ${finderTelemetry.rawFixes} raw / ${finderTelemetry.usableFixes} usable` +
+            `${finderTelemetry.lastRejectedAccuracy != null ? ` (last reject ±${Math.round(finderTelemetry.lastRejectedAccuracy)}m)` : ""}` +
+            `, last fix ${finderTelemetry.lastFixAt ? `${Math.round((Date.now() - finderTelemetry.lastFixAt) / 1000)}s ago` : "never"}` +
+            `, problems ${finderTelemetry.problems}${finderTelemetry.lastProblem ? ` (${finderTelemetry.lastProblem})` : ""}` +
+            `, restarts ${finderTelemetry.restarts} watchdog / ${finderTelemetry.resumes} screen-wake` +
             `, repaints ${finderRenders.done}/${finderRenders.started}`
           : "not opened this session"
       }`,
+      ``,
+      // The glasses events the router actually saw, newest last. "text(elided)"
+      // vs "text(0)" is the distinction most gesture bugs turn on.
+      // Did the host actually accept our page/text writes? These APIs return
+      // false rather than rejecting, so "the page went up" is only knowable
+      // from here.
+      `Host ops: ${hostOpFailures} rejected${
+        lastHostOp
+          ? `, last ${lastHostOp.what} → ${lastHostOp.ok ? "ok" : "REJECTED"}` +
+            ` ${Math.max(0, Math.round((Date.now() - lastHostOp.at) / 1000))}s ago`
+          : ", none yet"
+      }`,
+      `Believed view: ${view}${backgrounded ? " (backgrounded)" : ""}`,
+      // Which menu shape the host would accept — names the field or characters
+      // it refuses when "full" isn't the answer.
+      `Menu variant: ${menuVariantUsed ?? "none accepted yet"}`,
+      `Finder layout: ${finderLayoutUsed ?? "not opened this session"}`,
+      `Input trace (last ${inputTrace.entries().length}):`,
+      ...(inputTrace.entries().length
+        ? inputTrace.lines(Date.now()).map((l) => `  ${l}`)
+        : ["  no glasses events yet"]),
       ``,
     ];
 
@@ -1887,6 +2090,184 @@ function bindPhoneUi() {
 }
 
 // ---------------------------------------------------------------------------
+// Phone-side finder screen ("Find my car" on the phone)
+//
+// A standalone companion to the glasses arrow: the phone runs the SAME finder
+// loop (finderEngine) and draws a radar from its frames, so it works with the
+// glasses disconnected or absent, and renders alongside them from one shared
+// state when both are active. Deliberately entered from a button near the
+// bottom of the settings page — glasses-initiated is the primary path, this is
+// the bonus.
+
+function bindPhoneFinder() {
+  const screenEl = document.getElementById("finder-screen") as HTMLDivElement;
+  const openBtn = document.getElementById("finder-open") as HTMLButtonElement;
+  const backBtn = document.getElementById("finder-back") as HTMLButtonElement;
+  const doneBtn = document.getElementById("finder-done") as HTMLButtonElement;
+  const canvas = document.getElementById("finder-radar") as HTMLCanvasElement;
+  const headlineEl = document.getElementById(
+    "finder-headline",
+  ) as HTMLParagraphElement;
+  const detailEl = document.getElementById(
+    "finder-detail",
+  ) as HTMLParagraphElement;
+  const messageEl = document.getElementById("finder-message") as HTMLDivElement;
+  const ctx = canvas.getContext("2d");
+
+  let layout: RadarLayout = layoutFor(280);
+
+  // Backing-store size follows the device pixel ratio for a crisp radar; the
+  // context is scaled so all radar.ts geometry stays in CSS pixels.
+  function resizeCanvas() {
+    const size = Math.max(200, Math.min(screenEl.clientWidth - 48, 300));
+    const dpr = window.devicePixelRatio || 1;
+    canvas.style.width = `${size}px`;
+    canvas.style.height = `${size}px`;
+    canvas.width = Math.round(size * dpr);
+    canvas.height = Math.round(size * dpr);
+    ctx?.setTransform(dpr, 0, 0, dpr, 0, 0);
+    layout = layoutFor(size);
+  }
+
+  // The first-run walkthrough doubles as the awaiting-permission screen: clear
+  // copy, then it flows into the radar the moment the first fix lands.
+  const WALKTHROUGH =
+    "Find my car uses your phone's location to point you back to your car.\n\n" +
+    "When your phone asks, tap Allow. Your location stays on this phone and is " +
+    "never sent anywhere.";
+
+  function problemCopy(frame: FinderFrame): string {
+    if (frame.problem === "denied") {
+      // iOS won't re-prompt once denied — the only fix is the settings app.
+      return (
+        "Location access is off for this app.\n\n" +
+        "Turn it on in your phone's Settings › Even › Location, then reopen " +
+        "Find my car."
+      );
+    }
+    if (frame.problem === "unavailable") {
+      return "No GPS signal.\n\nMove somewhere with a clearer view of the sky.";
+    }
+    // Mode "problem" with no watch problem ⇒ the car hasn't given a position.
+    return (
+      "Your car hasn't reported where it's parked yet.\n\n" +
+      "Try again once it has."
+    );
+  }
+
+  function showMessage(text: string) {
+    messageEl.textContent = text;
+    messageEl.style.display = "block";
+    canvas.style.display = "none";
+    headlineEl.style.display = "none";
+    detailEl.style.display = "none";
+    doneBtn.style.display = "none";
+  }
+  function showRadar() {
+    messageEl.style.display = "none";
+    canvas.style.display = "block";
+    headlineEl.style.display = "block";
+    detailEl.style.display = "block";
+  }
+
+  // The phone renderer: one FinderFrame → radar + headline, or a full-screen
+  // message for the awaiting/problem states (no radar to draw without a fix).
+  phoneFinderRenderer = {
+    render(frame: FinderFrame) {
+      if (!phoneFinderOpen || !ctx) return;
+      const v = frame.view;
+      const mode = v.mode;
+      if (mode === "awaiting") {
+        showMessage(WALKTHROUGH);
+        return;
+      }
+      if (mode === "problem") {
+        showMessage(problemCopy(frame));
+        return;
+      }
+      showRadar();
+      drawRadar(ctx, layout, frame);
+      const unit = lastStatus?.range_unit ?? null;
+      headlineEl.textContent =
+        mode === "arrived"
+          ? v.headline
+          : frame.distanceM != null
+            ? formatDistance(frame.distanceM, unit)
+            : "Locating…";
+      // Same wording the glasses use: the keep-unlocked note, then the parked
+      // age, then the arrival advice.
+      detailEl.textContent = frame.noteActive
+        ? KEEP_UNLOCKED_NOTE
+        : mode === "arrived"
+          ? v.detail
+          : (formatParkedAge(
+              lastStatus?.location_last_updated ?? null,
+              Date.now(),
+            ) ?? "");
+      // Arrival has nowhere to auto-return to on the phone, so it offers Done.
+      // Note: "" would revert to the stylesheet's display:none — use a value.
+      doneBtn.style.display = mode === "arrived" ? "inline-block" : "none";
+    },
+  };
+
+  // True when THIS phone screen put the glasses into the finder, so closing it
+  // takes them back out — but a finder the user opened from the glasses is left
+  // alone.
+  let phoneOpenedGlassesFinder = false;
+
+  async function openFinder() {
+    if (phoneFinderOpen) return;
+    phoneFinderOpen = true;
+    screenEl.style.display = "flex";
+    resizeCanvas();
+    // Attach to the shared loop (starts a session, or joins the glasses one).
+    attachPhoneFinder();
+    // Ensure a car position: if the last status lacked one, poll now — the
+    // engine's tick starts the GPS watch the moment coordinates arrive.
+    if (!carPosition() && client) void pollStatus();
+    // Mirror onto the glasses. This is the "active from either side" half of
+    // the design that was missing: opening from the phone now puts the finder
+    // on the glasses too, both rendering the same session. It is also the only
+    // route to the glasses finder while the host is refusing the menu page.
+    if (view !== "finder") {
+      phoneOpenedGlassesFinder = true;
+      await enterFinder();
+    }
+  }
+
+  function closeFinder() {
+    if (!phoneFinderOpen) return;
+    phoneFinderOpen = false;
+    // Detach — the GPS watch is provably stopped unless the glasses finder is
+    // also open (engine ref-counting).
+    detachPhoneFinder();
+    screenEl.style.display = "none";
+    if (phoneOpenedGlassesFinder) {
+      phoneOpenedGlassesFinder = false;
+      void exitFinder();
+    }
+  }
+
+  openBtn.addEventListener("click", openFinder);
+  backBtn.addEventListener("click", closeFinder);
+  doneBtn.addEventListener("click", closeFinder);
+  window.addEventListener("resize", () => {
+    if (phoneFinderOpen) resizeCanvas();
+  });
+
+  // DEV only (constant-folded out of production): `VITE_FINDER_AUTO=1` opens the
+  // phone finder on boot, so the simulator's webview screenshot can inspect the
+  // radar without a way to click the DOM button through the glasses input API.
+  if (import.meta.env.DEV && import.meta.env.VITE_FINDER_AUTO) {
+    // Delayed so the app has finished connecting and settled on the HUD —
+    // otherwise this races boot and the connect's showHud paints over the
+    // finder. Matches a real user tapping the button, which is the path worth
+    // exercising.
+    setTimeout(() => void openFinder(), 4000);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Boot. Order matters: the first frame goes to the glasses before anything
 // else — in particular before the settings read, which must never sit
 // between launch and first paint (black-frame risk on a slow storage read).
@@ -1911,4 +2292,5 @@ if (createResult !== 0) {
   subscribeEvents();
   void connectToBackend();
   bindPhoneUi();
+  bindPhoneFinder();
 }
