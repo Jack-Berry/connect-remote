@@ -6,7 +6,7 @@ provider while commands stay on the reverse-engineered flow.
 """
 
 from datetime import datetime
-from typing import Annotated, Protocol
+from typing import Annotated, Any, Protocol
 
 from pydantic import BaseModel, BeforeValidator
 
@@ -21,6 +21,36 @@ def _round_float(v: object) -> object:
 # (observed: ev_battery_percentage 74.5, ev_driving_range 213.7). Every
 # integer field that carries upstream data must tolerate that, so: round.
 LaxInt = Annotated[int, BeforeValidator(_round_float)]
+
+
+def _truthy(v: Any) -> Any:
+    """Coerce upstream 'is on' values to a real bool.
+
+    The library's boolean-looking flags are not always booleans. `climate_on`
+    comes from `air_control_is_on`, which is actually the blower SPEED (0-10+):
+    with the climate genuinely running at full fan it arrives as 10, and
+    Pydantic v2 accepts only 0/1 for a bool — so the whole /status 500'd
+    exactly when the feature was in use (hardware, 2026-07-24). Anything
+    non-zero means on.
+
+    Deliberately applied to every bool field rather than just the one that
+    bit: one odd upstream value must never take the entire status down, and
+    a field that is None stays None (absent, not false).
+    """
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "on", "yes"):
+            return True
+        if s in ("false", "off", "no", ""):
+            return False
+    return v
+
+
+LaxBool = Annotated[bool, BeforeValidator(_truthy)]
 
 
 class VehicleStatus(BaseModel):
@@ -45,10 +75,10 @@ class VehicleStatus(BaseModel):
     fuel_range: LaxInt | None = None
     # Combined range where the API provides one (PHEV: EV + fuel).
     total_range: LaxInt | None = None
-    locked: bool | None = None
-    charging: bool | None = None
+    locked: LaxBool | None = None
+    charging: LaxBool | None = None
     charge_eta_minutes: LaxInt | None = None
-    climate_on: bool | None = None
+    climate_on: LaxBool | None = None
     doors_open: list[str] = []
     # Last reported car position — consumed by the glasses "Find my car" mode.
     latitude: float | None = None

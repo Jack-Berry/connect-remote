@@ -214,3 +214,34 @@ def test_set_climate_off_ignores_temperature():
     provider = make_climate_provider(3, range(62, 83))
     provider.set_climate(ClimateSettings(on=False, temp=21.0, defrost=False, heating=False))
     assert captured == ["stop"]
+
+
+# ---------------------------------------------------------------------------
+# Bool coercion — hardware regression, 2026-07-24.
+
+
+def test_climate_on_accepts_blower_speed_not_just_0_or_1():
+    """`air_control_is_on` is the blower SPEED, not a flag.
+
+    With the climate genuinely running the car reported 10, Pydantic v2 accepts
+    only 0/1 for a bool, and the whole /status 500'd with "backend bug, please
+    report" — i.e. the app broke exactly when the feature was in use. Any
+    non-zero value means on.
+    """
+    from app.providers.base import VehicleStatus
+
+    assert VehicleStatus(climate_on=10).climate_on is True
+    assert VehicleStatus(climate_on=1).climate_on is True
+    assert VehicleStatus(climate_on=0).climate_on is False
+    # Absent stays absent — never coerced into a confident False.
+    assert VehicleStatus(climate_on=None).climate_on is None
+    assert VehicleStatus().climate_on is None
+
+
+def test_every_bool_field_tolerates_odd_upstream_values():
+    """One weird value must never take the whole status down."""
+    from app.providers.base import VehicleStatus
+
+    s = VehicleStatus(locked=2, charging=10, climate_on=7)
+    assert (s.locked, s.charging, s.climate_on) == (True, True, True)
+    assert VehicleStatus(locked=True, charging=False).locked is True
