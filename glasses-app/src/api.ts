@@ -36,6 +36,13 @@ export interface VehicleStatus {
   fuel_level_percent?: number | null
   fuel_range?: number | null
   total_range?: number | null
+  /** Stable keys for warnings the CAR reports, most severe first — proxy-owned
+   *  and proxy-ranked (backend/app/warnings.py). Empty is the normal answer:
+   *  a healthy car and a car that doesn't report a given flag at all both land
+   *  here, deliberately indistinguishable. Absent from an older proxy, and
+   *  keys this app has no copy for are dropped rather than rendered raw — see
+   *  warnings.ts. */
+  warnings?: string[] | null
   stale?: boolean | null
 }
 

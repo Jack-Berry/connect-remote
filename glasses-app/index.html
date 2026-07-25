@@ -101,6 +101,45 @@
         margin: 8px 0 0;
       }
 
+      /* -- car-reported warnings ------------------------------------------- */
+      /* The one place this surface raises its voice, and it still doesn't
+         shout: a left rule in the error colour, ordinary body text, no fill
+         and no icon. The copy REPORTS what the car said, it doesn't diagnose
+         (docs-internal/WARNINGS-FIELDS.md), so alarm-red panelling would
+         overstate what we actually know. Unlike the glasses (one line, five
+         seconds) the phone lists every active warning and waits to be
+         dismissed. */
+      #warning-banner {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+        margin-top: 22px;
+        padding: 12px 0 12px 14px;
+        border-left: 3px solid var(--err);
+      }
+      #warning-banner .warn-list {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        font-size: 15px;
+        line-height: 1.45;
+        color: var(--ink);
+      }
+      /* Big enough to hit without magnifying, quiet enough not to compete
+         with the message it dismisses. */
+      #warning-dismiss {
+        flex: none;
+        margin: -6px -6px 0 0;
+        padding: 6px 10px;
+        border: 0;
+        background: none;
+        font-size: 20px;
+        line-height: 1;
+        color: var(--chevron);
+        cursor: pointer;
+      }
+
       /* -- sections -------------------------------------------------------- */
       /* The hairline rule under the heading is the ONLY grouping device: no
          cards, no fills, no shadows. */
@@ -749,6 +788,14 @@
       <div class="eyebrow" data-brand="name">Genesis</div>
       <h1>Remote settings</h1>
       <p class="lede">Status and controls live on the glasses.</p>
+
+      <!-- CAR-REPORTED WARNINGS — populated from /status by main.ts, hidden
+           whenever the car reports none (the overwhelmingly common case) and
+           for the rest of the session once dismissed. -->
+      <div id="warning-banner" hidden>
+        <div id="warning-list" class="warn-list"></div>
+        <button id="warning-dismiss" type="button" aria-label="Dismiss warnings">×</button>
+      </div>
 
       <!-- ACCOUNT ------------------------------------------------------- -->
       <section class="sec">

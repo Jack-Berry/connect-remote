@@ -39,6 +39,8 @@ import {
   FINDER_MAIN_Y,
   HUD_CONTAINER,
   HUD_NOTE_CONTAINER,
+  HUD_NOTE_H,
+  HUD_NOTE_Y,
   HUD_PADDING,
   HUD_ROW_CONTAINER,
   HUD_ROW_W,
@@ -106,6 +108,7 @@ import {
   tempFieldState,
   toCanonicalC,
 } from "./settings";
+import { WarningGate, renderWarningBanner, warningLines } from "./warnings";
 // Vite resolves JSON imports at build time — gives us the version string
 // from app.json without a runtime fetch.
 import appJson from "../app.json";
@@ -139,6 +142,22 @@ let connectState: "connecting" | "failed" = "connecting";
 // app keeps running and polling. Distinct from connect/error states, which
 // always render something — a silent blank must only ever be user-chosen.
 let hudHidden = false;
+// Car-reported warnings: one line, highest severity, once per app launch,
+// auto-clearing. The gate (warnings.ts) holds the pending line and the
+// precedence rules; these three are just what is currently on screen.
+const warningGate = new WarningGate();
+// The note currently occupying the HUD's bottom band — a command
+// confirmation or an error. Non-empty means the band is spoken for and a
+// warning must wait: transient notes win absolutely.
+let hudNote = "";
+// The warning line currently painted (it stacks above the energy lines
+// rather than replacing them), and its auto-clear timer.
+let warningShown = "";
+let warningTimer: ReturnType<typeof setTimeout> | null = null;
+/** How long a warning holds before clearing itself. There is no dismiss
+ *  gesture — a tap on the HUD is the hide-HUD toggle — so auto-clear is the
+ *  only way it can ever go away. */
+const WARNING_HOLD_MS = 5000;
 let menuItems: MenuItem[] = [];
 let repollTimer: ReturnType<typeof setTimeout> | null = null;
 // Guard against a rapid repeat double-tap re-firing the exit dialog.
@@ -227,9 +246,11 @@ function hudPage(note: string) {
       }),
       new TextContainerProperty({
         xPosition: 0,
-        yPosition: 224,
+        // Three lines tall, bottom-aligned by formatHudBottom, so the everyday
+        // one-line content sits exactly where the old 64px box put it.
+        yPosition: HUD_NOTE_Y,
         width: 576,
-        height: 64,
+        height: HUD_NOTE_H,
         borderWidth: 0,
         borderColor: 0,
         paddingLength: HUD_PADDING,
@@ -238,7 +259,7 @@ function hudPage(note: string) {
           ? " "
           : safeText(
               "render/hud",
-              () => formatHudBottom(lastStatus, note),
+              () => formatHudBottom(lastStatus, note, warningShown),
               SAFE_NOTE,
             ),
         isEventCapture: 0,
@@ -458,6 +479,9 @@ function upgradeText(
 }
 
 async function updateHud(note = "") {
+  // Every HUD paint declares what is in the band, which is how the warning
+  // gate knows whether a command note currently owns it.
+  hudNote = note;
   await upgradeText(
     HUD_ROW_CONTAINER,
     hudHidden
@@ -470,10 +494,48 @@ async function updateHud(note = "") {
       ? " "
       : safeText(
           "render/hud",
-          () => formatHudBottom(lastStatus, note),
+          () => formatHudBottom(lastStatus, note, warningShown),
           SAFE_NOTE,
         ),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Car-reported warnings on the glasses (see warnings.ts for the rules).
+
+/** Drop whatever warning is on screen and stop its timer. Called whenever the
+ *  band stops being ours — leaving the HUD, hiding it, backgrounding. */
+function clearWarningLine() {
+  if (warningTimer) clearTimeout(warningTimer);
+  warningTimer = null;
+  warningShown = "";
+}
+
+/**
+ * Paint the pending warning if this exact moment allows it — else leave it
+ * pending and try again after the next HUD paint. The gate spends the
+ * once-per-launch allowance only when it actually hands the line over, so a
+ * warning that arrives during a command confirmation is re-queued behind it,
+ * not lost.
+ */
+async function maybeShowWarning() {
+  const line = warningGate.claim({
+    view,
+    hudHidden,
+    backgrounded,
+    noteActive: hudNote !== "",
+  });
+  if (!line) return;
+  warningShown = line;
+  await updateHud(hudNote);
+  if (warningTimer) clearTimeout(warningTimer);
+  warningTimer = setTimeout(() => {
+    warningTimer = null;
+    warningShown = "";
+    // Repaint only if the HUD is still what's on screen; anything else has
+    // already cleared the line on its way out.
+    if (view === "hud" && !hudHidden && !backgrounded) void updateHud(hudNote);
+  }, WARNING_HOLD_MS);
 }
 
 // Transient HUD note: clears itself back to the regular bottom line (blank
@@ -488,7 +550,11 @@ function scheduleNoteClear(ms: number) {
   clearNoteTimer();
   noteTimer = setTimeout(() => {
     noteTimer = null;
-    if (view === "hud" && !backgrounded) void updateHud();
+    if (view === "hud" && !backgrounded) {
+      // The band is free again — a warning that arrived while this note held
+      // it has been waiting for exactly this moment.
+      void updateHud().then(maybeShowWarning);
+    }
   }, ms);
 }
 
@@ -501,6 +567,10 @@ const HUD_HIDDEN_HINT = "HUD Hidden: Tap to show";
 async function toggleHudHidden() {
   hudHidden = !hudHidden;
   clearNoteTimer();
+  // A warning never survives into (or out of) the hidden state: hiding is the
+  // user saying "show me nothing", and unhiding must not replay a five-second
+  // line whose five seconds happened while the display was blank.
+  clearWarningLine();
   if (hudHidden) {
     await upgradeText(HUD_ROW_CONTAINER, " ");
     await upgradeText(
@@ -510,6 +580,8 @@ async function toggleHudHidden() {
     scheduleNoteClear(2000);
   } else {
     await updateHud();
+    // Still pending (it was never paintable while hidden) → now it can be.
+    await maybeShowWarning();
     void pollStatus();
   }
 }
@@ -527,18 +599,24 @@ const setView = (v: GlassesView) => {
   view = v;
 };
 
-function showHud(note = "") {
+async function showHud(note = "") {
   const previous = view;
   // Explicit navigation to the HUD always shows it — landing from the menu
   // (or a fresh connect) on an invisible page would look broken.
   hudHidden = false;
-  return commitView(
+  hudNote = note;
+  const ok = await commitView(
     "hud",
     previous,
     setView,
     () => rebuildPage("hud page", new RebuildPageContainer(hudPage(note))),
     (err) => recordError("render/hud", err),
   );
+  // Every arrival at a HUD that genuinely went up is a chance for a pending
+  // warning — launch, back from the finder, back from the menu. A `note` in
+  // the band blocks it (commands win), and it stays pending.
+  if (ok) await maybeShowWarning();
+  return ok;
 }
 
 /**
@@ -608,6 +686,8 @@ async function rebuildMenuPage(
 // changing its context-aware items) is a full page rebuild.
 function showMenu(note = "") {
   const previous = view;
+  // The menu replaces the HUD band entirely; anything showing there is gone.
+  clearWarningLine();
   let candidate: MenuItem[];
   try {
     candidate = buildMenuItems(lastStatus, settings);
@@ -951,6 +1031,9 @@ function detachPhoneFinder() {
 
 async function enterFinder() {
   const previous = view;
+  // The finder owns the whole panel and has no bottom band; a warning must
+  // never follow the user in here, and its timer must not fire behind it.
+  clearWarningLine();
   finderShown = null;
   finderDebugShown = null;
   finderRenders = { started: 0, done: 0 };
@@ -1154,6 +1237,10 @@ async function renderCurrent(note = "") {
       finderEngine.refresh();
     } else if (view === "hud") {
       await updateHud(note);
+      // Every HUD paint is a chance for a pending warning: this is the path
+      // the first status takes once the user is actually looking at the HUD,
+      // and the path a re-queued warning takes once its blocking note clears.
+      await maybeShowWarning();
     } else if (
       // Through prioritiseMenu with the accepted cap FIRST, so this compares
       // the menu we would render against the one on screen. Comparing the raw
@@ -1189,6 +1276,8 @@ async function pollStatus(note = "") {
   try {
     lastStatus = await client.getStatus();
     applyPowertrain(lastStatus);
+    // Offered, not fired: the gate decides if and when it can be seen.
+    warningGate.offer(lastStatus);
     await renderCurrent(note);
   } catch (err) {
     // 409 mid-session = device token expired. Clear it so the phone-side
@@ -1243,6 +1332,36 @@ function applyPowertrain(status: VehicleStatus | null) {
   // The car has just told us what limits it holds — that may be exactly what
   // is on the form, in which case the send button quietly goes away.
   syncPhoneLimits?.();
+  // Same trigger, different surface: every successful status is also when the
+  // phone's warning banner is right or wrong.
+  renderPhoneWarnings(status);
+}
+
+// ---------------------------------------------------------------------------
+// Phone warning banner. Where the glasses show one line for five seconds, the
+// phone lists every active warning and stays until dismissed — it is a
+// surface you are already looking at, with room to be complete, and (unlike
+// the HUD) it has somewhere safe to put a dismiss control.
+
+/** Dismissed for this launch only. Not persisted: a warning the car is still
+ *  reporting next time you open the app is worth showing again, and a
+ *  permanently silenced warning is the failure mode this whole feature is
+ *  trying to avoid. */
+let phoneWarningsDismissed = false;
+
+function renderPhoneWarnings(status: VehicleStatus | null) {
+  renderWarningBanner(
+    document,
+    phoneWarningsDismissed ? [] : warningLines(status),
+  );
+}
+
+function bindPhoneWarnings() {
+  const btn = document.getElementById("warning-dismiss");
+  btn?.addEventListener("click", () => {
+    phoneWarningsDismissed = true;
+    renderPhoneWarnings(lastStatus);
+  });
 }
 
 function scheduleRepoll(delayMs: number) {
@@ -1302,6 +1421,10 @@ async function connectToBackend() {
     if (gen !== connectGen) return; // superseded or backgrounded mid-flight
     lastStatus = status;
     applyPowertrain(status);
+    // The launch status almost always lands while the user is still on the
+    // connecting page, which is precisely why the gate holds it until the
+    // HUD is genuinely up rather than painting into a page without a band.
+    warningGate.offer(status);
     stopSpinner();
     await showHud();
   } catch (err) {
@@ -1498,6 +1621,10 @@ function subscribeEvents() {
         if (repollTimer) clearTimeout(repollTimer);
         repollTimer = null;
         clearNoteTimer();
+        // Nothing is on the glasses while backgrounded, so a warning's five
+        // seconds must not tick away unseen — drop the line; if it never got
+        // its showing the gate still holds it for the next HUD paint.
+        clearWarningLine();
         // GPS is the expensive one: a watch left running while the phone is in
         // a pocket is a battery complaint. The watch stops unless the phone
         // finder is also open (it keeps its own session).
@@ -2806,6 +2933,7 @@ function bindSafely(what: string, bind: () => void) {
 }
 bindSafely("settings form", bindPhoneUi);
 bindSafely("car finder", bindPhoneFinder);
+bindSafely("warning banner", bindPhoneWarnings);
 
 gate.onReady(async (host) => {
   try {

@@ -58,6 +58,13 @@ export const FINDER_IMG_CONTAINER = {
 // label ("Refresh · updated 14:12" ≈ 200px + list item padding).
 export const MENU_LIST_WIDTH = 272;
 export const HUD_PADDING = 4;
+// Bottom band geometry. Three ~32px lines ending flush with the panel's
+// bottom edge (192 + 96 = 288), so the everyday one- and two-line content
+// lands on exactly the pixels it did when this box was 64px at y=224 — see
+// bottomAlign. The third line exists for a warning stacked above a charging
+// PHEV's EV+charging pair, the tallest combination the band can produce.
+export const HUD_NOTE_Y = 192;
+export const HUD_NOTE_H = 96;
 // Top row spans only the central 80% of the canvas — flush to the panel
 // edges it looked lopsided (left item tighter to the edge than the right).
 export const HUD_ROW_X = 58;
@@ -348,29 +355,57 @@ export function formatHudRow(status: VehicleStatus | null): string {
   return justifyRow(items, HUD_ROW_INNER_W);
 }
 
-// HUD bottom block, centred. Transient notes (command sent / errors) take
-// precedence over everything, then:
+// How many ~32px text lines the bottom band's container can hold. The band is
+// bottom-aligned by padding short blocks up to this many lines, so the
+// everyday one-line content (charging / a note) sits exactly where it always
+// has while a three-line stack still has somewhere to go. See
+// HUD_NOTE_Y/HUD_NOTE_H in main.ts — they must agree with this.
+export const HUD_NOTE_LINES = 3;
+
+// HUD bottom block, centred and bottom-aligned. Transient notes (command sent
+// / errors) take precedence over everything, then, stacked top-down:
+//   · a car-reported warning (~5 s, highest severity only — see warnings.ts);
 //   · both-sides cars (PHEV): the EV line ("25 mi  55%"), with the charging
 //     line stacked directly below it while charging — same spot where a
 //     pure EV's charging line lives;
 //   · pure EV: the charging line while charging;
 //   · a car with no renderable energy data at all: an honest "limited data"
 //     notice so the near-empty top row doesn't read as a malfunction.
+//
+// The warning STACKS ABOVE the energy lines rather than evicting them: on a
+// PHEV that band is the car's only EV readout, and blanking it for five
+// seconds to report low washer fluid would be a bad trade. It does replace
+// the "limited data" fallback, which exists only to fill an empty band.
 export function formatHudBottom(
   status: VehicleStatus | null,
   note = "",
+  warning = "",
 ): string {
   let text = note;
-  if (!text && status) {
+  if (!text) {
     const lines: string[] = [];
-    if (isBothSides(status)) lines.push(evItems(status).join("  "));
-    if (status.charging) lines.push(chargingLine(status));
-    if (!lines.length && !hasEnergyData(status))
-      lines.push("Limited data for this vehicle");
+    if (warning) lines.push(warning);
+    if (status) {
+      if (isBothSides(status)) lines.push(evItems(status).join("  "));
+      if (status.charging) lines.push(chargingLine(status));
+      if (!lines.length && !hasEnergyData(status))
+        lines.push("Limited data for this vehicle");
+    }
     text = lines.join("\n");
   }
   if (!text) return " ";
-  return centerBlock(text, HUD_INNER_W);
+  return bottomAlign(centerBlock(text, HUD_INNER_W));
+}
+
+// Pad a block up to HUD_NOTE_LINES with blank lines ON TOP. The container
+// renders from its top edge, so without this a two-line block would start
+// where a one-line block starts and the whole band would visibly jump every
+// time the charging line appeared. A space, not an empty string: an empty
+// line's height is the renderer's business, a space's is not.
+function bottomAlign(block: string): string {
+  const lines = block.split("\n");
+  const pad = Math.max(0, HUD_NOTE_LINES - lines.length);
+  return [...Array(pad).fill(" "), ...lines].join("\n");
 }
 
 // Connecting page: no HUD until the first successful /status — a HUD of

@@ -142,10 +142,14 @@ describe("formatHudBottom", () => {
 
   it("stacks the PHEV EV line directly above the charging line", () => {
     const s = { ...PHEV, charging: true, charge_eta_minutes: 95 };
+    // Three lines always: the band is bottom-aligned inside a three-line box
+    // (a warning can stack above these two), so short blocks carry blank
+    // padding on top and the content still ends flush with the panel edge.
     const lines = formatHudBottom(s).split("\n");
-    expect(lines).toHaveLength(2);
-    expect(lines[0]).toContain("25 mi  55%");
-    expect(lines[1]).toContain("Charging (1h35m left)");
+    expect(lines).toHaveLength(3);
+    expect(lines[0].trim()).toBe("");
+    expect(lines[1]).toContain("25 mi  55%");
+    expect(lines[2]).toContain("Charging (1h35m left)");
   });
 
   it("keeps note precedence over the PHEV EV line", () => {
