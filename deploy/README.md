@@ -12,11 +12,20 @@ Docker Compose:
 The proxy is stateless for user data (see `/DECISIONS-LOG.md`): no database,
 no credentials at rest. Restarts and redeploys lose nothing but the in-memory
 session cache — the next request from each user just logs in afresh. The one
-volume (`proxy-shapes`) holds the vehicle-model field-name list (names +
-types only, never values — see `backend/app/shape_capture.py` and
-PRIVACY.md); set `SHAPES_DEBUG_TOKEN` in the compose environment to make
-`GET /debug/shapes` readable with the `X-Debug-Token` header, otherwise the
-endpoint answers 404.
+volume (`proxy-shapes`) holds two anonymous files: the vehicle-model
+field-name list (`shapes.json` — names + types only, never values, see
+`backend/app/shape_capture.py`) and the warning-fire counts
+(`warning-counts.json` — brand:region:warning_key → count, no account link,
+no values, no timestamps, see `backend/app/warning_counts.py`). Both are
+disclosed in PRIVACY.md. Set `SHAPES_DEBUG_TOKEN` in the compose environment
+to make `GET /debug/shapes` readable with the `X-Debug-Token` header — it
+returns both collections — otherwise the endpoint answers 404:
+
+```sh
+curl -s -H "X-Debug-Token: $SHAPES_DEBUG_TOKEN" \
+  https://car-proxy.berrydev.co.uk/debug/shapes | jq .warning_counts
+# {} until a car actually reports a fault — every specimen we hold is healthy.
+```
 
 ## One-time server setup
 

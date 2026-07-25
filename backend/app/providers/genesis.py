@@ -25,7 +25,7 @@ from hyundai_kia_connect_api.exceptions import (
 from hyundai_kia_connect_api.Token import Token
 from pydantic import ValidationError
 
-from .. import shape_capture
+from .. import shape_capture, warning_counts, warnings as car_warnings
 from ..climate_units import wire_temp, wire_unit
 from .base import (
     AuthError,
@@ -316,6 +316,16 @@ class GenesisProvider:
         shape_capture.store.record(
             self._brand_name, self._region_name, self._powertrain, v
         )
+        # Per-car opt-in, proven from this car's own payload; suppressed
+        # wholesale when the car's data is older than warnings.MAX_WARNING_AGE
+        # (see app/warnings.py). Never raises.
+        active_warnings = car_warnings.evaluate(v)
+        # Anonymous count of WHICH warning types fire in the wild — no account
+        # link, no values, no timestamps. Every specimen we hold is a healthy
+        # car; this is how that changes. Never raises.
+        warning_counts.store.record(
+            self._brand_name, self._region_name, active_warnings
+        )
         # Fuel fields are gated on the classification, not on field presence:
         # every EV reports fuelLevel 0, and Kia-US EVs get fuel_driving_range
         # populated with their EV range via a distanceToEmpty fallback. For
@@ -367,6 +377,7 @@ class GenesisProvider:
                 doors_open=doors,
                 charge_limit_ac=getattr(v, "ev_charge_limits_ac", None),
                 charge_limit_dc=getattr(v, "ev_charge_limits_dc", None),
+                warnings=active_warnings,
                 latitude=getattr(v, "location_latitude", None),
                 longitude=getattr(v, "location_longitude", None),
                 # NAME TRAP: the public property is location_last_updated_at.

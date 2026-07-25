@@ -28,9 +28,34 @@ class FakeProvider:
         self.limit_ac, self.limit_dc = 80, 90
 
     def _status(self):
+        # FAKE_WARNINGS drives the car-reported warning line/banner — a comma
+        # separated list of proxy keys, e.g.
+        #   FAKE_WARNINGS=brake_fluid_low,washer_fluid_low
+        # The real evaluator refuses to invent these (every field must be
+        # proven from the car's own payload, and we hold no fault specimen),
+        # so this is the only way to see the collision matrix on screen.
+        # FAKE_PHEV=1 makes it a charging both-sides car: the band's hardest
+        # case, where the warning has to stack above an EV line AND a
+        # charging line without evicting either.
+        # FAKE_WARNINGS_FILE points at a file re-read on every request, so a
+        # warning can be made to arrive WHILE the app is in the menu, the
+        # finder, a command confirmation or a hidden HUD — the precedence
+        # collisions are all about timing, and a fixed env var can only ever
+        # produce the easy one (a warning that is already there at launch).
+        warnings_file = os.environ.get("FAKE_WARNINGS_FILE")
+        raw = os.environ.get("FAKE_WARNINGS", "")
+        if warnings_file and os.path.exists(warnings_file):
+            with open(warnings_file, encoding="utf-8") as f:
+                raw = f.read().strip()
+        warnings = [w.strip() for w in raw.split(",") if w.strip()]
+        phev = os.environ.get("FAKE_PHEV") == "1"
         return VehicleStatus(
-            soc_percent=82,
-            range_value=317,
+            powertrain="PHEV" if phev else "EV",
+            warnings=warnings,
+            fuel_level_percent=60 if phev else None,
+            fuel_range=340 if phev else None,
+            soc_percent=82 if not phev else 55,
+            range_value=317 if not phev else 25,
             range_unit="mi",
             locked=self.locked,
             charging=self.charging,

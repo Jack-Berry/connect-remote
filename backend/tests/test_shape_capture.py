@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from hyundai_kia_connect_api.Vehicle import Vehicle
 
-from app import shape_capture
+from app import shape_capture, warning_counts
 from app.main import app
 from app.shape_capture import ShapeStore
 
@@ -155,4 +155,17 @@ def test_debug_shapes_returns_snapshot_with_token(monkeypatch):
     shape_capture.store.record("Kia", "USA", "HEV", SimpleNamespace(fuel_level=62))
     r = client.get("/debug/shapes", headers={"X-Debug-Token": "right-token"})
     assert r.status_code == 200
-    assert r.json()["Kia:USA:HEV"] == {"fuel_level": "int"}
+    assert r.json()["shapes"]["Kia:USA:HEV"] == {"fuel_level": "int"}
+
+
+def test_debug_shapes_also_exposes_warning_counts(monkeypatch):
+    """One endpoint for everything the proxy retains — and both collections
+    are nested, because shape keys and count keys are both "A:B:C" strings
+    and would be indistinguishable merged into one flat dict."""
+    monkeypatch.setenv("SHAPES_DEBUG_TOKEN", "right-token")
+    warning_counts.store.record("Kia", "USA", ["washer_fluid_low"])
+    payload = client.get(
+        "/debug/shapes", headers={"X-Debug-Token": "right-token"}
+    ).json()
+    assert payload["warning_counts"]["Kia:USA:washer_fluid_low"] >= 1
+    assert set(payload) == {"shapes", "warning_counts"}

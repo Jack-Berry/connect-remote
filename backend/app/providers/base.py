@@ -91,6 +91,12 @@ class VehicleStatus(BaseModel):
     # Current AC/DC charge targets as reported by the car (percent)
     charge_limit_ac: LaxInt | None = None
     charge_limit_dc: LaxInt | None = None
+    # Stable keys for warnings THIS car reports, most severe first (see
+    # app/warnings.py). Empty is the normal answer — a car that reports no
+    # fault and a car that doesn't report a given flag at all both land here,
+    # deliberately indistinguishable to the client. Never populated from a
+    # stale payload: a cached fault may already have been dealt with.
+    warnings: list[str] = []
     # True when this is served from cache because upstream is unreachable
     stale: bool = False
 

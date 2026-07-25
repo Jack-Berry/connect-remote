@@ -5,7 +5,7 @@ permalink: /privacy/
 
 # Connect Remote Privacy Policy
 
-_Last updated: 20 July 2026_
+_Last updated: 25 July 2026_
 
 Connect Remote is an open-source companion app for Genesis, Kia, and Hyundai
 vehicles, running on Even Realities G2 smart glasses. This policy explains what
@@ -57,7 +57,10 @@ The relay's source code is in this repository, so what it does is auditable.
   beyond the same short-lived in-memory session. To improve support for
   different vehicle types, the relay may record which data fields a vehicle
   model exposes — field names only, never values — keyed by brand, region and
-  powertrain type, not by account.
+  powertrain type, not by account. For the same reason, the relay may record
+  an anonymous count of which warning types vehicles report (for example
+  "low washer fluid"), keyed by brand and region, with no account link and no
+  values.
 
 - **Settings** (credentials, climate preferences, charge limits) are stored
   locally in the Even phone app's storage on your device, and nowhere else.
@@ -95,8 +98,9 @@ app sends to the relay contains your phone's position.
   policy.
 - **DigitalOcean**, which hosts the relay server. It has no access to request
   contents (TLS terminates inside the server); the only data at rest on its
-  infrastructure is the vehicle-model field-name list described above, which
-  contains no values and no account information.
+  infrastructure is the vehicle-model field-name list and the anonymous
+  warning-type counts described above, neither of which contains values or
+  account information.
 
 Connect Remote is not affiliated with, endorsed by, or sponsored by Genesis,
 Kia, Hyundai, Hyundai Motor Group, or Even Realities.
@@ -104,8 +108,9 @@ Kia, Hyundai, Hyundai Motor Group, or Even Realities.
 ## Data retention and deletion
 
 The relay retains nothing at rest that identifies you or your account (the
-vehicle-model field-name list above contains no values and no account link),
-so there is nothing for the developer to delete. To remove your data:
+vehicle-model field-name list and the anonymous warning-type counts above
+contain no values and no account link), so there is nothing for the developer
+to delete. To remove your data:
 
 - Clear the app's settings (or delete the app) on your phone to remove the
   stored credentials.

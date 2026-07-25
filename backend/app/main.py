@@ -33,7 +33,7 @@ from .providers.base import (
     UpstreamError,
     VehicleStatus,
 )
-from . import shape_capture
+from . import shape_capture, warning_counts
 from .rate_limit import FailedAuthLimiter, ThrottleRegistry
 from .redact import redact
 from .session_cache import Session, SessionCache
@@ -282,7 +282,14 @@ def get_status(body: CredentialedRequest, request: Request) -> VehicleStatus:
         # Degrade gracefully: serve last-known state marked stale, not a 500.
         if session.last_known is not None:
             logger.warning("upstream failed, serving stale status: %s", exc)
-            return session.last_known.model_copy(update={"stale": True})
+            # Warnings are dropped, not carried: a warning is a claim about the
+            # car RIGHT NOW, and this payload is by definition not now. Same
+            # rule as the age gate in app/warnings.py, applied one layer up
+            # where the staleness is ours rather than the car's. `stale: true`
+            # is itself the explanation for the empty array — no new field.
+            return session.last_known.model_copy(
+                update={"stale": True, "warnings": []}
+            )
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}")
 
 
@@ -336,16 +343,30 @@ def debug_fields(body: CredentialedRequest, request: Request) -> Response:
 
 @app.get("/debug/shapes", include_in_schema=False)
 def debug_shapes(request: Request) -> dict:
-    """Collected field shapes (names + type names only, never values), keyed
-    by brand:region:powertrain — see shape_capture.py. Developer-only:
-    requires the SHAPES_DEBUG_TOKEN env var to be set AND matched by the
-    X-Debug-Token header. 404 (not 401/403) otherwise, so the endpoint's
-    existence isn't advertised to scanners."""
+    """Everything the proxy retains, which is two things and both anonymous:
+
+    - ``shapes``: field shapes (names + type names only, never values) keyed
+      by brand:region:powertrain — see shape_capture.py.
+    - ``warning_counts``: how often each warning key has fired, keyed by
+      brand:region:warning_key — see warning_counts.py. No account link, no
+      values, no timestamps.
+
+    Developer-only: requires the SHAPES_DEBUG_TOKEN env var to be set AND
+    matched by the X-Debug-Token header. 404 (not 401/403) otherwise, so the
+    endpoint's existence isn't advertised to scanners.
+
+    The two collections are nested under named keys rather than merged: shape
+    keys and count keys are both "A:B:C" strings and would otherwise be
+    indistinguishable in the dump.
+    """
     expected = os.environ.get("SHAPES_DEBUG_TOKEN")
     provided = request.headers.get("x-debug-token", "")
     if not expected or not secrets.compare_digest(provided, expected):
         raise HTTPException(status_code=404, detail="Not Found")
-    return shape_capture.store.snapshot()
+    return {
+        "shapes": shape_capture.store.snapshot(),
+        "warning_counts": warning_counts.store.snapshot(),
+    }
 
 
 def _send_command(request: Request, creds: Credentials, fn) -> CommandAccepted:

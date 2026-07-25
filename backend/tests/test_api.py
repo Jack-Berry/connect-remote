@@ -256,12 +256,40 @@ def test_status_omits_location_timestamp_when_the_car_never_reported_one():
     assert status.model_dump(mode="json")["location_last_updated"] is None
 
 
+def test_status_carries_the_warning_keys_the_provider_computed(client, provider):
+    """The array is proxy-owned and severity-ordered; the glasses render
+    warnings[0] and nothing else, so order survives the wire verbatim."""
+    provider.status = make_status(warnings=["brake_fluid_low", "washer_fluid_low"])
+    payload = client.post("/status", json=body()).json()
+    assert payload["warnings"] == ["brake_fluid_low", "washer_fluid_low"]
+
+
+def test_status_warnings_default_to_empty_not_absent(client):
+    """An empty array is the normal answer for a healthy — or simply
+    unsupporting — car, and clients must never have to null-guard it."""
+    assert client.post("/status", json=body()).json()["warnings"] == []
+
+
 def test_status_serves_stale_cache_when_upstream_down(client, provider):
     client.post("/status", json=body())  # populate session last_known
     provider.fail = True
     r = client.post("/status", json=body())
     assert r.status_code == 200
     assert r.json()["stale"] is True
+
+
+def test_stale_cache_never_carries_warnings_forward(client, provider):
+    """A warning is a claim about the car RIGHT NOW. Re-serving a cached one
+    could keep reporting a fault the owner dealt with an hour ago — and
+    `stale: true` is itself the explanation for the empty array."""
+    provider.status = make_status(warnings=["brake_fluid_low"])
+    assert client.post("/status", json=body()).json()["warnings"] == ["brake_fluid_low"]
+    provider.fail = True
+    payload = client.post("/status", json=body()).json()
+    assert payload["stale"] is True
+    assert payload["warnings"] == []
+    # The cached status itself is untouched — only the copy sent out is.
+    assert provider.status.warnings == ["brake_fluid_low"]
 
 
 def test_status_502_when_down_and_no_cache(client, provider):

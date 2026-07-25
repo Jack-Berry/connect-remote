@@ -3,6 +3,102 @@
 Significant product/architecture decisions, newest first. One entry per
 decision: what changed, why, and what it rules out.
 
+## 2026-07-25 — Car-reported warnings: per-car opt-in, proven from the payload
+
+**Decision:** `/status` gains `warnings: []` — stable, severity-ranked keys,
+first cut exactly four: `brake_fluid_low` > `tyre_pressure_low` >
+`smart_key_battery_low` > `washer_fluid_low`. A key is evaluated only when the
+proxy can PROVE from that car's own raw payload that the car reports the flag
+(`backend/app/warnings.py`); unprovable → the key silently does not exist for
+that car, and an empty array is the normal answer. Flags are read truthily,
+never `is True`; any type that isn't bool/int/float is treated as unsupported,
+not as a warning. No warning is ever derived from a numeric reading or an
+uncalibrated raw enum. Glasses show one line, highest severity, ~5 s, once per
+launch; the phone lists all of them in a dismissible banner.
+
+**Why:** each car reports a different subset of these fields (`windowOpen` is
+present on a 2020 Kia-US Niro EV and `NoneType` on a 2026 Kia-US ICE — same
+region, same parser), so presence must be proven per car rather than assumed
+per region. The proof cannot come from the parsed value: `ApiImplType1` wraps
+the tyre and smart-key flags in a bare `bool(...)`, and `KiaUvoApiEU` does the
+same for the tyre flags (line 599 — a correction to WARNINGS-FIELDS.md, which
+listed EU-legacy tyre as `int | None`), so `bool(None) → False` makes "not
+supported" and "no warning" the same value. Raw-key presence in `vehicle.data`
+is the proof; every parser stores its untouched payload there.
+
+Warnings are suppressed wholesale when the car's own data is older than
+30 minutes, and dropped from the cached copy served when upstream is down. A
+warning is a claim about the car *right now*, and a cached payload can describe
+a fault already dealt with. 30 min = two `/refresh` throttle windows, so
+fresh data is always reachable inside it. The response explains the empty array
+without a new field: `stale` and `last_updated` are already in it.
+
+**Confidence ceiling, unchanged by shipping:** every specimen we hold is a
+healthy car. The flag → dashboard-lamp correspondence is inferred from key
+names, never observed firing. Hence copy that reports rather than diagnoses
+("Car reports low brake fluid"), and `backend/app/warning_counts.py`: an
+anonymous count per (brand, region, warning_key), no account link, no values,
+no timestamps, so the first real-world fire in the wild gets captured.
+
+**What it rules out:** warnings from readings or thresholds (12 V level, tyre
+`Pressure`, SoC) — those are our diagnosis, not the car's; per-corner tyre
+flags as an independent trigger (never parsed at all on Kia-US); `dtc_count`
+until a non-zero specimen exists (`"0"` is truthy, and its type differs
+per car within one region); and any copy that invites a tap, because a tap on
+the HUD is the hide-HUD toggle.
+
+**Glasses precedence, all pinned by tests and a simulator sweep:** transient
+command notes and errors win absolutely and a warning arriving during one
+re-queues behind them; the warning stacks ABOVE the PHEV both-sides EV line and
+the charging line rather than evicting them (the band's box grew to three lines
+at y=192 and is bottom-aligned, so existing one- and two-line content lands on
+the same pixels as before); nothing paints while the HUD is hidden,
+backgrounded, or in the finder; and the showing is pending-until-first-HUD-paint
+rather than fire-on-status, because the launch `/status` routinely lands while
+the user is still on the connecting page.
+
+## 2026-07-25 — Save never commands the car; charge limits get a contextual send
+
+**Decision:** Save persists local settings and nothing else — credentials,
+region, unit, climate target, toggles, and the charge-limit *values*. No request
+reaches the car because the user tapped Save. Pushing charge limits is its own
+deliberate action: a button under the limit controls that appears only while the
+form disagrees with what the car is known to hold, names the exact values
+(`Send 80% / 90% to car`), carries its own sending/sent/failed line, and stays
+put after a failure as the retry. One push at a time; a tap while in flight is
+ignored, never queued. Genesis → 1.4.8.
+
+**Why:** the phone-UI redesign folded the old standalone *Send limits to car*
+button into Save, on the reasoning that "limits go with Save". That made a
+preference write drive the vehicle as a side effect — a dropdown brushed by
+accident became a command — and it is the only place in the app where a car
+command isn't an explicit, separately labelled tap (climate, lock, charge all
+are). It also quietly removed the retry path that matters most: the car takes
+30–90 s to apply limits and is often asleep, so the first attempt failing is
+routine, and the only way back was to change a dropdown and re-Save.
+
+"What the car is known to hold" ranks a successful send above the car's own
+reported `charge_limit_ac`/`dc` for a settle window (`CHARGE_LIMITS_SETTLE_MS`,
+3 min) and below it after — otherwise a poll landing inside the apply window
+re-raises the button seconds after a successful send, and a stale send record
+would mask a limit changed in the manufacturer's own app forever. Unknown counts
+as "offer the send": a car that reports no limits and has been sent none is the
+one case with no other way to find out.
+
+**What it rules out:** bundling any further car command into Save, or into any
+control whose visible job is to record a preference. If a value is worth sending
+to the car it gets its own labelled action and its own status line.
+
+**Also pinned by tests, not just prose:** Save's disabled-until-dirty gate is fed
+by one delegated `input`/`change` listener on `#app`, which is broad enough to
+catch controls a hand-written field list would forget — but it means any control
+that changes a persisted value without emitting a bubbling event leaves Save
+permanently dead. Two on this form are that shape (the ± climate steppers, and
+the C/F segmented switch writing to a hidden `<select>`); both synthesise
+`bubbles: true` events, and `dirty-tracking.test.ts` now sweeps every control in
+every state and brand so deleting that flag fails a test instead of a hardware
+round.
+
 ## 2026-07-24 — All bridge calls go through `enqueue`; view transitions are atomic
 
 **Decision:** two invariants, both now enforced in code after 1.4.0-TEST killed
