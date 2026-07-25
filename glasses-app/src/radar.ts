@@ -113,8 +113,9 @@ export interface RadarLayout {
 }
 
 export function layoutFor(size: number): RadarLayout {
-  // Leave a margin for the orbiting rim arrowhead and the N tick.
-  return { size, cx: size / 2, cy: size / 2, radius: size * 0.4 };
+  // The outermost range ring IS the edge of the radar element; the rim
+  // arrowhead and the N marker sit outside it and are allowed to overflow.
+  return { size, cx: size / 2, cy: size / 2, radius: size / 2 };
 }
 
 export interface RadarScene {
@@ -198,107 +199,9 @@ export function computeScene(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Drawing (the only part that needs a canvas)
-
-// Phone dark-theme palette (index.html: #232323 surface, #E5E5E5 text), with a
-// soft green accent echoing the glasses' green panel for the car + arrowhead.
-const COL_BG = "#232323";
-const COL_RING = "#3a3a3a";
-const COL_USER = "#E5E5E5";
-const COL_HALO = "rgba(122, 208, 143, 0.10)";
-const COL_ACCENT = "#7ad08f";
-const COL_TICK = "#9a9a9a";
-
-export function drawScene(
-  ctx: CanvasRenderingContext2D,
-  layout: RadarLayout,
-  scene: RadarScene,
-): void {
-  const { cx, cy, radius } = layout;
-  ctx.clearRect(0, 0, layout.size, layout.size);
-  ctx.fillStyle = COL_BG;
-  ctx.fillRect(0, 0, layout.size, layout.size);
-
-  // Range rings.
-  ctx.strokeStyle = COL_RING;
-  ctx.lineWidth = 1.5;
-  for (const r of scene.ringRadii) {
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
-  // North tick (stationary only) — a small mark and 'N' at the top of the rim.
-  if (scene.showN) {
-    ctx.strokeStyle = COL_TICK;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy - radius - 2);
-    ctx.lineTo(cx, cy - radius - 12);
-    ctx.stroke();
-    ctx.fillStyle = COL_TICK;
-    ctx.font = "600 13px -apple-system, system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "bottom";
-    ctx.fillText("N", cx, cy - radius - 15);
-  }
-
-  // Accuracy halo, under the user dot.
-  if (scene.accuracyRadiusPx > 1) {
-    ctx.fillStyle = COL_HALO;
-    ctx.beginPath();
-    ctx.arc(cx, cy, scene.accuracyRadiusPx, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // User dot at the centre.
-  ctx.fillStyle = COL_USER;
-  ctx.beginPath();
-  ctx.arc(cx, cy, 5, 0, Math.PI * 2);
-  ctx.fill();
-
-  // Car dot.
-  if (scene.car) {
-    ctx.fillStyle = COL_ACCENT;
-    ctx.beginPath();
-    ctx.arc(scene.car.x, scene.car.y, 6, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // Rim arrowhead (walking) — a filled triangle just outside the rim, pointing
-  // outward along the relative direction.
-  if (scene.arrowheadDeg != null) {
-    drawArrowhead(ctx, layout, scene.arrowheadDeg);
-  }
-}
-
-function drawArrowhead(
-  ctx: CanvasRenderingContext2D,
-  layout: RadarLayout,
-  screenDeg: number,
-): void {
-  const { cx, cy, radius } = layout;
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(toRad(screenDeg));
-  ctx.fillStyle = COL_ACCENT;
-  const tip = radius + 16;
-  const base = radius + 4;
-  ctx.beginPath();
-  ctx.moveTo(0, -tip);
-  ctx.lineTo(9, -base);
-  ctx.lineTo(-9, -base);
-  ctx.closePath();
-  ctx.fill();
-  ctx.restore();
-}
-
-/** Convenience: compute + draw in one call. */
-export function drawRadar(
-  ctx: CanvasRenderingContext2D,
-  layout: RadarLayout,
-  frame: FinderFrame,
-): void {
-  drawScene(ctx, layout, computeScene(frame, layout));
-}
+// There is no drawing code here any more. The radar is DOM + CSS (see
+// `bindPhoneFinder` in main.ts): the car dot and the rim arrowhead have to
+// glide between updates rather than jump, and a CSS `transform` transition
+// does that — and honours prefers-reduced-motion — for free, where a canvas
+// would need its own tween loop. This module stays what it always was: the
+// pure geometry, testable without a rendering surface of any kind.

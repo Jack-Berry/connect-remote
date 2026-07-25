@@ -1,0 +1,18 @@
+{
+  "package_id": "com.jackberry.sensorprobe",
+  "edition": "202601",
+  "name": "Sensor Probe",
+  "version": "0.2.0",
+  "min_app_version": "2.0.0",
+  "min_sdk_version": "0.0.10",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "location",
+      "desc": "Reads this phone's GPS position to measure fix accuracy and update rate. Throwaway developer probe: values are shown on this screen and on the glasses only, are never stored, and are never sent to any server."
+    }
+  ],
+  "supported_languages": [
+    "en"
+  ]
+}

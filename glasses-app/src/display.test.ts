@@ -15,6 +15,8 @@ import {
   formatHudRow,
   formatMenuInfo,
   hasEnergyData,
+  prioritiseMenu,
+  sameMenu,
 } from "./display";
 import type { FinderView } from "./finder";
 import { DEFAULT_SETTINGS } from "./settings";
@@ -298,6 +300,104 @@ describe("car finder menu item", () => {
     const keys = items({ ...EV, latitude: 51.5072, longitude: -0.1276 });
     expect(keys.indexOf("finder")).toBeGreaterThan(keys.indexOf("lock"));
     expect(keys.indexOf("finder")).toBeLessThan(keys.indexOf("refresh"));
+  });
+});
+
+describe("prioritiseMenu", () => {
+  const keys = (s: VehicleStatus | null, max: number) =>
+    prioritiseMenu(buildMenuItems(s, DEFAULT_SETTINGS), max).map((i) => i.key);
+
+  it("keeps the way back, the finder and the way out in a three-slot menu", () => {
+    // The host accepts only a short list on hardware. 1.4.4 shipped a blind
+    // slice(0, 3), which cut Find my car and stranded the owner.
+    expect(keys(EV, 3)).toEqual(["hud", "finder", "quit"]);
+  });
+
+  it("pins Quit to the bottom wherever it survives", () => {
+    for (const max of [0, 3, 4, 5, 6]) {
+      const out = keys(EV, max);
+      // An exit item in the middle of the list is a mis-tap waiting to happen.
+      expect(out[out.length - 1]).toBe("quit");
+    }
+  });
+
+  it("drops Quit only in the last-ditch two-slot menu", () => {
+    // Two slots go to the way back and the finder. There is no visible way
+    // out at that size — double-tap still opens the same system dialog, and a
+    // menu that can't reach the feature is worse than one without an exit row.
+    expect(keys(EV, 2)).toEqual(["hud", "finder"]);
+  });
+
+  it("keeps the build order otherwise, so the list doesn't reshuffle", () => {
+    const full = buildMenuItems(EV, DEFAULT_SETTINGS).map((i) => i.key);
+    const kept = keys(EV, 5);
+    const expectedOrder = full.filter((k) => kept.includes(k) && k !== "quit");
+    expect(kept.filter((k) => k !== "quit")).toEqual(expectedOrder);
+  });
+
+  it("caps at max and never drops below it when items are available", () => {
+    for (const max of [2, 3, 4, 5]) {
+      expect(keys(EV, max)).toHaveLength(max);
+    }
+  });
+
+  it("treats 0 as no cap", () => {
+    expect(keys(EV, 0)).toHaveLength(
+      buildMenuItems(EV, DEFAULT_SETTINGS).length,
+    );
+  });
+
+  it("keeps duplicate-looking items distinct (identity, not label matching)", () => {
+    // Two items could share a label after pxTruncate; filtering by value
+    // identity must not collapse or duplicate them.
+    const items = [
+      { key: "hud", label: "Return to HUD" },
+      { key: "lock", label: "Same" },
+      { key: "unlock", label: "Same" },
+      { key: "finder", label: "Find my car" },
+      { key: "quit", label: "Quit" },
+    ] as ReturnType<typeof buildMenuItems>;
+    expect(prioritiseMenu(items, 3).map((i) => i.key)).toEqual([
+      "hud",
+      "finder",
+      "quit",
+    ]);
+  });
+});
+
+describe("sameMenu against a truncated on-screen menu", () => {
+  // THE REGRESSION. renderCurrent asked "has the menu changed?" by comparing a
+  // freshly built (untruncated) list against the truncated one on screen. Those
+  // can never match once the host caps the list, so every status poll rebuilt
+  // the whole menu page — including the poll openMenu fires the instant the
+  // menu appears. That rebuild recreates the list container under the user's
+  // finger, and the press aimed at "Find my car" was eaten.
+  const onScreen = (s: VehicleStatus | null, cap: number) =>
+    prioritiseMenu(buildMenuItems(s, DEFAULT_SETTINGS), cap);
+
+  it("never matches when the raw build is compared to a capped menu", () => {
+    for (const s of [EV, HEV, null]) {
+      const raw = buildMenuItems(s, DEFAULT_SETTINGS);
+      expect(sameMenu(raw, onScreen(s, 3))).toBe(false);
+    }
+  });
+
+  it("matches when both sides go through the same cap — no rebuild", () => {
+    for (const cap of [0, 2, 3, 4, 5, 6]) {
+      for (const s of [EV, HEV, null]) {
+        const fresh = onScreen(s, cap);
+        expect(sameMenu(fresh, onScreen(s, cap))).toBe(true);
+      }
+    }
+  });
+
+  it("still reports a genuine change through the cap", () => {
+    // Locked → unlocked swaps which action the menu offers. With a 4-slot cap
+    // that item is on screen, so the rebuild is the right answer.
+    const locked = onScreen({ ...EV, locked: true }, 4);
+    const unlocked = onScreen({ ...EV, locked: false }, 4);
+    expect(locked.map((i) => i.key)).not.toEqual(unlocked.map((i) => i.key));
+    expect(sameMenu(locked, unlocked)).toBe(false);
   });
 });
 

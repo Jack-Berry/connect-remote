@@ -1,320 +1,982 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-brand-id="genesis">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <!-- Placeholder: replaced at boot from the build-time brand (src/brand.ts). -->
     <title>Genesis Remote</title>
     <style>
+      /* =====================================================================
+         "Instrument, daylight" — the phone companion surface.
+
+         Light off-white, hairline section rules instead of card chrome,
+         uppercase micro-labels, mono tabular numerals for anything numeric.
+         The surface is deliberately light and the radar ring deliberately
+         heavy black: this screen is read outdoors, in glare, while walking.
+
+         Every colour lives in the token block below. Nothing else in this
+         file hard-codes a colour.
+
+         One codebase, three brands: the layout is byte-identical and the only
+         per-brand value is --accent, switched from `data-brand-id` on <html>
+         (set by applyBrand at boot). NOTE: the attribute is `data-brand-id`,
+         not `data-brand`, because `data-brand` is already the copy-injection
+         hook applyBrand walks — see src/brand.ts.
+         ===================================================================== */
+      :root {
+        /* surfaces */
+        --bg:           #F7F6F3;  /* page */
+        --surface:      #FFFFFF;  /* inputs, radar face */
+        --ink:          #16171A;  /* primary text, Save, radar ring */
+        --ink-muted:    #63676D;  /* body/help text, mono readouts */
+        --ink-faint:    #7A7E85;  /* uppercase micro-labels */
+        --chevron:      #8A8E94;
+        --chevron-soft: #A6A9AF;
+
+        /* lines */
+        --rule-strong:  #D9D6CF;  /* input borders, Help section rule */
+        --rule:         #E4E1DA;  /* row dividers */
+        --rule-faint:   #EAE7E1;  /* radar crosshair */
+        --ring-inner:   #D5D1C9;  /* radar inner rings, off toggle track */
+        --stepper-edge: #C8C4BC;  /* +/- button border */
+
+        /* state */
+        --ok:           oklch(0.48 0.12 150);  /* "● Connected", "Copied" */
+        /* Not in the handoff's token list, but this app has real failures to
+           report (proxy down, wrong PIN, save refused) and they must not read
+           as success. Deliberately the only other colour on the screen. */
+        --err:          oklch(0.50 0.16 25);
+
+        /* brand accent — the ONLY value that changes per brand */
+        --accent:       oklch(0.45 0.12 70);   /* Genesis */
+
+        --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+        --pad: 22px;
+      }
+      [data-brand-id="kia"]     { --accent: oklch(0.50 0.16 25); }
+      [data-brand-id="hyundai"] { --accent: oklch(0.45 0.14 250); }
+
+      * { box-sizing: border-box; }
+
       html, body {
         margin: 0;
-        height: 100%;
-        /* ER brand dark-theme surface (#232323) + Neutral-200 text (#E5E5E5). */
-        background: #232323;
-        color: #E5E5E5;
-        font: 14px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+        min-height: 100%;
+        background: var(--bg);
+        color: var(--ink);
+        font: 16px/1.4 var(--sans);
         /* Kill WebView zoom + iOS auto-sizing + rubber-band scroll. */
         touch-action: manipulation;
         -webkit-text-size-adjust: 100%;
         overscroll-behavior: none;
+        -webkit-font-smoothing: antialiased;
       }
+      input, select, button, textarea { font: inherit; color: inherit; }
+
       #app {
         max-width: 420px;
         margin: 0 auto;
-        /* Bottom padding keeps the last form fields clear of the fixed
-           Save footer. */
-        padding: 24px 20px 110px;
-        box-sizing: border-box;
+        padding: calc(14px + env(safe-area-inset-top)) var(--pad) 10px;
       }
-      .footer {
-        position: fixed;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        background: #232323;
-        border-top: 1px solid #3a3a3a;
-        padding: 10px 20px calc(10px + env(safe-area-inset-bottom));
+
+      /* -- header ---------------------------------------------------------- */
+      .eyebrow {
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--accent);
       }
-      .footer .inner { max-width: 420px; margin: 0 auto; }
-      .footer button { margin-top: 0; }
-      .footer .status { margin: 6px 0 0; min-height: 1.2em; }
-      h1 { font-size: 18px; margin: 0 0 4px; }
-      p.hint { color: #9a9a9a; margin: 0 0 20px; }
-      label { display: block; margin: 14px 0 4px; color: #bdbdbd; }
-      input[type="text"], input[type="url"], input[type="password"], input[type="number"] {
-        width: 100%;
-        box-sizing: border-box;
-        padding: 10px;
-        border: 1px solid #444;
-        border-radius: 6px;
-        background: #2e2e2e;
-        color: #E5E5E5;
-        font-size: 16px; /* prevents iOS focus zoom */
+      h1 {
+        font-size: 28px;
+        font-weight: 620;
+        letter-spacing: -0.015em;
+        margin: 4px 0 0;
       }
+      p.lede {
+        font-size: 15px;
+        line-height: 1.55;
+        color: var(--ink-muted);
+        margin: 8px 0 0;
+      }
+
+      /* -- sections -------------------------------------------------------- */
+      /* The hairline rule under the heading is the ONLY grouping device: no
+         cards, no fills, no shadows. */
+      .sec { margin-top: 30px; }
+      .sec-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding-bottom: 10px;
+        border-bottom: 1.5px solid color-mix(in oklch, var(--accent) 45%, transparent);
+      }
+      /* Help is secondary — a neutral rule instead of the accent one. */
+      .sec.sec-quiet .sec-head { border-bottom-color: var(--rule-strong); }
+      h2 {
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--ink);
+        margin: 0;
+      }
+      .chip {
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--ok);
+        white-space: nowrap;
+      }
+      .chip.chip-off { color: var(--ink-muted); }
+      [hidden] { display: none !important; }
+
+      /* -- fields ---------------------------------------------------------- */
+      .fields {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        padding-top: 16px;
+      }
+      .field { display: flex; flex-direction: column; gap: 6px; }
+      .field-row { display: flex; gap: 12px; }
+      .field-row > .field { flex: 1; }
+      .field-pin { flex: none !important; width: 110px; }
+
+      label, .micro {
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
+      }
+
+      input[type="text"],
+      input[type="url"],
+      input[type="password"],
+      input[type="number"],
       select {
         width: 100%;
-        box-sizing: border-box;
-        padding: 10px;
-        border: 1px solid #444;
-        border-radius: 6px;
-        background: #2e2e2e;
-        color: #E5E5E5;
-        font-size: 16px;
-      }
-      .row { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
-      .cols { display: flex; gap: 12px; }
-      .cols > div { flex: 1; }
-      h2 {
-        font-size: 13px;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        color: #9a9a9a;
-        border-bottom: 1px solid #3a3a3a;
-        padding-bottom: 6px;
-        margin: 28px 0 4px;
-      }
-      button {
-        margin-top: 22px;
-        width: 100%;
-        padding: 12px;
-        border: 0;
-        border-radius: 6px;
-        background: #4d7c4d;
-        color: #fff;
-        font-size: 16px;
-      }
-      button.secondary {
-        margin-top: 16px;
-        background: #3a3a3a;
-        color: #e5e5e5;
-        border: 1px solid #555;
-      }
-      button:disabled { opacity: 0.5; }
-      .status { margin-top: 10px; min-height: 1.4em; color: #8fbc8f; }
-      .status.err { color: #e0a3a3; }
-      details {
-        border: 1px solid #3a3a3a;
+        height: 50px;
+        background: var(--surface);
+        border: 1px solid var(--rule-strong);
         border-radius: 8px;
-        padding: 10px 14px;
-        margin-bottom: 8px;
-        background: #282828;
+        color: var(--ink);
+        font-size: 17px;   /* ≥16px: stops iOS zooming on focus */
+        padding: 0 14px;
+        appearance: none;
+        -webkit-appearance: none;
       }
-      summary { cursor: pointer; color: #bdbdbd; font-weight: 600; }
-      details ol { padding-left: 20px; margin: 10px 0; }
-      details li { margin: 6px 0; }
-      details p { margin: 10px 0; color: #bdbdbd; }
-      details a { color: #8fbc8f; }
+      input::placeholder { color: var(--chevron-soft); }
+      input:focus-visible,
+      select:focus-visible,
+      input:focus,
+      select:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 18%, transparent);
+      }
+      /* Native select arrow off, ▾ drawn in the same place across brands. */
+      .select-wrap { position: relative; display: block; }
+      .select-wrap::after {
+        content: "▾";
+        position: absolute;
+        right: 14px;
+        top: 50%;
+        transform: translateY(-50%);
+        color: var(--chevron);
+        pointer-events: none;
+        font-size: 15px;
+      }
+      .select-wrap select { padding-right: 34px; font-variant-numeric: tabular-nums; }
 
-      /* Find-my-car full-screen overlay. Hidden by default; shown as a flex
-         column when the finder is open. */
+      /* -- test connection row --------------------------------------------- */
+      .test-row { display: flex; align-items: center; gap: 12px; }
+      .btn-outline {
+        flex: 1;
+        height: 50px;
+        border-radius: 8px;
+        border: 1.5px solid var(--ink);
+        background: transparent;
+        color: var(--ink);
+        font-size: 16px;
+        font-weight: 600;
+      }
+      .readout {
+        width: 120px;
+        flex: none;
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.35;
+        color: var(--ink-muted);
+        font-variant-numeric: tabular-nums;
+        white-space: pre-line;
+      }
+
+      /* -- climate target -------------------------------------------------- */
+      .stepper-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding-top: 20px;
+      }
+      .climate { display: flex; flex-direction: column; gap: 2px; }
+      .climate-value {
+        display: flex;
+        align-items: baseline;
+        font-family: var(--mono);
+        font-size: 44px;
+        font-weight: 600;
+        line-height: 1.1;
+        font-variant-numeric: tabular-nums;
+        color: var(--ink);
+      }
+      /* The big number IS the input — tap to type, steppers for everything
+         else. Width is set from the value length (mono) by main.ts. */
+      .climate-value input[type="number"] {
+        width: 2ch;
+        height: auto;
+        padding: 0;
+        border: 0;
+        background: none;
+        border-radius: 0;
+        font: inherit;
+        font-variant-numeric: tabular-nums;
+      }
+      .climate-value input[type="number"]:focus,
+      .climate-value input[type="number"]:focus-visible {
+        box-shadow: none;
+        border-bottom: 2px solid var(--accent);
+      }
+      .climate-value input::-webkit-outer-spin-button,
+      .climate-value input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+      .climate-value input[type="number"] { -moz-appearance: textfield; }
+      .steppers { display: flex; gap: 8px; }
+      .stepper {
+        width: 52px;
+        height: 52px;
+        border: 1.5px solid var(--stepper-edge);
+        border-radius: 8px;
+        background: var(--surface);
+        color: var(--ink);
+        font-size: 22px;
+        line-height: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      /* -- segmented unit switch ------------------------------------------- */
+      .segmented {
+        display: flex;
+        margin-top: 18px;
+        border: 1.5px solid var(--rule-strong);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--surface);
+      }
+      .seg {
+        flex: 1;
+        border: 0;
+        background: none;
+        padding: 11px 0;
+        font-size: 15px;
+        color: var(--ink-muted);
+      }
+      .seg[aria-pressed="true"] {
+        background: var(--accent);
+        color: #fff;
+        font-weight: 650;
+      }
+
+      /* -- toggle rows ----------------------------------------------------- */
+      .toggles { margin-top: 20px; display: flex; flex-direction: column; }
+      .toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 14px 0;
+        border-top: 1px solid var(--rule);
+      }
+      .toggle-row:last-child { border-bottom: 1px solid var(--rule); }
+      .toggle-row label {
+        font-size: 16px;
+        font-weight: 400;
+        letter-spacing: 0;
+        text-transform: none;
+        color: var(--ink);
+        flex: 1;
+      }
+      input[type="checkbox"].switch {
+        appearance: none;
+        -webkit-appearance: none;
+        flex: none;
+        width: 51px;
+        height: 31px;
+        margin: 0;
+        border: 0;
+        border-radius: 16px;
+        background: var(--ring-inner);
+        position: relative;
+        transition: background 160ms ease-out;
+      }
+      input[type="checkbox"].switch::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 27px;
+        height: 27px;
+        border-radius: 50%;
+        background: #fff;
+        transition: transform 160ms ease-out;
+      }
+      input[type="checkbox"].switch:checked { background: var(--accent); }
+      input[type="checkbox"].switch:checked::after { transform: translateX(20px); }
+      input[type="checkbox"].switch:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 18%, transparent);
+      }
+
+      .limits { display: flex; gap: 12px; padding-top: 18px; }
+      .limits > .field { flex: 1; }
+      /* The contextual "send limits" action. Outline, like Test connection:
+         it is a deliberate car command, but a secondary one — it must not
+         compete with Save (--ink) or Find My Car (accent). */
+      .btn-send {
+        width: 100%;
+        height: 50px;
+        margin-top: 14px;
+        border-radius: 8px;
+        border: 1.5px solid var(--ink);
+        background: transparent;
+        color: var(--ink);
+        font-size: 16px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+      #limits-status { margin-top: 10px; }
+
+      /* -- buttons --------------------------------------------------------- */
+      .btn-accent {
+        width: 100%;
+        height: 58px;
+        border: 0;
+        border-radius: 8px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 17px;
+        font-weight: 650;
+        letter-spacing: 0.02em;
+        margin-top: 16px;
+      }
+      /* Save is --ink in every brand: the primary action reads the same
+         everywhere, deliberately not the accent. */
+      .btn-ink {
+        width: 100%;
+        height: 52px;
+        border: 0;
+        border-radius: 9px;
+        background: var(--ink);
+        color: #fff;
+        font-size: 17px;
+        font-weight: 650;
+        letter-spacing: 0.02em;
+      }
+      button:active { filter: brightness(0.94); }
+      button:disabled { opacity: 0.6; pointer-events: none; }
+
+      p.hint {
+        font-size: 13px;
+        line-height: 1.5;
+        color: var(--ink-faint);
+        margin: 10px 0 0;
+      }
+      p.status {
+        font-size: 13px;
+        line-height: 1.45;
+        color: var(--ink-muted);
+        margin: 0;
+        min-height: 0;
+      }
+      p.status:empty { display: none; }
+      p.status.err { color: var(--err); }
+
+      /* -- help rows ------------------------------------------------------- */
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        width: 100%;
+        padding: 15px 0;
+        border: 0;
+        border-bottom: 1px solid var(--rule);
+        background: none;
+        color: var(--ink);
+        font-size: 16px;
+        font-weight: 400;
+        text-align: left;
+        text-decoration: none;
+        border-radius: 0;
+      }
+      /* The diagnostics row is the last one in Help; its status line sits
+         after it, so :last-child would not catch it. */
+      .row:last-child, #diag-btn.row { border-bottom: 0; }
+      .row:active { background: rgba(0, 0, 0, 0.04); }
+      .chev { color: var(--chevron-soft); flex: none; }
+      .row .flag { color: var(--ok); font-size: 12px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+
+      /* The setup guide is a Help row that opens in place. */
+      details#setup-guide { border-bottom: 1px solid var(--rule); }
+      details#setup-guide > summary {
+        list-style: none;
+        cursor: pointer;
+        border-bottom: 0;
+      }
+      details#setup-guide > summary::-webkit-details-marker { display: none; }
+      details#setup-guide[open] > summary .chev { transform: rotate(90deg); }
+      details#setup-guide .guide {
+        font-size: 14px;
+        line-height: 1.55;
+        color: var(--ink-muted);
+        padding: 0 0 16px;
+      }
+      details#setup-guide ol { padding-left: 20px; margin: 10px 0; }
+      details#setup-guide li { margin: 6px 0; }
+      details#setup-guide a { color: var(--accent); }
+
+      /* -- sticky save footer ---------------------------------------------- */
+      .footer {
+        position: sticky;
+        bottom: 0;
+        background: color-mix(in srgb, var(--bg) 93%, transparent);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border-top: 1px solid var(--rule-strong);
+        padding: 12px var(--pad) calc(12px + env(safe-area-inset-bottom));
+        margin-top: 24px;
+      }
+      .footer .inner { max-width: 420px; margin: 0 auto; }
+      .footer .status { margin-bottom: 8px; text-align: center; }
+
+      /* -- Kia-US enrolment ------------------------------------------------- */
+      .enroll-progress {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        padding-top: 16px;
+      }
+      .enroll-progress .bar { flex: 1; height: 3px; background: var(--accent); }
+      .enroll-progress .bar.pending { background: var(--rule-strong); }
+      .enroll-progress .step {
+        font-family: var(--mono);
+        font-size: 12px;
+        letter-spacing: 0.1em;
+        color: var(--ink-muted);
+      }
+      .enroll-explainer {
+        font-size: 14px;
+        line-height: 1.55;
+        color: var(--ink-muted);
+        margin: 16px 0 0;
+      }
+      #enroll-code {
+        height: 60px;
+        text-align: center;
+        font-family: var(--mono);
+        font-size: 28px;
+        letter-spacing: 0.3em;
+        /* letter-spacing adds a trailing gap after the last digit; the indent
+           puts it back on the left so the code reads centred. */
+        text-indent: 0.3em;
+        border: 1.5px solid var(--accent);
+      }
+      .enroll-link {
+        display: block;
+        text-align: center;
+        font-size: 15px;
+        color: var(--accent);
+        text-decoration: none;
+        padding: 6px 0;
+      }
+      #enroll-verify-btn, #enroll-start-btn {
+        width: 100%;
+        height: 52px;
+        border: 0;
+        border-radius: 9px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 17px;
+        font-weight: 650;
+      }
+
+      /* =====================================================================
+         Find my car — full-screen overlay.
+
+         Direction first: the distance and the heading phrase are read while
+         walking; the radar underneath is confirmation, not the answer.
+         ===================================================================== */
       #finder-screen {
         display: none;
         position: fixed;
         inset: 0;
-        background: #232323;
+        background: var(--bg);
         flex-direction: column;
         z-index: 10;
-        padding: calc(8px + env(safe-area-inset-top)) 20px
-          calc(16px + env(safe-area-inset-bottom));
-        box-sizing: border-box;
+        padding: env(safe-area-inset-top) 20px calc(20px + env(safe-area-inset-bottom));
+        overflow: hidden;
       }
-      .finder-top {
+      .finder-nav {
         display: flex;
         align-items: center;
-        gap: 12px;
-        min-height: 40px;
+        justify-content: space-between;
+        padding: 10px 0;
       }
       .finder-back {
-        margin: 0;
-        width: auto;
-        padding: 8px 12px;
-        background: transparent;
-        color: #8fbc8f;
-        font-size: 16px;
+        border: 0;
+        background: none;
+        padding: 0;
+        font-size: 17px;
+        font-weight: 560;
+        color: var(--accent);
       }
       .finder-title {
-        font-size: 15px;
-        font-weight: 600;
-        color: #bdbdbd;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
       }
+      .finder-nav-spacer { width: 46px; }
+
       .finder-body {
         flex: 1;
         display: flex;
         flex-direction: column;
         align-items: center;
         justify-content: center;
-        gap: 8px;
+        gap: 26px;
+        min-height: 0;
+      }
+      .finder-readout {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 6px;
         text-align: center;
       }
-      .finder-radar {
-        display: block;
-        touch-action: none;
+      .finder-distance {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+        font-family: var(--mono);
+        font-variant-numeric: tabular-nums;  /* the number must not jitter */
       }
-      .finder-headline {
-        margin: 12px 0 0;
-        font-size: 30px;
+      .finder-distance .value {
+        font-size: 92px;
         font-weight: 600;
-        color: #E5E5E5;
+        line-height: 1;
+        letter-spacing: -0.045em;
+        color: var(--ink);
+      }
+      /* "You're here" is words, not a measurement — drop it to a readable size. */
+      .finder-distance.is-text .value { font-size: 44px; letter-spacing: -0.02em; }
+      .finder-distance.is-dim .value { color: var(--ink-faint); }
+      .finder-distance .unit { font-size: 32px; font-weight: 400; color: var(--ink-muted); }
+      .finder-phrase {
+        font-size: 19px;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+        color: var(--accent);
         min-height: 1.2em;
       }
-      .finder-detail {
-        margin: 0;
-        font-size: 14px;
-        color: #9a9a9a;
-        min-height: 1.4em;
+
+      /* -- radar ------------------------------------------------------------ */
+      .radar { position: relative; width: 340px; height: 340px; flex: none; }
+      .radar-face {
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        background: var(--surface);
+        border: 3px solid var(--ink);   /* heavy: it has to survive glare */
       }
+      .radar-ring {
+        position: absolute;
+        border-radius: 50%;
+        border: 1.5px solid var(--ring-inner);
+      }
+      .radar-cross-h {
+        position: absolute;
+        top: 50%;
+        left: 14px;
+        right: 14px;
+        height: 1px;
+        background: var(--rule-faint);
+      }
+      .radar-cross-v {
+        position: absolute;
+        left: 50%;
+        top: 14px;
+        bottom: 14px;
+        width: 1px;
+        background: var(--rule-faint);
+      }
+      /* Full-size wrappers that rotate: everything inside lands on a bearing
+         without any per-element trigonometry. */
+      .radar-rot { position: absolute; inset: 0; transition: transform 300ms ease-out; }
+      .radar-arrow {
+        position: absolute;
+        top: -28px;
+        left: 50%;
+        margin-left: -23px;
+        width: 46px;
+        height: 38px;
+        background: var(--accent);
+        clip-path: polygon(50% 0, 100% 100%, 0 100%);
+      }
+      /* No compass fix ⇒ no "walk this way" claim; the arrow goes grey and
+         only marks where the car lies on a north-up map. */
+      .radar-arrow.is-muted { background: var(--ink-muted); }
+      .radar-car-wrap {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 30px;
+        height: 30px;
+        margin: -15px 0 0 -15px;
+        transition: transform 300ms ease-out;
+      }
+      .radar-car {
+        width: 100%;
+        height: 100%;
+        border-radius: 50%;
+        background: var(--accent);
+        /* White border + accent outer ring: reads on the white face AND on the
+           off-white surround when it drifts to the rim. */
+        border: 3px solid #fff;
+        box-shadow: 0 0 0 2.5px var(--accent);
+      }
+      .radar-user {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        margin: -8px 0 0 -8px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--ink);
+      }
+      .radar-n {
+        position: absolute;
+        top: -6px;
+        left: 50%;
+        /* main.ts re-applies this with the counter-rotation that keeps N true
+           while the map turns; this is the value before the first frame. */
+        transform: translateX(-50%);
+        background: var(--bg);   /* breaks the ring cleanly */
+        padding: 0 8px;
+        font-size: 13px;
+        font-weight: 800;
+        letter-spacing: 0.1em;
+        color: var(--ink);
+      }
+      .radar-scale {
+        position: absolute;
+        bottom: 12px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+        color: var(--chevron);
+        white-space: nowrap;
+      }
+
+      .finder-meta {
+        display: flex;
+        gap: 22px;
+        font-family: var(--mono);
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--ink-muted);
+      }
+      .finder-meta span:empty { display: none; }
+
       .finder-message {
         display: none;
-        max-width: 300px;
+        max-width: 320px;
         font-size: 16px;
-        line-height: 1.5;
-        color: #cfcfcf;
+        line-height: 1.55;
+        color: var(--ink-muted);
         white-space: pre-line;
+        text-align: center;
       }
-      .finder-done {
-        margin-top: 24px;
-        width: auto;
-        min-width: 160px;
-        padding: 12px 24px;
-        display: none;
+      .finder-foot { padding-top: 20px; }
+      .finder-foot .btn-ink { height: 54px; }
+      .finder-note {
+        font-size: 13px;
+        line-height: 1.5;
+        color: var(--ink-faint);
+        text-align: center;
+        margin: 10px 0 0;
+        min-height: 0;
+      }
+      .finder-note:empty { display: none; }
+
+      /* Short phones: the 92px number and the 340px radar do not both fit. */
+      @media (max-height: 720px) {
+        .finder-distance .value { font-size: 68px; }
+        .finder-body { gap: 16px; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .radar-rot, .radar-car-wrap, input[type="checkbox"].switch,
+        input[type="checkbox"].switch::after { transition: none; }
       }
     </style>
   </head>
   <body>
     <div id="app">
-      <h1><span data-brand="appName">Genesis Remote</span> settings</h1>
-      <p class="hint">Status and controls are on the glasses. Sign in to your car account and set preferences here; they are saved to the Even app on this phone.</p>
+      <div class="eyebrow" data-brand="name">Genesis</div>
+      <h1>Remote settings</h1>
+      <p class="lede">Status and controls live on the glasses.</p>
 
-      <details id="setup-guide">
-        <summary>Setup guide</summary>
-        <p>Sign in with the same <span data-brand="serviceName">Genesis Connected Services</span> account you use in the official <span data-brand="name">Genesis</span> app. Your details are stored only on this phone (in the Even app) and sent, encrypted, straight to the app's relay when you use a control; the relay keeps nothing.</p>
-        <ol>
-          <li>Enter your <span data-brand="serviceName">Genesis Connected Services</span> username and password below.</li>
-          <li>Enter your PIN, the code the official app asks for before lock/unlock. Most accounts have one.</li>
-          <li>Pick the region your account is registered in.</li>
-          <li>Hit <strong>Test connection</strong>. The first sign-in can take up to a minute.</li>
-          <li>Save. Status and controls live on the glasses.</li>
-        </ol>
-        <p><a href="https://github.com/jack-berry/connect-remote#readme" target="_blank" rel="noopener">Full documentation on GitHub &rarr;</a></p>
-        <p><a href="https://jack-berry.github.io/connect-remote/privacy/" target="_blank" rel="noopener">Privacy policy &rarr;</a></p>
-      </details>
-
-      <h2><span data-brand="serviceName">Genesis Connected Services</span> account</h2>
-
-      <label for="acct-username">Username / email</label>
-      <input id="acct-username" type="text" placeholder="you@example.com" autocapitalize="off" autocorrect="off" autocomplete="username" />
-
-      <label for="acct-password">Password</label>
-      <input id="acct-password" type="password" placeholder="password" autocapitalize="off" autocorrect="off" autocomplete="current-password" />
-
-      <label for="acct-pin">PIN</label>
-      <input id="acct-pin" type="password" inputmode="numeric" placeholder="the PIN the official app asks for" autocapitalize="off" autocorrect="off" />
-
-      <label for="acct-region">Account region</label>
-      <select id="acct-region"></select>
-
-      <button id="test-btn" type="button" class="secondary">Test connection</button>
-      <p id="test-status" class="status"></p>
-
-      <!-- Kia-US only: device enrollment via OTP. Hidden for all other
-           brand/region combos. Shown dynamically by main.ts. -->
-      <div id="enroll-section" style="display:none">
-        <h2>Device enrollment</h2>
-        <p class="hint">Kia Connect (US) requires a one-time verification code to trust this app. You'll receive the code by email or text. This only needs to be done once, and codes expire after a few minutes.</p>
-        <div id="enroll-start-area">
-          <label for="enroll-notify-type">Send code via</label>
-          <select id="enroll-notify-type">
-            <option value="EMAIL">Email</option>
-            <option value="SMS">SMS</option>
-          </select>
-          <button id="enroll-start-btn" type="button" class="secondary">Send verification code</button>
+      <!-- ACCOUNT ------------------------------------------------------- -->
+      <section class="sec">
+        <div class="sec-head">
+          <h2>Account</h2>
+          <!-- Set from the last Test connection: connected / not connected,
+               nothing at all until it has been tried. -->
+          <span id="conn-chip" class="chip" hidden></span>
         </div>
-        <div id="enroll-verify-area" style="display:none">
-          <label for="enroll-code">Verification code</label>
-          <input id="enroll-code" type="text" inputmode="numeric" placeholder="Enter the code from your email/SMS" autocapitalize="off" autocorrect="off" />
-          <button id="enroll-verify-btn" type="button" class="secondary">Verify code</button>
-          <p style="margin:8px 0 0;"><a href="#" id="enroll-resend" style="color:#8fbc8f;font-size:14px;">Didn't get a code? Send again</a></p>
+        <div class="fields">
+          <div class="field">
+            <label for="acct-username">Email</label>
+            <input id="acct-username" type="text" placeholder="you@example.com" autocapitalize="off" autocorrect="off" autocomplete="username" />
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="acct-password">Password</label>
+              <input id="acct-password" type="password" placeholder="password" autocapitalize="off" autocorrect="off" autocomplete="current-password" />
+            </div>
+            <div class="field field-pin">
+              <label for="acct-pin">PIN</label>
+              <input id="acct-pin" type="password" inputmode="numeric" placeholder="••••" autocapitalize="off" autocorrect="off" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="acct-region">Region</label>
+            <span class="select-wrap"><select id="acct-region"></select></span>
+          </div>
+
+          <div class="test-row">
+            <button id="test-btn" type="button" class="btn-outline">Test connection</button>
+            <!-- Last known battery and the time of the last successful test. -->
+            <div id="test-readout" class="readout"></div>
+          </div>
+          <p id="test-status" class="status"></p>
+        </div>
+      </section>
+
+      <!-- DEVICE ENROLLMENT — Kia + region USA only. Hidden for every other
+           brand/region combo; shown dynamically by main.ts. -->
+      <section class="sec" id="enroll-section" style="display:none">
+        <div class="sec-head">
+          <h2><span data-brand="name">Kia</span> US · Enrolment</h2>
+        </div>
+        <div class="enroll-progress">
+          <div class="bar"></div>
+          <div class="bar" id="enroll-bar-2"></div>
+          <div class="step" id="enroll-step">1 / 2</div>
+        </div>
+        <p class="enroll-explainer" id="enroll-explainer"><span data-brand="serviceName">Kia Connect</span> (US) needs a one-time code to trust this app. It expires after a few minutes.</p>
+
+        <div id="enroll-start-area" class="fields">
+          <div class="field">
+            <label for="enroll-notify-type">Send code via</label>
+            <span class="select-wrap"><select id="enroll-notify-type">
+              <option value="EMAIL">Email</option>
+              <option value="SMS">SMS</option>
+            </select></span>
+          </div>
+          <button id="enroll-start-btn" type="button">Send verification code</button>
+        </div>
+
+        <div id="enroll-verify-area" class="fields" style="display:none">
+          <div class="field">
+            <label for="enroll-code">Verification code</label>
+            <input id="enroll-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="000000" autocapitalize="off" autocorrect="off" />
+          </div>
+          <button id="enroll-verify-btn" type="button">Verify code</button>
+          <a href="#" id="enroll-resend" class="enroll-link">Send the code again</a>
         </div>
         <p id="enroll-status" class="status"></p>
-      </div>
+      </section>
 
-      <h2>Car</h2>
+      <!-- CAR ----------------------------------------------------------- -->
+      <section class="sec">
+        <div class="sec-head"><h2>Car</h2></div>
 
-      <label for="temp-unit">Temperature unit</label>
-      <select id="temp-unit">
-        <option value="C">Celsius (&deg;C)</option>
-        <option value="F">Fahrenheit (&deg;F)</option>
-      </select>
-
-      <!-- Label text and the min/max/step are rewritten by main.ts whenever
-           the unit changes; the value is always stored as Celsius. -->
-      <label for="climate-temp" id="climate-temp-label">Climate target temperature (&deg;C)</label>
-      <input id="climate-temp" type="number" min="14" max="30" step="0.5" />
-
-      <div class="row">
-        <input id="climate-defrost" type="checkbox" />
-        <label for="climate-defrost" style="margin:0">Defrost on with climate</label>
-      </div>
-
-      <div class="row">
-        <input id="climate-heating" type="checkbox" />
-        <label for="climate-heating" style="margin:0">Steering wheel + rear window heat with climate</label>
-      </div>
-
-      <!-- Hidden by main.ts when the car can't plug in (HEV/ICE, or
-           UNKNOWN with fuel-only evidence) — charge limits mean nothing
-           there. Rule: chargeLimitsRelevant in settings.ts. -->
-      <div id="charge-limits-section">
-        <div class="cols" style="margin-top:14px">
-          <div>
-            <label for="charge-limit-ac" style="margin-top:0">AC charge limit</label>
-            <select id="charge-limit-ac"></select>
+        <div class="stepper-row">
+          <div class="climate">
+            <!-- Text rewritten by main.ts; the unit lives in the value. -->
+            <label for="climate-temp" id="climate-temp-label" class="micro">Climate target</label>
+            <div class="climate-value">
+              <input id="climate-temp" type="number" min="14" max="30" step="0.5" />
+              <span id="climate-temp-unit">&deg;C</span>
+            </div>
           </div>
-          <div>
-            <label for="charge-limit-dc" style="margin-top:0">DC charge limit</label>
-            <select id="charge-limit-dc"></select>
+          <div class="steppers">
+            <button id="temp-down" type="button" class="stepper" aria-label="Lower the climate target">&minus;</button>
+            <button id="temp-up" type="button" class="stepper" aria-label="Raise the climate target">+</button>
           </div>
         </div>
 
-        <button id="limits-btn" type="button" class="secondary">Send limits to car</button>
-        <p id="limits-status" class="status"></p>
-      </div>
+        <!-- The segmented switch is the control the user sees; the select
+             below it stays the single source of truth every existing handler
+             reads (and keeps a real form field for the dirty tracking). -->
+        <div class="segmented" role="group" aria-label="Temperature unit">
+          <button type="button" class="seg" id="unit-c" data-unit="C" aria-pressed="true">Celsius</button>
+          <button type="button" class="seg" id="unit-f" data-unit="F" aria-pressed="false">Fahrenheit</button>
+        </div>
+        <select id="temp-unit" hidden aria-hidden="true" tabindex="-1">
+          <option value="C">Celsius (&deg;C)</option>
+          <option value="F">Fahrenheit (&deg;F)</option>
+        </select>
 
-      <h2>Diagnostics</h2>
-      <p class="hint">If something isn't working, copy a diagnostic report and send it to the developer. No passwords or tokens are included.</p>
-      <button id="diag-btn" type="button" class="secondary">Copy diagnostic report</button>
-      <p id="diag-status" class="status"></p>
+        <div class="toggles">
+          <div class="toggle-row">
+            <label for="climate-defrost">Defrost with climate</label>
+            <input id="climate-defrost" type="checkbox" class="switch" />
+          </div>
+          <div class="toggle-row">
+            <label for="climate-heating">Wheel + rear window heat</label>
+            <input id="climate-heating" type="checkbox" class="switch" />
+          </div>
+        </div>
 
-      <!-- Deliberately last: glasses-initiated finding is the primary path;
-           this is a bonus companion view that also works without the glasses. -->
-      <h2>Find my car</h2>
-      <p class="hint">Open a radar on this phone that points you back to your car. Works with the glasses on or off. Uses your phone's location on-device only.</p>
-      <button id="finder-open" type="button" class="secondary">Find my car</button>
+        <!-- Hidden by main.ts when the car can't plug in (HEV/ICE, or
+             UNKNOWN with fuel-only evidence) — charge limits mean nothing
+             there. Rule: chargeLimitsRelevant in settings.ts.
+
+             The send button is contextual: it appears only while the values on
+             screen differ from what the car is known to hold. Sending is always
+             a deliberate tap — never a side effect of Save or of touching a
+             dropdown — and it stays put after a failure as the retry. -->
+        <div id="charge-limits-section">
+          <div class="limits">
+            <div class="field">
+              <label for="charge-limit-ac">AC limit</label>
+              <span class="select-wrap"><select id="charge-limit-ac"></select></span>
+            </div>
+            <div class="field">
+              <label for="charge-limit-dc">DC limit</label>
+              <span class="select-wrap"><select id="charge-limit-dc"></select></span>
+            </div>
+          </div>
+          <button id="limits-btn" type="button" class="btn-send" hidden></button>
+          <p id="limits-status" class="status"></p>
+        </div>
+      </section>
+
+      <!-- FIND MY CAR --------------------------------------------------- -->
+      <section class="sec">
+        <div class="sec-head"><h2>Find my car</h2></div>
+        <button id="finder-open" type="button" class="btn-accent">Find My Car</button>
+        <p class="hint">Works with the glasses on or off. Location stays on this phone.</p>
+      </section>
+
+      <!-- HELP ---------------------------------------------------------- -->
+      <section class="sec sec-quiet">
+        <div class="sec-head"><h2>Help</h2></div>
+
+        <details id="setup-guide">
+          <summary class="row">Setup guide<span class="chev">&rsaquo;</span></summary>
+          <div class="guide">
+            <p>Sign in with the same <span data-brand="serviceName">Genesis Connected Services</span> account you use in the official <span data-brand="name">Genesis</span> app. Your details are stored only on this phone (in the Even app) and sent, encrypted, straight to the app's relay when you use a control; the relay keeps nothing.</p>
+            <ol>
+              <li>Enter your <span data-brand="serviceName">Genesis Connected Services</span> username and password above.</li>
+              <li>Enter your PIN, the code the official app asks for before lock/unlock. Most accounts have one.</li>
+              <li>Pick the region your account is registered in.</li>
+              <li>Hit <strong>Test connection</strong>. The first sign-in can take up to a minute.</li>
+              <li>Save. Status and controls live on the glasses.</li>
+            </ol>
+            <p><a href="https://jack-berry.github.io/connect-remote/privacy/" target="_blank" rel="noopener">Privacy policy &rarr;</a></p>
+          </div>
+        </details>
+
+        <a class="row" href="https://github.com/jack-berry/connect-remote#readme" target="_blank" rel="noopener">Documentation<span class="chev">&rsaquo;</span></a>
+
+        <button id="diag-btn" type="button" class="row">
+          <span>Copy diagnostic report</span>
+          <span><span id="diag-copied" class="flag"></span> <span class="chev">&rsaquo;</span></span>
+        </button>
+        <p id="diag-status" class="status"></p>
+      </section>
     </div>
+
     <!-- Save stays visible regardless of scroll position — on a long form a
-         bottom-of-form Save ends up off-screen. -->
+         bottom-of-form Save ends up off-screen. Charge limits ride along with
+         it; there is no separate "send limits" action any more. -->
     <div class="footer">
       <div class="inner">
-        <button id="save-btn" type="button">Save</button>
         <p id="save-status" class="status"></p>
+        <button id="save-btn" type="button" class="btn-ink">Save</button>
       </div>
     </div>
 
-    <!-- Full-screen finder overlay. Hidden until "Find my car" is tapped; the
-         radar canvas, headline and staleness live here, with a message block
-         that replaces the radar for the walkthrough / permission / no-signal
-         states. Driven by the shared finder engine (src/main.ts). -->
+    <!-- Full-screen finder overlay. Hidden until "Find My Car" is tapped.
+         Distance and heading phrase lead; the radar under them confirms.
+         Driven by the shared finder engine (src/main.ts). -->
     <div id="finder-screen">
-      <div class="finder-top">
-        <button id="finder-back" type="button" class="finder-back">‹ Back</button>
-        <span class="finder-title">Find my car</span>
+      <div class="finder-nav">
+        <button id="finder-back" type="button" class="finder-back">&lsaquo; Back</button>
+        <div class="finder-title">Find my car</div>
+        <div class="finder-nav-spacer"></div>
       </div>
+
       <div class="finder-body">
-        <canvas id="finder-radar" class="finder-radar" width="280" height="280"></canvas>
-        <p id="finder-headline" class="finder-headline"></p>
-        <p id="finder-detail" class="finder-detail"></p>
+        <div id="finder-readout" class="finder-readout">
+          <div id="finder-headline" class="finder-distance">
+            <span id="finder-distance-value" class="value">&mdash;</span>
+            <span id="finder-distance-unit" class="unit">m</span>
+          </div>
+          <div id="finder-phrase" class="finder-phrase"></div>
+        </div>
+
+        <div id="finder-radar" class="radar">
+          <div class="radar-face"></div>
+          <div id="radar-rings"></div>
+          <div class="radar-cross-h"></div>
+          <div class="radar-cross-v"></div>
+          <div id="radar-arrow-rot" class="radar-rot"><div id="radar-arrow" class="radar-arrow"></div></div>
+          <div id="radar-car-wrap" class="radar-car-wrap"><div class="radar-car"></div></div>
+          <div class="radar-user"></div>
+          <div id="radar-north-rot" class="radar-rot"><div id="radar-north" class="radar-n">N</div></div>
+          <div id="radar-scale" class="radar-scale"></div>
+        </div>
+
+        <div id="finder-detail" class="finder-meta">
+          <span id="finder-brg"></span><span id="finder-cardinal"></span><span id="finder-age"></span>
+        </div>
+
         <div id="finder-message" class="finder-message"></div>
-        <button id="finder-done" type="button" class="finder-done">Done</button>
+      </div>
+
+      <div class="finder-foot">
+        <button id="finder-done" type="button" class="btn-ink">Done</button>
+        <p id="finder-note" class="finder-note"></p>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

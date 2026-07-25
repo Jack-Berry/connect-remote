@@ -195,6 +195,70 @@ export function buildMenuItems(
   }));
 }
 
+/**
+ * Which items survive when the host will only take a short list, best first.
+ * "Find my car" ranks second — immediately after the way back — because a
+ * truncated menu that can't reach the finder is a menu that can't do the one
+ * thing this round exists for. (1.4.4 shipped a blind `slice(0, 3)`, which cut
+ * exactly that item and stranded the owner.)
+ *
+ * Quit ranks third so it survives even a three-slot menu — a list with no
+ * visible way out reads as broken — but `prioritiseMenu` pins it to the BOTTOM
+ * of the rendered list: an exit item in the middle of the menu is a mis-tap
+ * waiting to happen.
+ */
+export const MENU_PRIORITY: MenuKey[] = [
+  "hud",
+  "finder",
+  "quit",
+  "unlock",
+  "lock",
+  "climateOn",
+  "climateOff",
+  "refresh",
+  "chargeStart",
+  "chargeStop",
+];
+
+/**
+ * Keep the `max` highest-priority items (`max` of 0 = no cap), then restore a
+ * sensible reading order: the order `buildMenuItems` produced, with Quit last.
+ *
+ * Lives here rather than in main.ts because main.ts is unreachable from a test
+ * — the same trap that hid the 1.4.0 router regression. This function decides
+ * which item a tap index means, so it is the last place in the app that should
+ * be untestable.
+ */
+export function prioritiseMenu(items: MenuItem[], max: number): MenuItem[] {
+  const tidy = (list: MenuItem[]) => [
+    ...list.filter((i) => i.key !== "quit"),
+    ...list.filter((i) => i.key === "quit"),
+  ];
+  if (!max || items.length <= max) return tidy(items);
+  const rank = (i: MenuItem) => {
+    const r = MENU_PRIORITY.indexOf(i.key);
+    return r === -1 ? MENU_PRIORITY.length : r;
+  };
+  const kept = new Set(
+    [...items].sort((a, b) => rank(a) - rank(b)).slice(0, max),
+  );
+  return tidy(items.filter((i) => kept.has(i)));
+}
+
+/**
+ * Do these two lists describe the same on-screen menu?
+ *
+ * CALLERS MUST COMPARE LIKE WITH LIKE. This is the diff that decides whether a
+ * status poll may leave the menu alone or must rebuild the whole page, and it
+ * was fed a freshly-built (untruncated) list on one side and the truncated list
+ * actually on screen on the other. Those can never be equal once the host caps
+ * the item count, so every poll rebuilt the menu — including the one `openMenu`
+ * fires the instant the menu appears. That rebuild recreates the list container
+ * under the user's finger: the host's selection resets to item 0, so a tap
+ * aimed at "Find my car" lands on "Return to HUD" and reads as the press being
+ * ignored. Run the fresh list through `prioritiseMenu` with the accepted
+ * variant's cap before calling this.
+ */
 export function sameMenu(a: MenuItem[], b: MenuItem[]): boolean {
   return (
     a.length === b.length && a.every((item, i) => item.label === b[i].label)

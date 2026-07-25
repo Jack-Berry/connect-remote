@@ -117,6 +117,26 @@ export function cardinal(deg: number): string {
   return CARDINALS[octant(deg)];
 }
 
+/**
+ * The phone finder's heading phrase — the line that is read while walking,
+ * above the radar. Takes the RELATIVE angle to the car (bearing to the car
+ * minus the direction the user is travelling), signed the way `angleDelta`
+ * signs it: positive to the right, negative to the left.
+ *
+ * Coarser than the 8-way arrow on purpose. The arrow is a picture and can
+ * afford 45° steps; this is a sentence, and "ahead and to your right" has to
+ * stay true for long enough to be worth reading.
+ */
+export function headingPhrase(relativeDeg: number): string {
+  const a = Math.abs(angleDelta(relativeDeg, 0));
+  const side = angleDelta(relativeDeg, 0) >= 0 ? "right" : "left";
+  if (a <= 20) return "Straight ahead";
+  if (a <= 70) return `Ahead and to your ${side}`;
+  if (a <= 110) return `To your ${side}`;
+  if (a <= 160) return `Behind you to the ${side}`;
+  return "Behind you";
+}
+
 // ---------------------------------------------------------------------------
 // Travel course from successive fixes
 //

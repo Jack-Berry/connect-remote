@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no" />
+    <title>Sensor Probe</title>
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #232323;
+        color: #E5E5E5;
+        font: 14px/1.45 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+        touch-action: manipulation;
+        -webkit-text-size-adjust: 100%;
+        overscroll-behavior: none;
+      }
+      #app { max-width: 460px; margin: 0 auto; padding: 20px 16px 40px; box-sizing: border-box; }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      p.hint { color: #9a9a9a; margin: 0 0 18px; }
+      h2 {
+        font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+        color: #9a9a9a; border-bottom: 1px solid #3a3a3a;
+        padding-bottom: 6px; margin: 26px 0 10px;
+      }
+      button {
+        margin-top: 10px; width: 100%; padding: 13px; border: 0;
+        border-radius: 6px; background: #4d7c4d; color: #fff; font-size: 16px;
+      }
+      button.secondary { background: #3a3a3a; color: #e5e5e5; border: 1px solid #555; }
+      button:disabled { opacity: 0.5; }
+      /* Verdict chip — colour is a shortcut, the word is the answer. */
+      .verdict {
+        display: inline-block; padding: 2px 8px; border-radius: 4px;
+        font-size: 12px; font-weight: 700; letter-spacing: 0.04em;
+        background: #3a3a3a; color: #bdbdbd;
+      }
+      .verdict.ok { background: #2f4f2f; color: #b6dab6; }
+      .verdict.bad { background: #512f2f; color: #e0a3a3; }
+      .verdict.warn { background: #4f462f; color: #e0d3a3; }
+      .detail { color: #9a9a9a; margin: 8px 0 0; font-size: 13px; }
+      pre {
+        margin: 10px 0 0; padding: 10px; background: #1c1c1c;
+        border: 1px solid #333; border-radius: 6px;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #cfcfcf; white-space: pre-wrap; word-break: break-word;
+      }
+      .glyphs { font-size: 22px; letter-spacing: 6px; margin: 8px 0 0; }
+      .missing { color: #e0a3a3; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <h1>Sensor Probe</h1>
+      <p class="hint">
+        Throwaway Stage&nbsp;0 probe for the car finder. Answers: does GPS work,
+        does the compass work, does a permission prompt appear, and do the arrow
+        glyphs exist. Results mirror to the glasses. Nothing is stored or sent
+        anywhere.
+      </p>
+
+      <h2>Environment</h2>
+      <pre id="env">…</pre>
+
+      <h2>1 · Geolocation</h2>
+      <p class="hint" style="margin:0">
+        Needs a Hub build — geolocation never works from a QR sideload.
+      </p>
+      <button id="geo-btn" type="button">Start geolocation</button>
+      <button id="geo-stop" type="button" class="secondary" disabled>Stop</button>
+      <p class="detail"><span id="geo-verdict" class="verdict">UNTESTED</span></p>
+      <p class="detail" id="geo-detail">not started</p>
+      <pre id="geo-values">—</pre>
+
+      <h2>2 · Motion &amp; compass</h2>
+      <p class="hint" style="margin:0">
+        Must be triggered by this button: iOS only grants the sensors from a
+        user-gesture handler. Watch for a permission dialog and note whether one
+        actually appeared.
+      </p>
+      <button id="mot-btn" type="button">Request motion &amp; compass</button>
+      <button id="mot-stop" type="button" class="secondary" disabled>Stop</button>
+      <p class="detail">
+        Compass <span id="ori-verdict" class="verdict">UNTESTED</span>
+        &nbsp; Motion <span id="mot-verdict" class="verdict">UNTESTED</span>
+      </p>
+      <p class="detail" id="ori-detail">not started</p>
+      <p class="detail" id="mot-detail">not started</p>
+      <pre id="mot-values">—</pre>
+
+      <h2>3 · Arrow glyphs</h2>
+      <p class="hint" style="margin:0">
+        Measured with @evenrealities/pretext against the firmware font chain.
+        Zero advance width = glyph absent = silently skipped by the firmware.
+        The glasses line below shows the same set on real hardware.
+      </p>
+      <div class="glyphs" id="glyph-row">…</div>
+      <pre id="glyph-table">…</pre>
+
+      <h2>4 · Image container spike</h2>
+      <p class="hint" style="margin:0">
+        Can a 144&times;144 image container have its pixels replaced by
+        <code>updateImageRawData</code> alone &mdash; no rebuild, no flash? The
+        page is rebuilt <strong>once</strong> on entry; every frame after that
+        is a bare push. Judge by eye: does the swap flash, and is the circled
+        arrow readable at this size? The dim frame answers whether grey level 5
+        is legible enough to use for staleness.
+      </p>
+      <p class="hint" style="margin:0">
+        The pixel packing is <em>not</em> documented &mdash; if the arrow comes
+        out as noise or stripes, switch packing and push again. Whichever one
+        draws a recognisable arrow is the answer.
+      </p>
+      <button id="spike-enter" type="button">Enter image mode</button>
+      <button id="spike-next" type="button" class="secondary" disabled>Push next frame</button>
+      <button id="spike-auto" type="button" class="secondary" disabled>Auto-cycle 1s</button>
+      <button id="spike-pack" type="button" class="secondary" disabled>Switch packing</button>
+      <button id="spike-exit" type="button" class="secondary" disabled>Back to sensors</button>
+      <p class="detail" id="spike-stats">not started</p>
+      <pre id="spike-log">—</pre>
+
+      <h2>Glasses mirror</h2>
+      <p class="hint" style="margin:0">Exactly what is on the panel right now.</p>
+      <pre id="mirror">…</pre>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

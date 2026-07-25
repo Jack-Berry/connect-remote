@@ -18,6 +18,7 @@ import {
 } from "./api";
 import { renderArrowFrames } from "./arrow-frames";
 import { BRAND, applyBrand } from "./brand";
+import { createBridgeGate } from "./bridge-gate";
 import {
   CONNECTING_TEXT,
   CONNECT_CONTAINER,
@@ -52,6 +53,7 @@ import {
   formatHudBottom,
   formatHudRow,
   formatMenuInfo,
+  prioritiseMenu,
   sameMenu,
   spinnerFrame,
 } from "./display";
@@ -60,7 +62,13 @@ import {
   createGlyphIndicator,
   createImageIndicator,
 } from "./direction";
-import { formatDistance, formatParkedAge } from "./finder";
+import {
+  angleDelta,
+  cardinal,
+  formatDistance,
+  formatParkedAge,
+  headingPhrase,
+} from "./finder";
 import {
   KEEP_UNLOCKED_NOTE,
   type FinderFrame,
@@ -81,15 +89,17 @@ import {
   probePermission,
   saveGrantedOnce,
 } from "./location-permission";
-import { type RadarLayout, drawRadar, layoutFor } from "./radar";
+import { type RadarLayout, computeScene, layoutFor, niceRange } from "./radar";
 import {
   type AppSettings,
   type Bridge,
   type TempUnit,
   DEFAULT_SETTINGS,
   REGIONS,
+  carKnownLimits,
   chargeLimitsRelevant,
   isConfigured,
+  limitsNeedSending,
   loadSettings,
   resolveTempUnit,
   saveSettings,
@@ -102,7 +112,15 @@ import appJson from "../app.json";
 
 const APP_VERSION: string = appJson.version;
 
-const bridge = await waitForEvenAppBridge();
+// The host bridge, usable from this line on whether or not a host ever shows
+// up (bridge-gate.ts explains the encoding it fails with). This used to be
+// `await waitForEvenAppBridge()` — an unbounded top-level await on a promise
+// the SDK never rejects and never times out. On any host that didn't inject the
+// bridge, the whole module body below never executed: no listeners, no phone
+// UI, and a settings page that rendered perfectly while every button on it,
+// "Find my car" and "Copy diagnostic report" alike, did nothing.
+const gate = createBridgeGate(waitForEvenAppBridge);
+const bridge = gate.bridge;
 
 // Real settings load AFTER the first frame is on the glasses (boot section at
 // the bottom) — a slow bridge storage read must never delay the first paint.
@@ -310,41 +328,20 @@ const MENU_VARIANTS = [
   { name: "2-items+plain", radius: false, ascii: true, maxItems: 2 },
 ] as const;
 
-/**
- * Which items survive when the host will only take a short list, best first.
- * "Find my car" ranks second — immediately after the way back — because a
- * truncated menu that can't reach the finder is a menu that can't do the one
- * thing this round exists for. (1.4.4 shipped a blind `slice(0, 3)`, which cut
- * exactly that item and stranded the owner.)
- */
-const MENU_PRIORITY: string[] = [
-  "hud",
-  "finder",
-  // Quit is third so it survives even a three-slot menu. Double-tap reaches the
-  // same dialog, but a list with no visible way out reads as broken — the owner
-  // called its absence out on the 1.4.4 hardware round.
-  "quit",
-  "unlock",
-  "lock",
-  "climateOn",
-  "climateOff",
-  "refresh",
-  "chargeStart",
-  "chargeStop",
-];
-
-/** Keep the `max` highest-priority items, in priority order. */
-function prioritiseMenu(items: MenuItem[], max: number): MenuItem[] {
-  if (!max || items.length <= max) return items;
-  const rank = (i: MenuItem) => {
-    const r = MENU_PRIORITY.indexOf(i.key);
-    return r === -1 ? MENU_PRIORITY.length : r;
-  };
-  return [...items].sort((a, b) => rank(a) - rank(b)).slice(0, max);
-}
-
-/** Which variant the host accepted last (null = none tried / all refused). */
+/** Which variant the host accepted last (null = none tried / all refused).
+ *  `prioritiseMenu` and `MENU_PRIORITY` moved to display.ts, where a test can
+ *  reach them — they decide which action a tap index means. */
 let menuVariantUsed: string | null = null;
+
+/**
+ * The item cap currently in force: the accepted variant's, or none if the host
+ * hasn't accepted anything yet. `renderCurrent` needs this to compare a fresh
+ * menu against the one actually on screen — see the warning on `sameMenu`.
+ */
+function acceptedMenuMax(): number {
+  const variant = MENU_VARIANTS.find((v) => v.name === menuVariantUsed);
+  return variant ? variant.maxItems : 0;
+}
 
 /** Non-ASCII → nearest plain equivalent, for the ascii variants. */
 function toAsciiLabel(s: string): string {
@@ -545,11 +542,22 @@ function showHud(note = "") {
 }
 
 /**
- * Build the menu page, walking MENU_VARIANTS until the host accepts one.
- * Throws only when every variant is refused, so commitView still rolls the view
- * back rather than stranding it on a page that never went up.
+ * Build the menu page from `candidate`, walking MENU_VARIANTS until the host
+ * accepts one. Throws only when every variant is refused, so commitView still
+ * rolls the view back rather than stranding it on a page that never went up.
+ *
+ * `candidate` is a parameter rather than module state on purpose: `menuItems`
+ * must describe what is ON SCREEN, and nothing else. It used to be assigned
+ * before the rebuild, so for the length of a BLE round trip it named the full
+ * untruncated list while the glasses still showed the truncated one — and a tap
+ * during that window resolved index 1 ("Find my car") to `unlock`, sending an
+ * unlock to the car. Same discipline as `commitView` and `view`: assign only
+ * once the host has actually taken the page.
  */
-async function rebuildMenuPage(note: string): Promise<void> {
+async function rebuildMenuPage(
+  candidate: MenuItem[],
+  note: string,
+): Promise<void> {
   const info = safeText(
     "render/menu",
     () => formatMenuInfo(lastStatus, note),
@@ -565,7 +573,7 @@ async function rebuildMenuPage(note: string): Promise<void> {
       ]
     : [...MENU_VARIANTS];
   for (const variant of ordered) {
-    const items = prioritiseMenu(menuItems, variant.maxItems);
+    const items = prioritiseMenu(candidate, variant.maxItems);
     try {
       await rebuildPage(
         `menu page (${variant.name})`,
@@ -600,13 +608,14 @@ async function rebuildMenuPage(note: string): Promise<void> {
 // changing its context-aware items) is a full page rebuild.
 function showMenu(note = "") {
   const previous = view;
+  let candidate: MenuItem[];
   try {
-    menuItems = buildMenuItems(lastStatus, settings);
+    candidate = buildMenuItems(lastStatus, settings);
   } catch (err) {
     // Same safety net as the HUD: a broken status must still leave a
     // navigable menu (the universal actions need no status at all).
     recordError("render/menu", err);
-    menuItems = [
+    candidate = [
       { key: "hud", label: "Return to HUD" },
       { key: "refresh", label: "Refresh" },
       { key: "quit", label: "Quit" },
@@ -616,7 +625,7 @@ function showMenu(note = "") {
     "menu",
     previous,
     setView,
-    () => rebuildMenuPage(note),
+    () => rebuildMenuPage(candidate, note),
     (err) => recordError("render/menu", err),
   );
 }
@@ -986,7 +995,7 @@ async function enterFinder() {
       let lastErr: unknown = null;
       for (const layout of layouts) {
         directionIndicator = layout.indicator;
-        directionIndicator.prepare?.();
+        // NOTE: `prepare()` is deliberately NOT called here — see below.
         directionIndicator.reset();
         try {
           await rebuildPage(
@@ -1014,6 +1023,27 @@ async function enterFinder() {
   // Attach to the shared loop — starts a fresh session, or joins one the phone
   // already started (one loop, both surfaces, no mode conflict).
   finderEngine.attach(glassesFinderRenderer);
+
+  // Arrow frames LAST, and off this turn entirely. `prepare()` renders ~35
+  // 144x144 PNGs synchronously (renderArrowFrames: 16 rotations x 2 brightness
+  // levels, each a canvas + toDataURL + per-byte number[]), which blocks the
+  // WebView's main thread — no painting, no event delivery — on the first
+  // finder entry of the session. Doing that BEFORE the page rebuild meant the
+  // user's press bought a freeze and nothing on screen, and any tap during it
+  // queued up to fire afterwards (a queued tap routes to exitFinder and snaps
+  // straight back to the HUD, which reads as the press doing nothing). The page
+  // is up and the tap acknowledged before we spend that time; `update()`
+  // no-ops until the frames exist, so the repaint below is what draws the first
+  // arrow. Later entries are free — the frames are cached.
+  const indicator = directionIndicator;
+  if (indicator.prepare) {
+    setTimeout(() => {
+      indicator.prepare?.();
+      // Still on the finder? Repaint through the engine so the arrow appears
+      // without waiting for the next GPS fix.
+      if (view === "finder" && !backgrounded) finderEngine.refresh();
+    }, 0);
+  }
 }
 
 function exitFinder() {
@@ -1124,7 +1154,17 @@ async function renderCurrent(note = "") {
       finderEngine.refresh();
     } else if (view === "hud") {
       await updateHud(note);
-    } else if (sameMenu(buildMenuItems(lastStatus, settings), menuItems)) {
+    } else if (
+      // Through prioritiseMenu with the accepted cap FIRST, so this compares
+      // the menu we would render against the one on screen. Comparing the raw
+      // build against the truncated `menuItems` can never match once the host
+      // caps the list, so every poll rebuilt the menu — the rebuild that ate
+      // the "Find my car" press. See the warning on sameMenu.
+      sameMenu(
+        prioritiseMenu(buildMenuItems(lastStatus, settings), acceptedMenuMax()),
+        menuItems,
+      )
+    ) {
       await updateMenuInfo(
         safeText("render/menu", () => formatMenuInfo(lastStatus, note), SAFE_NOTE),
       );
@@ -1200,6 +1240,9 @@ function applyPowertrain(status: VehicleStatus | null) {
     }
   }
   renderPowertrainForm();
+  // The car has just told us what limits it holds — that may be exactly what
+  // is on the form, in which case the send button quietly goes away.
+  syncPhoneLimits?.();
 }
 
 function scheduleRepoll(delayMs: number) {
@@ -1487,6 +1530,25 @@ function setStatus(el: HTMLParagraphElement, text: string, isError = false) {
   el.classList.toggle("err", isError);
 }
 
+/**
+ * Re-fill the settings form from `settings`, published by `bindPhoneUi`.
+ *
+ * The form binds before the settings read completes (that read goes over the
+ * bridge, and the bridge is no longer allowed to gate the phone UI), so boot
+ * calls this once the real values land. It leaves a form the user has already
+ * typed into alone.
+ */
+let hydratePhoneForm: ((force?: boolean) => void) | null = null;
+
+/**
+ * Re-evaluate the contextual charge-limit send button, published by
+ * `bindPhoneUi`. Called after every successful status fetch: the car's own
+ * reported limits are one of the two inputs to "does the form disagree with
+ * the car", so a poll can stand the button down (or raise it) with no
+ * interaction at all.
+ */
+let syncPhoneLimits: (() => void) | null = null;
+
 function bindPhoneUi() {
   // Fill the brand word into the static copy before anything else renders.
   applyBrand();
@@ -1521,6 +1583,19 @@ function bindPhoneUi() {
   const saveStatus = document.getElementById(
     "save-status",
   ) as HTMLParagraphElement;
+  // Presentation-only additions: the connection chip beside the ACCOUNT
+  // heading, the mono battery/last-test readout next to Test connection, the
+  // segmented unit switch and the climate steppers. All optional — a missing
+  // one degrades rather than throwing, because a cosmetic element must never
+  // be able to take the whole form down with it.
+  const connChip = document.getElementById("conn-chip");
+  const testReadout = document.getElementById("test-readout");
+  const tempUnitSuffix = document.getElementById("climate-temp-unit");
+  const unitSegs = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(".seg[data-unit]"),
+  );
+  const tempDownBtn = document.getElementById("temp-down");
+  const tempUpBtn = document.getElementById("temp-up");
 
   // The unit currently on screen. `climateTemp` is Celsius no matter what
   // this says — only the input, its bounds and the label follow it.
@@ -1528,6 +1603,12 @@ function bindPhoneUi() {
   // Once the user picks a unit themselves we stop inferring it from the
   // region, so choosing Celsius in the US survives a later region edit.
   let tempUnitExplicit = settings.tempUnit != null;
+
+  // The big mono readout IS the input, so it has to be exactly as wide as its
+  // own digits — a fixed width leaves "70" floating away from the "°F".
+  function sizeTempInput() {
+    tempEl.style.width = `${Math.max(2, tempEl.value.length)}ch`;
+  }
 
   // Retarget the input at `unit`, carrying whatever is currently typed across
   // the conversion (it's read back in `prev`, the unit it was entered in) so
@@ -1543,13 +1624,47 @@ function bindPhoneUi() {
     tempEl.max = field.max;
     tempEl.step = field.step;
     tempEl.value = field.value;
-    tempLabelEl.textContent = field.label;
+    // The unit rides on the value ("21°C") in this layout, so the label above
+    // it is the fixed micro-label; the full sentence stays as the input's
+    // accessible name.
+    tempLabelEl.textContent = "Climate target";
+    tempEl.setAttribute("aria-label", field.label);
+    if (tempUnitSuffix) tempUnitSuffix.textContent = `°${unit}`;
+    for (const seg of unitSegs) {
+      seg.setAttribute("aria-pressed", String(seg.dataset.unit === unit));
+    }
+    sizeTempInput();
   }
 
   tempUnitEl.addEventListener("change", () => {
     tempUnitExplicit = true;
     applyTempUnit(tempUnitEl.value as TempUnit, tempUnit);
   });
+
+  // The segmented switch drives the (hidden) select rather than the unit
+  // directly: the select stays the one source of truth every existing handler
+  // — and the dirty tracking — already reads.
+  for (const seg of unitSegs) {
+    seg.addEventListener("click", () => {
+      const unit = seg.dataset.unit as TempUnit;
+      if (unit === tempUnitEl.value) return;
+      tempUnitEl.value = unit;
+      tempUnitEl.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
+
+  // Steppers: one step of whatever the current unit's step is (1°C / 1°F),
+  // clamped by the input's own min/max. `input` keeps the width in step and
+  // marks the form dirty exactly as typing would.
+  function stepTemp(dir: 1 | -1) {
+    if (dir > 0) tempEl.stepUp();
+    else tempEl.stepDown();
+    tempEl.dispatchEvent(new Event("input", { bubbles: true }));
+    tempEl.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  tempUpBtn?.addEventListener("click", () => stepTemp(1));
+  tempDownBtn?.addEventListener("click", () => stepTemp(-1));
+  tempEl.addEventListener("input", sizeTempInput);
 
   for (const region of REGIONS) {
     regionEl.add(new Option(region.label, String(region.code)));
@@ -1560,23 +1675,275 @@ function bindPhoneUi() {
     }
   }
 
-  // First run: walk the user through setup. Once configured, collapse it.
-  guideEl.open = !isConfigured(settings);
-  usernameEl.value = settings.username;
-  passwordEl.value = settings.password;
-  pinEl.value = settings.pin;
-  regionEl.value = String(settings.region);
-  // Seed the field in Celsius (the stored unit), then let applyTempUnit
-  // convert it into whatever the user should see.
-  tempEl.value = String(settings.climateTemp);
-  applyTempUnit(resolveTempUnit(settings), "C");
-  defrostEl.checked = settings.climateDefrost;
-  heatingEl.checked = settings.climateHeating;
-  acEl.value = String(settings.chargeLimitAc);
-  dcEl.value = String(settings.chargeLimitDc);
-  // Sections reflect the persisted powertrain immediately — no waiting for
-  // a fetch to stop showing an EV form to a fuel car.
-  renderPowertrainForm();
+  // Has the user touched the form? The fields are live from the moment they
+  // bind, which is now BEFORE the settings read finishes (that read goes over
+  // the bridge and the bridge may never arrive). Typing in that window must
+  // survive the settings landing a moment later.
+  let formDirty = false;
+  // Save is disabled until something actually changes, so listening on a
+  // hand-written list of fields is no longer good enough: one control the list
+  // forgot would leave Save dead with nothing on screen saying why. Delegated,
+  // in the capture phase, so every input/change under the form counts —
+  // including the ones the steppers and the unit switch synthesise.
+  //
+  // Programmatic assignment fires neither event, so hydration can't mark
+  // itself dirty.
+  function markDirty() {
+    formDirty = true;
+    syncSaveEnabled();
+  }
+  const formRoot = document.getElementById("app") ?? document.body;
+  formRoot.addEventListener("input", markDirty, true);
+  formRoot.addEventListener("change", markDirty, true);
+
+  /** Nothing changed ⇒ nothing to save. Re-enabled by any edit above. */
+  function syncSaveEnabled() {
+    saveBtn.disabled = !formDirty;
+  }
+  syncSaveEnabled();
+
+  // -- Kia-US device enrollment: which section is on screen ------------------
+  //
+  // Deliberately above `hydrateFromSettings`, which calls `syncEnrollSection`:
+  // the visibility USED to be decided once, at bind time, and bind time is
+  // before the settings read resolves (it goes over the bridge). `regionEl`
+  // still held the default Europe then, so a returning Kia-US owner with no
+  // stored token — exactly the state a user is in when their device token
+  // expires and they must re-enrol — opened the settings page to no enrolment
+  // UI at all. It only appeared if they happened to touch the region select, or
+  // after Test connection came back 409. The gating rule is unchanged; the
+  // evaluation now re-runs whenever the form is re-filled from settings, the
+  // same way the charge-limits section follows the persisted powertrain.
+  const enrollSection = document.getElementById("enroll-section")!;
+  const enrollStartArea = document.getElementById("enroll-start-area")!;
+  const enrollVerifyArea = document.getElementById("enroll-verify-area")!;
+  const enrollNotifyType = document.getElementById("enroll-notify-type") as HTMLSelectElement;
+  const enrollStartBtn = document.getElementById("enroll-start-btn") as HTMLButtonElement;
+  const enrollCodeEl = document.getElementById("enroll-code") as HTMLInputElement;
+  const enrollVerifyBtn = document.getElementById("enroll-verify-btn") as HTMLButtonElement;
+  const enrollStatus = document.getElementById("enroll-status") as HTMLParagraphElement;
+  const enrollStepEl = document.getElementById("enroll-step");
+  const enrollBar2 = document.getElementById("enroll-bar-2");
+  const enrollExplainer = document.getElementById("enroll-explainer");
+
+  /** "j.berry@example.com" → "j***y@example.com"; anything else is left alone
+   *  (an SMS destination is already masked by the upstream). */
+  function maskDestination(dest: string): string {
+    const at = dest.indexOf("@");
+    if (at < 3) return dest;
+    return `${dest[0]}***${dest[at - 1]}${dest.slice(at)}`;
+  }
+
+  /**
+   * Presentation for the two-step panel: which progress bar is filled, the
+   * "N / 2" counter, and the explainer — which names the masked destination
+   * once a code has actually been sent somewhere.
+   */
+  function setEnrollStep(step: 1 | 2, dest?: string | null) {
+    if (enrollStepEl) enrollStepEl.textContent = `${step} / 2`;
+    enrollBar2?.classList.toggle("pending", step < 2);
+    if (!enrollExplainer) return;
+    enrollExplainer.textContent =
+      step === 2 && dest
+        ? `${BRAND.serviceName} (US) needs a one-time code to trust this app. Sent to ${maskDestination(dest)}.`
+        : `${BRAND.serviceName} (US) needs a one-time code to trust this app. It expires after a few minutes.`;
+  }
+  setEnrollStep(1);
+
+  function needsEnrollment(): boolean {
+    return IS_KIA_US && Number(regionEl.value) === 3;
+  }
+
+  function showEnrollSection() {
+    if (needsEnrollment()) enrollSection.style.display = "";
+  }
+
+  function hideEnrollSection() {
+    // Already hidden ⇒ nothing to do. Not just an optimisation: the reset below
+    // discards a code the user has typed and the "code sent" line above it, so
+    // a re-evaluation that changes nothing must not touch the DOM at all.
+    if (enrollSection.style.display === "none") return;
+    enrollSection.style.display = "none";
+    enrollVerifyArea.style.display = "none";
+    enrollCodeEl.value = "";
+    setEnrollStep(1);
+    setStatus(enrollStatus, "");
+  }
+
+  /**
+   * Show or hide the enrolment section from the region ON SCREEN plus whether a
+   * device token is stored. Idempotent — re-running it with nothing changed
+   * leaves the DOM untouched, so hydration, the region listener and the
+   * enrolment handlers can all call it without flicker or lost input.
+   */
+  function syncEnrollSection() {
+    const show = needsEnrollment() && !settings.kiaUsDeviceToken;
+    if (show) showEnrollSection();
+    else hideEnrollSection();
+    // Logged like the powertrain form: the original bug was invisible from the
+    // outside — the section was simply absent, with nothing saying why.
+    console.debug(
+      `enrolment form: brand ${BRAND.id}, region ${regionEl.value}, ` +
+        `token ${settings.kiaUsDeviceToken ? "stored" : "none"}` +
+        ` → ${show ? "shown" : "hidden"}`,
+    );
+  }
+
+  // -- Charge limits: the contextual send ------------------------------------
+  //
+  // Car commands in this app are always a deliberate, separately-labelled tap.
+  // Changing a dropdown is a preference edit; telling the car about it is an
+  // action, and it gets its own button, its own label naming the exact values,
+  // and its own status line. The button is only on screen while the form and
+  // the car actually disagree, so the common case stays clean — and because
+  // "disagree" survives a failed send, the button IS the retry path for the
+  // sleeping-car case.
+  let limitsSending = false;
+
+  function formLimits(): { ac: number; dc: number } {
+    return { ac: Number(acEl.value), dc: Number(dcEl.value) };
+  }
+
+  function syncLimitsButton() {
+    const { ac, dc } = formLimits();
+    if (limitsSending) {
+      // Stays on screen while in flight so the values being sent are still
+      // readable, and disabled so a second tap cannot start a second push.
+      limitsBtn.hidden = false;
+      limitsBtn.disabled = true;
+      limitsBtn.textContent = "Sending…";
+      return;
+    }
+    const known = carKnownLimits(
+      settings.chargeLimitsSent,
+      {
+        ac: lastStatus?.charge_limit_ac,
+        dc: lastStatus?.charge_limit_dc,
+      },
+      Date.now(),
+    );
+    const offer =
+      // No saved account ⇒ nothing to send to. First run shows the limit
+      // dropdowns without an action that could only fail.
+      isConfigured(settings) &&
+      chargeLimitsRelevant(
+        settings.lastPowertrain,
+        settings.lastPowertrainFuelOnly,
+      ) &&
+      limitsNeedSending(ac, dc, known);
+    limitsBtn.hidden = !offer;
+    limitsBtn.disabled = false;
+    limitsBtn.textContent = `Send ${ac}% / ${dc}% to car`;
+  }
+
+  // The label names the values, so it has to follow the dropdowns; and whether
+  // the button is offered at all follows them too. Editing a limit also drops
+  // the previous send's result — "Sent." above a value that has since changed
+  // would be a lie. (Clearing it inside syncLimitsButton would instead wipe the
+  // confirmation the moment a successful send stood the button down.)
+  function onLimitEdited() {
+    setStatus(limitsStatus, "");
+    syncLimitsButton();
+  }
+  acEl.addEventListener("change", onLimitEdited);
+  dcEl.addEventListener("change", onLimitEdited);
+
+  limitsBtn.addEventListener("click", async () => {
+    // Never concurrent: a tap while one is in flight is ignored outright, not
+    // queued. The disabled state above already blocks it; this is the belt.
+    if (limitsSending) return;
+    const limitsClient = formClient();
+    if (!limitsClient) {
+      setStatus(limitsStatus, "Enter your account details first.", true);
+      return;
+    }
+    const { ac, dc } = formLimits();
+    limitsSending = true;
+    syncLimitsButton();
+    setStatus(limitsStatus, "Sending…");
+    try {
+      await limitsClient.setChargeLimits(ac, dc);
+      // Record what the car now holds so the button stands down. Persisted
+      // through the same queue as everything else, and deliberately NOT via
+      // persistForm: sending must not quietly save the rest of the form.
+      settings.chargeLimitsSent = { ac, dc, at: Date.now() };
+      void enqueue(() => saveSettings(bridge as Bridge, settings));
+      setStatus(limitsStatus, "Sent. The car applies them in 30–90 s.");
+    } catch (err) {
+      recordError("charge-limits", err);
+      // The values still disagree with the car, so syncLimitsButton leaves the
+      // button up — that is the retry, no extra state needed.
+      setStatus(limitsStatus, describeError(err), true);
+    } finally {
+      limitsSending = false;
+      syncLimitsButton();
+    }
+  });
+
+  /**
+   * Fill the form from `settings`. Called once at bind time (with whatever
+   * defaults are in place) and again when the real settings arrive — see
+   * `hydratePhoneForm` and the boot block.
+   */
+  function hydrateFromSettings(force = false) {
+    if (formDirty && !force) return;
+    // First run: walk the user through setup. Once configured, collapse it.
+    guideEl.open = !isConfigured(settings);
+    usernameEl.value = settings.username;
+    passwordEl.value = settings.password;
+    pinEl.value = settings.pin;
+    regionEl.value = String(settings.region);
+    tempUnitExplicit = settings.tempUnit != null;
+    // Seed the field in Celsius (the stored unit), then let applyTempUnit
+    // convert it into whatever the user should see.
+    tempEl.value = String(settings.climateTemp);
+    applyTempUnit(resolveTempUnit(settings), "C");
+    defrostEl.checked = settings.climateDefrost;
+    heatingEl.checked = settings.climateHeating;
+    acEl.value = String(settings.chargeLimitAc);
+    dcEl.value = String(settings.chargeLimitDc);
+    // Sections reflect the persisted powertrain immediately — no waiting for
+    // a fetch to stop showing an EV form to a fuel car.
+    renderPowertrainForm();
+    // A limit typed but never sent has just been re-filled from storage; the
+    // button has to come back with it, still offering the send.
+    syncLimitsButton();
+    // Same rule for enrolment: the saved region decides it, so it has to be
+    // re-evaluated here and not only when the user changes the select.
+    syncEnrollSection();
+  }
+  hydrateFromSettings(true);
+  hydratePhoneForm = hydrateFromSettings;
+  syncPhoneLimits = syncLimitsButton;
+
+  // -- Connection chip + last-test readout ----------------------------------
+  //
+  // Pure presentation over the Test connection flow that already exists: the
+  // chip beside the ACCOUNT heading says whether the last test succeeded
+  // (nothing at all until one has been run), and the mono block beside the
+  // button carries the last known energy figure and the time of the last
+  // successful test — the two things worth remembering between visits.
+  function setConnectionChip(state: "idle" | "testing" | "ok" | "error") {
+    if (!connChip) return;
+    if (state === "idle" || state === "testing") {
+      connChip.hidden = true;
+      return;
+    }
+    connChip.hidden = false;
+    connChip.classList.toggle("chip-off", state === "error");
+    connChip.textContent = state === "ok" ? "● Connected" : "● Not connected";
+  }
+
+  function setTestReadout(status: VehicleStatus | null, at: number) {
+    if (!testReadout) return;
+    // Whichever energy figure this car actually reports — a hybrid answering
+    // "BATT ?%" would read as a broken connection.
+    const level = status?.soc_percent ?? status?.fuel_level_percent ?? null;
+    const label = status?.soc_percent != null ? "BATT" : "FUEL";
+    const time = new Date(at).toTimeString().slice(0, 5);
+    testReadout.textContent =
+      (level != null ? `${label} ${Math.round(level)}%\n` : "") + time;
+  }
 
   // Client built from the current field values (not saved state) so users
   // can test before saving. Null until username + password are filled in.
@@ -1606,6 +1973,8 @@ function bindPhoneUi() {
       return;
     }
     testBtn.disabled = true;
+    testBtn.textContent = "Testing…";
+    setConnectionChip("testing");
     setStatus(
       testStatus,
       "Testing… (the first sign-in can take up to a minute)",
@@ -1614,6 +1983,7 @@ function bindPhoneUi() {
       try {
         await probe.healthz(15_000);
       } catch {
+        setConnectionChip("error");
         setStatus(
           testStatus,
           "Proxy unreachable. Check your internet connection.",
@@ -1637,6 +2007,8 @@ function bindPhoneUi() {
         // Success proves the form's details work — persist them now rather
         // than trusting the user to also tap Save.
         const saved = await persistForm();
+        setConnectionChip("ok");
+        setTestReadout(status, Date.now());
         setStatus(
           testStatus,
           `Connected. Car responded (${figure}).` +
@@ -1644,6 +2016,7 @@ function bindPhoneUi() {
           !saved,
         );
       } catch (err) {
+        setConnectionChip("error");
         recordError("test/status", err);
         if (err instanceof ApiError && err.status === 409) {
           // Clear the stale token so enrollment can start fresh.
@@ -1693,33 +2066,14 @@ function bindPhoneUi() {
       }
     } finally {
       testBtn.disabled = false;
+      testBtn.textContent = "Test connection";
     }
   });
 
   // -- Kia-US device enrollment ---------------------------------------------
-  const enrollSection = document.getElementById("enroll-section")!;
-  const enrollStartArea = document.getElementById("enroll-start-area")!;
-  const enrollVerifyArea = document.getElementById("enroll-verify-area")!;
-  const enrollNotifyType = document.getElementById("enroll-notify-type") as HTMLSelectElement;
-  const enrollStartBtn = document.getElementById("enroll-start-btn") as HTMLButtonElement;
-  const enrollCodeEl = document.getElementById("enroll-code") as HTMLInputElement;
-  const enrollVerifyBtn = document.getElementById("enroll-verify-btn") as HTMLButtonElement;
-  const enrollStatus = document.getElementById("enroll-status") as HTMLParagraphElement;
-
-  function needsEnrollment(): boolean {
-    return IS_KIA_US && Number(regionEl.value) === 3;
-  }
-
-  function showEnrollSection() {
-    if (needsEnrollment()) enrollSection.style.display = "";
-  }
-
-  function hideEnrollSection() {
-    enrollSection.style.display = "none";
-    enrollVerifyArea.style.display = "none";
-    enrollCodeEl.value = "";
-    setStatus(enrollStatus, "");
-  }
+  // The section's elements and its visibility rule live above, next to
+  // `hydrateFromSettings` — the load-time evaluation has to happen there, after
+  // the settings read lands. What follows is the enrolment flow itself.
 
   // Selecting USA switches the display to Fahrenheit (and back out of it),
   // but only while the user hasn't overridden the unit themselves.
@@ -1729,21 +2083,9 @@ function bindPhoneUi() {
     if (inferred !== tempUnit) applyTempUnit(inferred, tempUnit);
   });
 
-  // Show/hide on region change — enrollment is only for Kia + US.
-  regionEl.addEventListener("change", () => {
-    if (needsEnrollment()) {
-      // Show only if we don't already have a token stored
-      if (!settings.kiaUsDeviceToken) showEnrollSection();
-      else hideEnrollSection();
-    } else {
-      hideEnrollSection();
-    }
-  });
-
-  // Show enrollment on load if Kia-US and not yet enrolled.
-  if (needsEnrollment() && !settings.kiaUsDeviceToken) {
-    showEnrollSection();
-  }
+  // Re-evaluate on region change — enrollment is only for Kia + US, and only
+  // until a device token is stored.
+  regionEl.addEventListener("change", syncEnrollSection);
 
   enrollStartBtn.addEventListener("click", async () => {
     const enrollClient = formClient();
@@ -1782,6 +2124,7 @@ function bindPhoneUi() {
         );
         enrollStartArea.style.display = "none";
         enrollVerifyArea.style.display = "";
+        setEnrollStep(2, dest ?? null);
         enrollCodeEl.focus();
       }
     } catch (err) {
@@ -1826,6 +2169,7 @@ function bindPhoneUi() {
         enrollStartArea.style.display = "";
         enrollVerifyArea.style.display = "none";
         enrollCodeEl.value = "";
+        setEnrollStep(1);
         hideEnrollSection();
         setStatus(testStatus, "");
       } else {
@@ -1843,6 +2187,7 @@ function bindPhoneUi() {
         enrollStartArea.style.display = "";
         enrollVerifyArea.style.display = "none";
         enrollCodeEl.value = "";
+        setEnrollStep(1);
       } else if (err instanceof ApiError && err.status === 401) {
         setStatus(enrollStatus, "Wrong code. Check and try again.", true);
       } else {
@@ -1861,6 +2206,7 @@ function bindPhoneUi() {
     enrollStartArea.style.display = "";
     enrollVerifyArea.style.display = "none";
     enrollCodeEl.value = "";
+    setEnrollStep(1);
     setStatus(enrollStatus, "");
   });
 
@@ -1869,6 +2215,7 @@ function bindPhoneUi() {
   const diagStatus = document.getElementById(
     "diag-status",
   ) as HTMLParagraphElement;
+  const diagCopied = document.getElementById("diag-copied");
 
   diagBtn.addEventListener("click", async () => {
     diagBtn.disabled = true;
@@ -1904,8 +2251,12 @@ function bindPhoneUi() {
           : "not opened this session"
       }`,
       ``,
-      // The glasses events the router actually saw, newest last. "text(elided)"
-      // vs "text(0)" is the distinction most gesture bugs turn on.
+      // READ THIS LINE FIRST. Whether a host bridge ever attached. NOT
+      // CONNECTED means no glasses call in the session could have done
+      // anything: every host op below is a placeholder refusal and the glasses
+      // half of the app was never running, so nothing further down is evidence
+      // of anything except that.
+      `Host bridge: ${gate.isReady() ? "connected" : "NOT CONNECTED"}`,
       // Did the host actually accept our page/text writes? These APIs return
       // false rather than rejecting, so "the page went up" is only knowable
       // from here.
@@ -1920,6 +2271,8 @@ function bindPhoneUi() {
       // it refuses when "full" isn't the answer.
       `Menu variant: ${menuVariantUsed ?? "none accepted yet"}`,
       `Finder layout: ${finderLayoutUsed ?? "not opened this session"}`,
+      // The glasses events the router actually saw, newest last. "text(elided)"
+      // vs "text(0)" is the distinction most gesture bugs turn on.
       `Input trace (last ${inputTrace.entries().length}):`,
       ...(inputTrace.entries().length
         ? inputTrace.lines(Date.now()).map((l) => `  ${l}`)
@@ -1969,6 +2322,12 @@ function bindPhoneUi() {
 
     if (copied) {
       setStatus(diagStatus, "Copied to clipboard. Paste it into a message to the developer.");
+      // The row itself acknowledges, briefly — the status line under it is the
+      // detail, this is the "it worked" the thumb is still over.
+      if (diagCopied) {
+        diagCopied.textContent = "Copied";
+        setTimeout(() => { diagCopied.textContent = ""; }, 2000);
+      }
     } else {
       setStatus(
         diagStatus,
@@ -2002,25 +2361,6 @@ function bindPhoneUi() {
     diagBtn.disabled = false;
   });
 
-  limitsBtn.addEventListener("click", async () => {
-    const limitsClient = formClient();
-    if (!limitsClient) {
-      setStatus(limitsStatus, "Enter your account details first.", true);
-      return;
-    }
-    limitsBtn.disabled = true;
-    setStatus(limitsStatus, "Sending…");
-    try {
-      await limitsClient.setChargeLimits(Number(acEl.value), Number(dcEl.value));
-      setStatus(limitsStatus, "Limits sent. The car applies them in 30–90 s.");
-    } catch (err) {
-      recordError("charge-limits", err);
-      setStatus(limitsStatus, describeError(err), true);
-    } finally {
-      limitsBtn.disabled = false;
-    }
-  });
-
   // The one save routine: persists the current form to bridge storage.
   // Shared by the Save button and the auto-save-on-success paths (Test
   // connection, OTP enrolment) — the tester lost his credentials because
@@ -2042,6 +2382,9 @@ function bindPhoneUi() {
       delete settings.kiaUsDeviceToken;
       if (needsEnrollment()) showEnrollSection();
     }
+    // Same reasoning for what we believe the car holds: a different account is
+    // a different car, so "we sent it 80/90" stops meaning anything.
+    if (usernameChanged) delete settings.chargeLimitsSent;
     settings = {
       username: usernameEl.value.trim(),
       password: passwordEl.value,
@@ -2063,12 +2406,22 @@ function bindPhoneUi() {
       ...(settings.kiaUsDeviceToken
         ? { kiaUsDeviceToken: settings.kiaUsDeviceToken }
         : {}),
+      // Likewise the record of what the car was last told — it belongs to the
+      // car, not the form, and a plain Save must not forget it and start
+      // nagging to re-send limits the car already has.
+      ...(settings.chargeLimitsSent
+        ? { chargeLimitsSent: settings.chargeLimitsSent }
+        : {}),
       // The powertrain memory belongs to the car, not the form — carry it
       // across saves.
       lastPowertrain: settings.lastPowertrain,
       lastPowertrainFuelOnly: settings.lastPowertrainFuelOnly,
     };
     rebuildClient();
+    // `settings` has just been replaced, and the send button reads it — the
+    // saved account gates whether it is offered at all, so a first Save has to
+    // re-evaluate it rather than leaving the pre-account state on screen.
+    syncLimitsButton();
     const ok = await enqueue(() => saveSettings(bridge as Bridge, settings));
     if (ok) guideEl.open = !isConfigured(settings);
     // Still on the connect page (first run: user just typed the account
@@ -2083,9 +2436,31 @@ function bindPhoneUi() {
     return ok;
   }
 
+  // Save is LOCAL ONLY. It writes the form to bridge storage and nothing else:
+  // no request ever leaves the phone because the user tapped Save. Every car
+  // command in this app is a deliberate, separately-labelled action (climate,
+  // lock, charge, and the charge-limit send below), and Save must not become
+  // the one exception — a preference write that silently drives the vehicle.
+  //
+  // The charge-limit VALUES are saved here like any other preference, so an
+  // unsent limit survives a reload; whether the car has been told about it is
+  // the send button's business, not this one's.
   saveBtn.addEventListener("click", async () => {
+    saveBtn.disabled = true;
     const ok = await persistForm();
-    setStatus(saveStatus, ok ? "Saved." : "Save failed. Try again.", !ok);
+    if (!ok) {
+      setStatus(saveStatus, "Save failed. Try again.", true);
+      formDirty = true;
+      syncSaveEnabled();
+      return;
+    }
+    formDirty = false;
+    syncSaveEnabled();
+    setStatus(saveStatus, "Saved.");
+    // A brief confirmation, then back to a quiet footer. Failures stay up.
+    setTimeout(() => {
+      if (!saveStatus.classList.contains("err")) setStatus(saveStatus, "");
+    }, 4000);
   });
 }
 
@@ -2104,29 +2479,66 @@ function bindPhoneFinder() {
   const openBtn = document.getElementById("finder-open") as HTMLButtonElement;
   const backBtn = document.getElementById("finder-back") as HTMLButtonElement;
   const doneBtn = document.getElementById("finder-done") as HTMLButtonElement;
-  const canvas = document.getElementById("finder-radar") as HTMLCanvasElement;
-  const headlineEl = document.getElementById(
-    "finder-headline",
-  ) as HTMLParagraphElement;
-  const detailEl = document.getElementById(
-    "finder-detail",
-  ) as HTMLParagraphElement;
   const messageEl = document.getElementById("finder-message") as HTMLDivElement;
-  const ctx = canvas.getContext("2d");
 
-  let layout: RadarLayout = layoutFor(280);
+  // The readout that leads: distance, then the heading phrase. The radar
+  // underneath is confirmation — the two lines above it are the answer.
+  const readoutEl = document.getElementById("finder-readout") as HTMLDivElement;
+  const headlineEl = document.getElementById("finder-headline") as HTMLDivElement;
+  const distValueEl = document.getElementById("finder-distance-value")!;
+  const distUnitEl = document.getElementById("finder-distance-unit")!;
+  const phraseEl = document.getElementById("finder-phrase")!;
 
-  // Backing-store size follows the device pixel ratio for a crisp radar; the
-  // context is scaled so all radar.ts geometry stays in CSS pixels.
-  function resizeCanvas() {
-    const size = Math.max(200, Math.min(screenEl.clientWidth - 48, 300));
-    const dpr = window.devicePixelRatio || 1;
-    canvas.style.width = `${size}px`;
-    canvas.style.height = `${size}px`;
-    canvas.width = Math.round(size * dpr);
-    canvas.height = Math.round(size * dpr);
-    ctx?.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // The radar is DOM, not canvas: the dot and the rim arrowhead have to GLIDE
+  // between updates (a fix arrives about once a second and a jumping dot reads
+  // as a broken instrument), and a CSS `transform` transition does that for
+  // free — including honouring prefers-reduced-motion, which a canvas tween
+  // would have to reimplement. All the geometry still comes from the same
+  // unit-tested radar.ts scene.
+  const radarEl = document.getElementById("finder-radar") as HTMLDivElement;
+  const ringsEl = document.getElementById("radar-rings") as HTMLDivElement;
+  const arrowRotEl = document.getElementById("radar-arrow-rot") as HTMLDivElement;
+  const arrowEl = document.getElementById("radar-arrow") as HTMLDivElement;
+  const carWrapEl = document.getElementById("radar-car-wrap") as HTMLDivElement;
+  const northRotEl = document.getElementById("radar-north-rot") as HTMLDivElement;
+  const northEl = document.getElementById("radar-north") as HTMLDivElement;
+  const scaleEl = document.getElementById("radar-scale") as HTMLDivElement;
+
+  const detailEl = document.getElementById("finder-detail") as HTMLDivElement;
+  const brgEl = document.getElementById("finder-brg")!;
+  const cardinalEl = document.getElementById("finder-cardinal")!;
+  const ageEl = document.getElementById("finder-age")!;
+  const noteEl = document.getElementById("finder-note")!;
+
+  /** The design's radar, shrunk to fit narrower phones. The outer ring IS the
+   *  box: the rim arrowhead sits outside it, which is why it is allowed to
+   *  overflow. */
+  const RADAR_MAX = 340;
+  let layout: RadarLayout = layoutFor(RADAR_MAX);
+
+  function resizeRadar() {
+    const size = Math.max(220, Math.min(screenEl.clientWidth - 40, RADAR_MAX));
+    radarEl.style.width = `${size}px`;
+    radarEl.style.height = `${size}px`;
     layout = layoutFor(size);
+    ringCount = -1; // insets are absolute px — rebuild them at the new size
+  }
+
+  // Range rings are rebuilt only when their COUNT changes; the scale itself
+  // follows the distance, so this is once every few hundred metres at most.
+  let ringCount = -1;
+  function renderRings(radii: number[]) {
+    if (radii.length === ringCount) return;
+    ringCount = radii.length;
+    // The outermost radius is the black outer ring, already drawn by the face.
+    ringsEl.replaceChildren(
+      ...radii.slice(0, -1).map((r) => {
+        const div = document.createElement("div");
+        div.className = "radar-ring";
+        div.style.inset = `${Math.round(layout.radius - r)}px`;
+        return div;
+      }),
+    );
   }
 
   // The first-run walkthrough doubles as the awaiting-permission screen: clear
@@ -2158,23 +2570,46 @@ function bindPhoneFinder() {
   function showMessage(text: string) {
     messageEl.textContent = text;
     messageEl.style.display = "block";
-    canvas.style.display = "none";
-    headlineEl.style.display = "none";
+    radarEl.style.display = "none";
+    readoutEl.style.display = "none";
     detailEl.style.display = "none";
-    doneBtn.style.display = "none";
+    noteEl.textContent = "";
   }
   function showRadar() {
     messageEl.style.display = "none";
-    canvas.style.display = "block";
-    headlineEl.style.display = "block";
-    detailEl.style.display = "block";
+    radarEl.style.display = "block";
+    readoutEl.style.display = "flex";
+    detailEl.style.display = "flex";
   }
 
-  // The phone renderer: one FinderFrame → radar + headline, or a full-screen
-  // message for the awaiting/problem states (no radar to draw without a fix).
+  /** `formatDistance` produces one string ("140m", "1.2 km"); the layout wants
+   *  the number and the unit set at different sizes on a shared baseline. */
+  function splitDistance(text: string): [string, string] {
+    const m = /^([\d.,]+)\s*(.*)$/.exec(text);
+    return m ? [m[1], m[2]] : [text, ""];
+  }
+
+  /** "47 MIN AGO" for the readout row. Unlike `formatParkedAge` (which stays
+   *  silent until a position is old enough to be worth warning about) this row
+   *  always carries the age, so it reports from the first minute. */
+  function parkedAgo(parkedAtIso: string | null | undefined, now: number): string {
+    if (!parkedAtIso) return "";
+    const at = new Date(parkedAtIso).getTime();
+    if (isNaN(at) || at > now) return "";
+    const minutes = Math.floor((now - at) / 60_000);
+    if (minutes < 1) return "JUST NOW";
+    if (minutes < 60) return `${minutes} MIN AGO`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 48) return `${hours} HR AGO`;
+    return `${Math.floor(hours / 24)} DAYS AGO`;
+  }
+
+  // The phone renderer: one FinderFrame → the readout, the radar and the meta
+  // row, or a full-screen message for the awaiting/problem states (there is no
+  // radar to draw without a fix).
   phoneFinderRenderer = {
     render(frame: FinderFrame) {
-      if (!phoneFinderOpen || !ctx) return;
+      if (!phoneFinderOpen) return;
       const v = frame.view;
       const mode = v.mode;
       if (mode === "awaiting") {
@@ -2186,17 +2621,95 @@ function bindPhoneFinder() {
         return;
       }
       showRadar();
-      drawRadar(ctx, layout, frame);
+
+      // -- the two lines that lead --------------------------------------
       const unit = lastStatus?.range_unit ?? null;
-      headlineEl.textContent =
+      headlineEl.classList.toggle("is-text", mode === "arrived");
+      headlineEl.classList.toggle("is-dim", frame.distanceM == null);
+      if (mode === "arrived") {
+        distValueEl.textContent = "You're here";
+        distUnitEl.textContent = "";
+      } else if (frame.distanceM != null) {
+        const [value, distUnit] = splitDistance(
+          formatDistance(frame.distanceM, unit),
+        );
+        distValueEl.textContent = value;
+        distUnitEl.textContent = distUnit;
+      } else {
+        distValueEl.textContent = "—";
+        distUnitEl.textContent = "m";
+      }
+
+      // The heading phrase needs a direction the user is FACING. This app has
+      // no compass — it derives a travel course from successive fixes — so the
+      // phrase appears while walking and is simply absent while stopped, which
+      // is the handoff's "no heading" state. Nothing is guessed.
+      const relative =
+        frame.course != null && frame.bearingToCar != null
+          ? angleDelta(frame.bearingToCar, frame.course)
+          : null;
+      phraseEl.textContent =
         mode === "arrived"
-          ? v.headline
-          : frame.distanceM != null
-            ? formatDistance(frame.distanceM, unit)
-            : "Locating…";
-      // Same wording the glasses use: the keep-unlocked note, then the parked
-      // age, then the arrival advice.
-      detailEl.textContent = frame.noteActive
+          ? "Check nearby"
+          : frame.distanceM == null
+            ? "Getting your location"
+            : relative != null
+              ? headingPhrase(relative)
+              : "";
+
+      // -- the radar ------------------------------------------------------
+      const scene = computeScene(frame, layout);
+      renderRings(scene.ringRadii);
+
+      // North-up while stopped, course-up while walking (the map turns so
+      // "ahead" is up) — the N marker stays TRUE either way by counter-rotating
+      // with the scene.
+      const rotation = frame.course ?? 0;
+      northRotEl.style.transform = `rotate(${-rotation}deg)`;
+      northEl.style.transform = `translateX(-50%) rotate(${rotation}deg)`;
+
+      if (scene.car) {
+        carWrapEl.style.display = "block";
+        carWrapEl.style.transform = `translate(${scene.car.x - layout.cx}px, ${scene.car.y - layout.cy}px)`;
+      } else {
+        carWrapEl.style.display = "none";
+      }
+
+      // The rim arrowhead is the shared "walk this way" cue with the glasses
+      // and only means that while there IS a course. Stopped, it degrades to a
+      // grey marker of where the car lies on the north-up map — a direction,
+      // not an instruction. Arrival drops it entirely.
+      const arrowDeg =
+        mode === "arrived"
+          ? null
+          : (scene.arrowheadDeg ?? frame.bearingToCar ?? null);
+      if (arrowDeg == null) {
+        arrowEl.style.display = "none";
+      } else {
+        arrowEl.style.display = "block";
+        arrowEl.classList.toggle("is-muted", scene.arrowheadDeg == null);
+        arrowRotEl.style.transform = `rotate(${arrowDeg}deg)`;
+      }
+
+      const range = niceRange(frame.distanceM ?? 0).maxRange;
+      scaleEl.textContent = `R ${formatDistance(range, unit).toUpperCase()}`;
+
+      // -- the meta row ---------------------------------------------------
+      brgEl.textContent =
+        frame.bearingToCar != null
+          ? `BRG ${Math.round(frame.bearingToCar)}°`
+          : "WAITING FOR GPS";
+      cardinalEl.textContent =
+        frame.bearingToCar != null ? cardinal(frame.bearingToCar) : "";
+      ageEl.textContent = parkedAgo(
+        lastStatus?.location_last_updated ?? null,
+        Date.now(),
+      );
+
+      // The keep-unlocked note (the one thing the user can actually do about a
+      // watch a locked phone kills) sits under Done, out of the readout's way.
+      // Arrival advice takes the same line — same wording as the glasses.
+      noteEl.textContent = frame.noteActive
         ? KEEP_UNLOCKED_NOTE
         : mode === "arrived"
           ? v.detail
@@ -2204,9 +2717,6 @@ function bindPhoneFinder() {
               lastStatus?.location_last_updated ?? null,
               Date.now(),
             ) ?? "");
-      // Arrival has nowhere to auto-return to on the phone, so it offers Done.
-      // Note: "" would revert to the stylesheet's display:none — use a value.
-      doneBtn.style.display = mode === "arrived" ? "inline-block" : "none";
     },
   };
 
@@ -2219,7 +2729,7 @@ function bindPhoneFinder() {
     if (phoneFinderOpen) return;
     phoneFinderOpen = true;
     screenEl.style.display = "flex";
-    resizeCanvas();
+    resizeRadar();
     // Attach to the shared loop (starts a session, or joins the glasses one).
     attachPhoneFinder();
     // Ensure a car position: if the last status lacked one, poll now — the
@@ -2252,7 +2762,7 @@ function bindPhoneFinder() {
   backBtn.addEventListener("click", closeFinder);
   doneBtn.addEventListener("click", closeFinder);
   window.addEventListener("resize", () => {
-    if (phoneFinderOpen) resizeCanvas();
+    if (phoneFinderOpen) resizeRadar();
   });
 
   // DEV only (constant-folded out of production): `VITE_FINDER_AUTO=1` opens the
@@ -2268,29 +2778,78 @@ function bindPhoneFinder() {
 }
 
 // ---------------------------------------------------------------------------
-// Boot. Order matters: the first frame goes to the glasses before anything
-// else — in particular before the settings read, which must never sit
-// between launch and first paint (black-frame risk on a slow storage read).
+// Boot.
+//
+// Two independent surfaces, and only one of them needs the glasses. The phone
+// settings screen is plain DOM in this same WebView; it binds first and
+// unconditionally. Everything that drives the glasses waits on the host bridge,
+// which may arrive late or never — and that wait no longer blocks anything.
+//
+// This ordering is the fix for a phone page whose every button was dead. It
+// used to sit behind TWO gates that could each silently swallow it: the
+// unbounded `await waitForEvenAppBridge()` at the top of this file, and a
+// `createStartUpPageContainer` failure below, which skipped all binding and
+// shut the app down.
 
-const createResult = await bridge.createStartUpPageContainer(
-  new CreateStartUpPageContainer(connectPage(CONNECTING_TEXT, spinnerFrame(0))),
-);
-if (createResult !== 0) {
-  // No startup page means nothing can ever render — every later call would
-  // drive containers that don't exist. Exit cleanly instead of continuing.
-  console.error(`Startup page creation failed (${createResult}) — exiting`);
-  void bridge.shutDownPageContainer(0);
-} else {
-  settings = await loadSettings(bridge);
-  // Dev-server-only (never in a production build: DEV guard): fake
-  // credentials so the simulator can reach the HUD against a mock proxy
-  // (VITE_BACKEND_URL). The mock ignores credentials entirely.
-  if (import.meta.env.DEV && import.meta.env.VITE_FAKE_CREDS) {
-    settings = { ...settings, username: "simulator", password: "simulator" };
+// Separately, so one broken surface cannot silently disable the other. These
+// run in order, and `bindPhoneFinder` used to be last: anything thrown by
+// `bindPhoneUi` — one missing element, one unsupported DOM API — left the
+// finder's listeners unattached with no error anyone would see, which is
+// indistinguishable from the button being broken. The settings form and the
+// finder screen fail independently now.
+function bindSafely(what: string, bind: () => void) {
+  try {
+    bind();
+  } catch (err) {
+    console.error(`phone UI: ${what} failed to bind`, err);
   }
-  rebuildClient();
-  subscribeEvents();
-  void connectToBackend();
-  bindPhoneUi();
-  bindPhoneFinder();
 }
+bindSafely("settings form", bindPhoneUi);
+bindSafely("car finder", bindPhoneFinder);
+
+gate.onReady(async (host) => {
+  try {
+    // The first frame goes to the glasses before anything else — in particular
+    // before the settings read, which must never sit between launch and first
+    // paint (black-frame risk on a slow storage read).
+    const createResult = await host.createStartUpPageContainer(
+      new CreateStartUpPageContainer(
+        connectPage(CONNECTING_TEXT, spinnerFrame(0)),
+      ),
+    );
+
+    // Settings load whatever the glasses did: the phone form needs them even
+    // when the startup page was refused.
+    settings = await loadSettings(bridge);
+    // Dev-server-only (never in a production build: DEV guard): fake
+    // credentials so the simulator can reach the HUD against a mock proxy
+    // (VITE_BACKEND_URL). The mock ignores credentials entirely.
+    if (import.meta.env.DEV && import.meta.env.VITE_FAKE_CREDS) {
+      settings = { ...settings, username: "simulator", password: "simulator" };
+    }
+    rebuildClient();
+    // The form has been live on defaults since bindPhoneUi; give it the real
+    // values now (unless the user has already started typing).
+    hydratePhoneForm?.();
+
+    if (createResult !== 0) {
+      // No startup page means nothing can ever render ON THE GLASSES — every
+      // later call would drive containers that don't exist, so we neither
+      // subscribe nor connect. The app is deliberately NOT shut down: the phone
+      // settings screen is fully usable, and it is the only way to fix
+      // credentials or send a diagnostic report. Exiting here is what left the
+      // owner holding a page where nothing responded.
+      console.error(
+        `Startup page creation failed (${createResult}) — glasses UI disabled,` +
+          ` phone settings still available`,
+      );
+      return;
+    }
+    subscribeEvents();
+    void connectToBackend();
+  } catch (err) {
+    // Never an unhandled rejection: that would take the phone UI's console
+    // with it and tell the next round nothing.
+    console.error("glasses boot failed", err);
+  }
+});
