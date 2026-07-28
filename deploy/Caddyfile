@@ -13,3 +13,63 @@ car-proxy.berrydev.co.uk {
 	# "proxy" is the app service name on the internal compose network.
 	reverse_proxy proxy:8000
 }
+
+matchhud.berrydev.co.uk {
+	# MatchHUD droplet API — a separate compose project (matchhud), reachable by
+	# container name because it joined this same docker network. Port 8090; the
+	# Connect Remote proxy above is on 8000.
+	reverse_proxy matchhud-api:8090
+}
+
+ableshow.app, www.ableshow.app {
+	# AbleShow — live performance cues for Ableton + Even Realities G2.
+	# Static site served from /srv/ableshow (bind mount of
+	# /home/deploy/ableshow-site — see docker-compose.yml). Update the site by
+	# rsyncing into that directory; no reload needed for content changes.
+	root * /srv/ableshow
+
+	# Private stats dashboard (/stats) — basic auth. The HTML is generated into
+	# the webroot at stats/index.html by cron (ableshow-stats/gen-stats.sh); this
+	# matcher is the only thing keeping the numbers non-public.
+	@stats path /stats /stats/*
+	basic_auth @stats {
+		jack HASH-REDACTED-ROTATED-20260917
+	}
+
+	# Scan-tracked QR target. Every printed/embedded QR encodes /qr, so scans
+	# are countable in the access log below — one total across all QR variants
+	# (no per-variant breakdown, no analytics service). 302 -> canonical root.
+	redir /qr https://ableshow.app/ 302
+
+	# Serve the Max for Live device as a download, never inline. .amxd has no
+	# registered MIME type, so without an explicit Content-Type the file could
+	# be content-sniffed and rendered as text in the browser.
+	@amxd path *.amxd
+	header @amxd {
+		Content-Type application/octet-stream
+		Content-Disposition attachment
+	}
+
+	file_server
+
+	# Access log — enabled ONLY for this site block. The global default keeps
+	# logs OFF (the car-proxy block MUST stay unlogged; its request bodies carry
+	# car credentials). Written to the persisted caddy-data volume (/data) so it
+	# survives container restart/recreate. Count /qr scans with:
+	#   docker compose exec -T caddy grep -c '"uri":"/qr"' /data/logs/ableshow-access.log
+	log {
+		output file /data/logs/ableshow-access.log {
+			roll_size 10MiB
+			roll_keep 10
+		}
+		format json
+	}
+}
+
+transit.berrydev.co.uk {
+	# London Transit HUD TfL proxy — separate compose project
+	# (~/london-transit-hud/proxy), reachable by service alias on this shared
+	# docker network. The proxy injects the TfL app_key server-side. No access
+	# log (global default stays off).
+	reverse_proxy transit-proxy:8100
+}
