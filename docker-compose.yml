@@ -13,6 +13,10 @@ services:
       - "443:443"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # London Transit HUD static app (see transit.berrydev.co.uk site block)
+      - /home/deploy/london-transit-hud-site:/srv/transit:ro
+      # AbleShow landing page webroot (static files, rsynced by Jack/Claude).
+      - /home/deploy/ableshow-site:/srv/ableshow:ro
       # Certificates and ACME account state — must persist across restarts
       # or Let's Encrypt gets re-asked for certs (and will rate-limit).
       - caddy-data:/data

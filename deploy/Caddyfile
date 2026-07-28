@@ -67,9 +67,24 @@ ableshow.app, www.ableshow.app {
 }
 
 transit.berrydev.co.uk {
-	# London Transit HUD TfL proxy — separate compose project
-	# (~/london-transit-hud/proxy), reachable by service alias on this shared
-	# docker network. The proxy injects the TfL app_key server-side. No access
-	# log (global default stays off).
-	reverse_proxy transit-proxy:8100
+	# London Transit HUD — static app plus TfL/geocode proxy, one origin.
+	# API paths go to the transit-proxy container (separate compose project,
+	# ~/london-transit-hud/proxy, key injected server-side); everything else is
+	# the built web app served from /srv/transit (bind mount of
+	# /home/deploy/london-transit-hud-site — rsync new builds there, no reload
+	# needed). No access log (global default stays off).
+	handle /tfl/* {
+		reverse_proxy transit-proxy:8100
+	}
+	handle /geocode {
+		reverse_proxy transit-proxy:8100
+	}
+	handle /healthz {
+		reverse_proxy transit-proxy:8100
+	}
+	handle {
+		root * /srv/transit
+		try_files {path} /index.html
+		file_server
+	}
 }
