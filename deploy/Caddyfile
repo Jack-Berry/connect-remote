@@ -88,3 +88,25 @@ transit.berrydev.co.uk {
 		file_server
 	}
 }
+
+beriscope.co.uk, www.beriscope.co.uk {
+	# Beriscope — apps for the Even Realities G2, plus the in-browser HUD
+	# simulator. Static site served from /srv/beriscope (bind mount of
+	# /home/deploy/beriscope-site — see docker-compose.yml). Update the site by
+	# rsyncing a fresh `npm run build` into that directory; no reload needed for
+	# content changes.
+	#
+	# No try_files: this is a multi-page site with real directories
+	# (/contact/, /apps/ableshow/, /apps/connect-remote/), so file_server's own
+	# directory-index handling is correct. An SPA-style fallback here would
+	# serve the homepage for every typo instead of a 404.
+	#
+	# Both hostnames serve the same files rather than redirecting: every page
+	# already carries <link rel="canonical"> pointing at the apex, which is what
+	# tells search engines which one counts. Same pattern as the ableshow block.
+	#
+	# No access log — the global default keeps logs off and this site has no
+	# reason to turn them on.
+	root * /srv/beriscope
+	file_server
+}

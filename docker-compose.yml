@@ -17,6 +17,9 @@ services:
       - /home/deploy/london-transit-hud-site:/srv/transit:ro
       # AbleShow landing page webroot (static files, rsynced by Jack/Claude).
       - /home/deploy/ableshow-site:/srv/ableshow:ro
+      # Beriscope site webroot (see beriscope.co.uk site block). Static build
+      # output, rsynced from the beriscope-website repo's dist/.
+      - /home/deploy/beriscope-site:/srv/beriscope:ro
       # Certificates and ACME account state — must persist across restarts
       # or Let's Encrypt gets re-asked for certs (and will rate-limit).
       - caddy-data:/data
