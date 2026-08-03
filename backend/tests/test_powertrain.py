@@ -12,6 +12,7 @@ docs-internal/POWERTRAIN-FIELDS.md):
 """
 
 import json
+import logging
 import pathlib
 from types import SimpleNamespace
 
@@ -22,7 +23,11 @@ from hyundai_kia_connect_api.KiaUvoApiEU import KiaUvoApiEU
 from hyundai_kia_connect_api.KiaUvoApiUSA import KiaUvoApiUSA
 from hyundai_kia_connect_api.Vehicle import Vehicle
 
-from app.providers.genesis import GenesisProvider, _detect_powertrain
+from app.providers.genesis import (
+    GenesisProvider,
+    _detect_powertrain,
+    _powertrain_evidence,
+)
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
@@ -34,9 +39,9 @@ def load_fixture(name: str) -> dict:
 
 def make_provider(vehicle) -> GenesisProvider:
     provider = GenesisProvider.__new__(GenesisProvider)
-    provider._vehicle_id = "v1"
     provider._vm = SimpleNamespace(vehicles={"v1": vehicle})
-    provider._powertrain = None
+    provider._vehicles_loaded = True
+    provider._powertrains = {}
     provider._brand_name = "Kia"
     provider._region_name = "USA"
     return provider
@@ -99,7 +104,7 @@ def test_real_ev_fixtures_classify_as_ev(parse, fixture):
     ],
 )
 def test_real_ev_fixtures_suppress_fuel_fields(parse, fixture):
-    status = make_provider(parse(fixture))._to_status()
+    status = make_provider(parse(fixture))._to_status("v1")
     assert status.powertrain == "EV"
     assert status.fuel_level_percent is None
     assert status.fuel_range is None
@@ -223,7 +228,7 @@ def test_hev_status_carries_fuel_and_no_ev_fields():
         _fuel_driving_range_unit="mi",
         is_locked=True,
     )
-    status = make_provider(v)._to_status()
+    status = make_provider(v)._to_status("v1")
     assert status.powertrain == "HEV"
     assert status.fuel_level_percent == 62
     assert status.fuel_range == 310
@@ -245,7 +250,7 @@ def test_phev_status_carries_both_sides():
         total_driving_range=365,
         ev_battery_is_charging=False,
     )
-    status = make_provider(v)._to_status()
+    status = make_provider(v)._to_status("v1")
     assert status.powertrain == "PHEV"
     assert status.soc_percent == 80
     assert status.range_value == 25
@@ -265,7 +270,7 @@ def test_kia_us_ev_dte_fallback_never_becomes_fuel_range():
         fuel_level=0,
         fuel_driving_range=170,
     )
-    status = make_provider(v)._to_status()
+    status = make_provider(v)._to_status("v1")
     assert status.powertrain == "EV"
     assert status.fuel_range is None
     assert status.fuel_level_percent is None
@@ -273,7 +278,7 @@ def test_kia_us_ev_dte_fallback_never_becomes_fuel_range():
 
 def test_unknown_with_genuine_fuel_emits_fuel_fields():
     v = SimpleNamespace(fuel_level=62, fuel_driving_range=310)
-    status = make_provider(v)._to_status()
+    status = make_provider(v)._to_status("v1")
     assert status.powertrain == "UNKNOWN"
     assert status.fuel_level_percent == 62
     assert status.fuel_range == 310
@@ -281,10 +286,74 @@ def test_unknown_with_genuine_fuel_emits_fuel_fields():
 
 def test_unknown_without_fuel_evidence_suppresses_fuel_fields():
     v = SimpleNamespace(fuel_level=0, fuel_driving_range=170)
-    status = make_provider(v)._to_status()
+    status = make_provider(v)._to_status("v1")
     assert status.powertrain == "UNKNOWN"
     assert status.fuel_level_percent is None
     assert status.fuel_range is None
+
+
+# ---------------------------------------------------------------------------
+# UNKNOWN diagnosability. The 2026-08-03 production dump held a
+# Hyundai:USA:UNKNOWN whose populated field set was a strict subset of
+# Hyundai:USA:EV's — shapes carry no values, so they cannot say which conflict
+# branch fired. The log line has to.
+
+
+def test_evidence_distinguishes_the_two_unknown_branches():
+    # Both classify UNKNOWN; the evidence string must tell them apart.
+    ev_plus_fuel = SimpleNamespace(
+        engine_type=ENGINE_TYPES.EV, ev_battery_percentage=70, fuel_level=48
+    )
+    ice_plus_battery = SimpleNamespace(
+        engine_type=ENGINE_TYPES.ICE, ev_battery_percentage=70, fuel_level=0
+    )
+    assert _detect_powertrain(ev_plus_fuel) == "UNKNOWN"
+    assert _detect_powertrain(ice_plus_battery) == "UNKNOWN"
+
+    assert _powertrain_evidence(ev_plus_fuel) == (
+        "lib_type='EV' has_ev_battery=True has_fuel=True"
+    )
+    assert _powertrain_evidence(ice_plus_battery) == (
+        "lib_type='ICE' has_ev_battery=True has_fuel=False"
+    )
+
+
+def test_evidence_reports_absent_engine_type_as_none():
+    assert _powertrain_evidence(SimpleNamespace()) == (
+        "lib_type=None has_ev_battery=False has_fuel=False"
+    )
+
+
+def test_evidence_carries_no_field_values():
+    # The whole privacy argument for logging this: booleans and a type name,
+    # never a reading. A distinctive SoC/fuel level must not appear.
+    v = SimpleNamespace(
+        engine_type=ENGINE_TYPES.EV, ev_battery_percentage=73, fuel_level=41
+    )
+    evidence = _powertrain_evidence(v)
+    assert "73" not in evidence
+    assert "41" not in evidence
+
+
+def test_unknown_is_logged_at_warning_with_evidence(caplog):
+    v = SimpleNamespace(
+        engine_type=ENGINE_TYPES.EV, ev_battery_percentage=70, fuel_level=48
+    )
+    with caplog.at_level(logging.INFO):
+        assert make_provider(v)._to_status("v1").powertrain == "UNKNOWN"
+    record = next(r for r in caplog.records if "powertrain classified" in r.message)
+    assert record.levelno == logging.WARNING
+    assert "lib_type='EV' has_ev_battery=True has_fuel=True" in record.getMessage()
+
+
+def test_confident_classification_stays_at_info(caplog):
+    v = SimpleNamespace(
+        engine_type=ENGINE_TYPES.EV, ev_battery_percentage=68, fuel_level=0
+    )
+    with caplog.at_level(logging.INFO):
+        assert make_provider(v)._to_status("v1").powertrain == "EV"
+    record = next(r for r in caplog.records if "powertrain classified" in r.message)
+    assert record.levelno == logging.INFO
 
 
 def test_classification_is_sticky_within_a_session():
@@ -294,6 +363,6 @@ def test_classification_is_sticky_within_a_session():
         engine_type=ENGINE_TYPES.EV, ev_battery_percentage=68, fuel_level=0
     )
     provider = make_provider(v)
-    assert provider._to_status().powertrain == "EV"
+    assert provider._to_status("v1").powertrain == "EV"
     provider._vm.vehicles["v1"] = SimpleNamespace(fuel_level=55)
-    assert provider._to_status().powertrain == "EV"
+    assert provider._to_status("v1").powertrain == "EV"

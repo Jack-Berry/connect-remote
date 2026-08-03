@@ -32,6 +32,7 @@ from .base import (
     ClimateSettings,
     ProviderDataError,
     ReenrollRequired,
+    UnknownVehicleError,
     UpstreamError,
     VehicleStatus,
 )
@@ -84,12 +85,36 @@ def _detect_powertrain(v) -> str:
         return "HEV"
     if lib_type == "ICE":
         return "ICE" if not has_ev_battery else "UNKNOWN"
-    # engine_type missing entirely (AU/CN never set it): infer only the one
-    # unambiguous case. Fuel-only evidence can't separate HEV from ICE, and
-    # ev-battery + fuel can't be confirmed as PHEV — both stay UNKNOWN.
+    # engine_type missing entirely: infer only the one unambiguous case.
+    # Fuel-only evidence can't separate HEV from ICE, and ev-battery + fuel
+    # can't be confirmed as PHEV — both stay UNKNOWN.
+    # (This was documented as "AU/CN never set it"; the 2026-08-03 production
+    # dump shows Kia:Australia:EV *does* carry an ENGINE_TYPES enum, so this
+    # branch is now a defensive fallback rather than the AU path.)
     if has_ev_battery and not has_fuel:
         return "EV"
     return "UNKNOWN"
+
+
+def _powertrain_evidence(v) -> str:
+    """The three inputs _detect_powertrain branches on, rendered for a log
+    line: two booleans and an engine-type name, never a field value — the
+    same disclosure standard as the shape capture.
+
+    Exists because UNKNOWN is otherwise undiagnosable. In the 2026-08-03
+    production dump a Hyundai:USA:UNKNOWN appeared whose populated field set
+    was a strict *subset* of Hyundai:USA:EV's, so the shapes could not say
+    which conflict produced it (lib EV + genuine fuel, or lib ICE + an EV
+    battery). Settling that from shapes is impossible by construction —
+    shapes hold no values — and /debug/fields needs the user's credentials.
+    These three flags distinguish the branches and identify nobody."""
+    raw = getattr(v, "engine_type", None)
+    lib_type = getattr(raw, "value", raw)
+    has_ev_battery = getattr(v, "ev_battery_percentage", None) is not None
+    return (
+        f"lib_type={lib_type!r} has_ev_battery={has_ev_battery} "
+        f"has_fuel={_has_genuine_fuel(v)}"
+    )
 
 
 class GenesisProvider:
@@ -131,13 +156,18 @@ class GenesisProvider:
             pin=pin,
             token=stored_token,
         )
-        self._vehicle_id: str | None = None
+        # Vehicle discovery runs once per provider life; after that the VM's
+        # vehicles dict is the list. One account can hold several cars, so the
+        # chosen car is a per-call argument rather than provider state.
+        self._vehicles_loaded = False
         # Decides the wire unit for climate targets — US wants Fahrenheit.
         self._region = region
         # Classified on the first status fetch of this provider's life (== one
         # proxy session — the session cache owns provider lifetime), then
         # reused: a mid-session data blip must not flip the classification.
-        self._powertrain: str | None = None
+        # Keyed by vehicle id: one account can pair an EV with an ICE, and
+        # classifying one must never leak onto the other.
+        self._powertrains: dict[str, str] = {}
         # For shape capture keys — names, since ints would rot if the lib
         # renumbered.
         self._brand_name = BRANDS.get(brand, str(brand))
@@ -159,9 +189,9 @@ class GenesisProvider:
             text = re.sub(re.escape(value), "<credential>", text, flags=re.IGNORECASE)
         return text
 
-    def _prepare(self) -> str:
+    def _prepare(self, requested: str | None = None) -> str:
         """Refresh auth token (they expire — do this before every operation)
-        and return the vehicle id.
+        and return the vehicle id to operate on.
 
         Fresh logins fail transiently on the EU endpoints (they
         rate-limit/bot-check new sessions — a Hyundai/Kia quirk, independent
@@ -179,9 +209,11 @@ class GenesisProvider:
             if delay:
                 time.sleep(delay)
             try:
-                return self._prepare_once()
+                return self._prepare_once(requested)
             except UpstreamError:
                 raise  # e.g. no vehicles on the account — retrying won't help
+            except UnknownVehicleError:
+                raise  # the id will still not be on the account next attempt
             except PINMissingError as exc:
                 raise AuthError(self._scrub(exc)) from exc
             except AuthenticationOTPRequired:
@@ -202,21 +234,31 @@ class GenesisProvider:
             raise AuthError(detail) from last_exc
         raise UpstreamError(detail)
 
-    def _prepare_once(self) -> str:
+    def _prepare_once(self, requested: str | None = None) -> str:
         t0 = time.monotonic()
         self._vm.check_and_refresh_token()
         logger.info("timing: token check/login %.1fs", time.monotonic() - t0)
-        if self._vehicle_id is None:
+        if not self._vehicles_loaded:
             t1 = time.monotonic()
             self._vm.update_all_vehicles_with_cached_state()
             logger.info("timing: vehicle discovery %.1fs", time.monotonic() - t1)
-            ids = list(self._vm.vehicles)
-            if not ids:
-                raise UpstreamError("no vehicles on this Genesis account")
+            self._vehicles_loaded = True
+        ids = list(self._vm.vehicles)
+        if not ids:
+            raise UpstreamError("no vehicles on this Genesis account")
+        if requested is None:
+            # No selector: the account's first car, exactly as before multi-car
+            # support existed. Clients that never send one are unaffected —
+            # though on a multi-car account this is upstream list order, which
+            # isn't guaranteed stable, so the client is better off picking.
             if len(ids) > 1:
-                logger.warning("multiple vehicles found, using first: %s", ids)
-            self._vehicle_id = ids[0]
-        return self._vehicle_id
+                logger.info("no vehicle selected, using first of %d", len(ids))
+            return ids[0]
+        if requested not in self._vm.vehicles:
+            # Static message: the id isn't secret, but nothing about the
+            # account belongs in an error string that may be logged upstairs.
+            raise UnknownVehicleError("vehicle not found on this account")
+        return requested
 
     # -- Kia-US OTP enrollment -----------------------------------------
     # These are called only by the /kia-us/enroll/* endpoints.
@@ -302,19 +344,26 @@ class GenesisProvider:
 
             return {"device_token": self._safe_token_dict()}
 
-    def _to_status(self) -> VehicleStatus:
-        v = self._vm.vehicles[self._vehicle_id]
-        if self._powertrain is None:
-            self._powertrain = _detect_powertrain(v)
-            logger.info(
-                "powertrain classified: %s (%s/%s)",
-                self._powertrain,
+    def _to_status(self, vehicle_id: str) -> VehicleStatus:
+        v = self._vm.vehicles[vehicle_id]
+        powertrain = self._powertrains.get(vehicle_id)
+        if powertrain is None:
+            powertrain = _detect_powertrain(v)
+            self._powertrains[vehicle_id] = powertrain
+            # UNKNOWN means the evidence conflicted and the car is running on
+            # degraded output — surface it at WARNING with the branch inputs,
+            # so a real one is diagnosable from logs alone.
+            emit = logger.warning if powertrain == "UNKNOWN" else logger.info
+            emit(
+                "powertrain classified: %s (%s/%s) [%s]",
+                powertrain,
                 self._brand_name,
                 self._region_name,
+                _powertrain_evidence(v),
             )
         # Names + types only, never values; never raises (see shape_capture).
         shape_capture.store.record(
-            self._brand_name, self._region_name, self._powertrain, v
+            self._brand_name, self._region_name, powertrain, v
         )
         # Per-car opt-in, proven from this car's own payload; suppressed
         # wholesale when the car's data is older than warnings.MAX_WARNING_AGE
@@ -331,8 +380,8 @@ class GenesisProvider:
         # populated with their EV range via a distanceToEmpty fallback. For
         # UNKNOWN, genuine fuel evidence (non-zero level / low-fuel light) is
         # required — better a missing fuel line than a bogus one.
-        fuel_bearing = self._powertrain in ("PHEV", "HEV", "ICE") or (
-            self._powertrain == "UNKNOWN" and _has_genuine_fuel(v)
+        fuel_bearing = powertrain in ("PHEV", "HEV", "ICE") or (
+            powertrain == "UNKNOWN" and _has_genuine_fuel(v)
         )
         doors = [
             name
@@ -359,7 +408,7 @@ class GenesisProvider:
         )
         try:
             return VehicleStatus(
-                powertrain=self._powertrain,
+                powertrain=powertrain,
                 soc_percent=getattr(v, "ev_battery_percentage", None),
                 range_value=getattr(v, "ev_driving_range", None),
                 range_unit=range_unit,
@@ -386,66 +435,72 @@ class GenesisProvider:
                 # "parked 2h ago" line would silently never appear.
                 location_last_updated=getattr(v, "location_last_updated_at", None),
                 last_updated=getattr(v, "last_updated_at", None),
+                # Lets the client label the HUD when the account holds more
+                # than one car. Model is the fallback for an unnamed car.
+                vehicle_name=(
+                    getattr(v, "name", None) or getattr(v, "model", None)
+                ),
+                vehicle_count=len(self._vm.vehicles),
             )
         except ValidationError as exc:
             raise ProviderDataError(
                 f"Genesis returned data the backend can't parse: {exc}"
             ) from exc
 
-    def get_cached_status(self) -> VehicleStatus:
+    def get_cached_status(self, vehicle_id: str | None = None) -> VehicleStatus:
         t_req = time.monotonic()
         with self._lock:
             lock_wait = time.monotonic() - t_req
             try:
                 t0 = time.monotonic()
-                vehicle_id = self._prepare()
+                vid = self._prepare(vehicle_id)
                 t1 = time.monotonic()
-                self._vm.update_vehicle_with_cached_state(vehicle_id)
+                self._vm.update_vehicle_with_cached_state(vid)
                 logger.info(
                     "timing status: lock wait %.1fs, login/prepare %.1fs, cached fetch %.1fs",
                     lock_wait, t1 - t0, time.monotonic() - t1,
                 )
-                return self._to_status()
-            except (UpstreamError, ProviderDataError, AuthError):
+                return self._to_status(vid)
+            except (UpstreamError, ProviderDataError, AuthError, UnknownVehicleError):
                 raise
             except AuthenticationError as exc:  # token died mid-session
                 raise AuthError(self._scrub(exc)) from exc
             except Exception as exc:  # lib raises assorted request errors
                 raise UpstreamError(self._scrub(exc)) from exc
 
-    def force_refresh(self) -> VehicleStatus:
+    def force_refresh(self, vehicle_id: str | None = None) -> VehicleStatus:
         t_req = time.monotonic()
         with self._lock:
             lock_wait = time.monotonic() - t_req
             try:
                 t0 = time.monotonic()
-                vehicle_id = self._prepare()
+                vid = self._prepare(vehicle_id)
                 t1 = time.monotonic()
-                self._vm.force_refresh_vehicle_state(vehicle_id)
-                self._vm.update_vehicle_with_cached_state(vehicle_id)
+                self._vm.force_refresh_vehicle_state(vid)
+                self._vm.update_vehicle_with_cached_state(vid)
                 logger.info(
                     "timing refresh: lock wait %.1fs, login/prepare %.1fs, car refresh %.1fs",
                     lock_wait, t1 - t0, time.monotonic() - t1,
                 )
-                return self._to_status()
-            except (UpstreamError, ProviderDataError, AuthError):
+                return self._to_status(vid)
+            except (UpstreamError, ProviderDataError, AuthError, UnknownVehicleError):
                 raise
             except AuthenticationError as exc:
                 raise AuthError(self._scrub(exc)) from exc
             except Exception as exc:
                 raise UpstreamError(self._scrub(exc)) from exc
 
-    def get_raw_fields(self) -> dict:
+    def get_raw_fields(self, vehicle_id: str | None = None) -> dict:
         """Everything the lib knows about the car: dataclass fields, derived
         properties, and the untouched upstream payload. Deliberately does not
         build a VehicleStatus — this is the tool for diagnosing a car whose
         data VehicleStatus can't parse."""
         with self._lock:
             try:
-                vehicle_id = self._prepare()
-                self._vm.update_vehicle_with_cached_state(vehicle_id)
-                v = self._vm.vehicles[vehicle_id]
-            except (UpstreamError, AuthError):
+                vid = self._prepare(vehicle_id)
+                self._vm.update_vehicle_with_cached_state(vid)
+                v = self._vm.vehicles[vid]
+            except (UpstreamError, AuthError, UnknownVehicleError):
                 raise
             except AuthenticationError as exc:
                 raise AuthError(self._scrub(exc)) from exc
@@ -467,20 +522,57 @@ class GenesisProvider:
                 properties[name] = f"<error: {exc}>"
         return {"fields": fields, "properties": properties, "raw": v.data}
 
-    def lock(self) -> None:
-        self._command("lock", lambda vid: self._vm.lock(vid))
+    def list_vehicles(self) -> list[dict]:
+        """Every car on the account. Logs nothing about them: names are
+        owner-chosen and can be personal, and the proxy's whole posture is
+        that account data passes through without being recorded.
 
-    def unlock(self) -> None:
-        self._command("unlock", lambda vid: self._vm.unlock(vid))
+        Always re-discovers rather than trusting the session's cached list:
+        this is the endpoint whose entire job is answering "what cars do I
+        have", and serving a garage up to a session-TTL out of date would
+        hide a car the user just added — from the one screen built to show
+        it. It is user-initiated and rare, so the extra fetch is affordable
+        here in a way it would not be on the per-poll paths."""
+        with self._lock:
+            try:
+                self._vehicles_loaded = False
+                self._prepare()
+                return [
+                    {
+                        "id": v.id,
+                        "name": getattr(v, "name", None),
+                        "model": getattr(v, "model", None),
+                        "year": getattr(v, "year", None),
+                    }
+                    for v in self._vm.vehicles.values()
+                ]
+            except (UpstreamError, AuthError):
+                raise
+            except AuthenticationError as exc:
+                raise AuthError(self._scrub(exc)) from exc
+            except Exception as exc:
+                raise UpstreamError(self._scrub(exc)) from exc
 
-    def start_charge(self) -> None:
-        self._command("start_charge", lambda vid: self._vm.start_charge(vid))
+    def lock(self, vehicle_id: str | None = None) -> None:
+        self._command("lock", lambda vid: self._vm.lock(vid), vehicle_id)
 
-    def stop_charge(self) -> None:
-        self._command("stop_charge", lambda vid: self._vm.stop_charge(vid))
+    def unlock(self, vehicle_id: str | None = None) -> None:
+        self._command("unlock", lambda vid: self._vm.unlock(vid), vehicle_id)
 
-    def set_charge_limits(self, ac: int, dc: int) -> None:
-        self._command("charge_limits", lambda vid: self._vm.set_charge_limits(vid, ac, dc))
+    def start_charge(self, vehicle_id: str | None = None) -> None:
+        self._command("start_charge", lambda vid: self._vm.start_charge(vid), vehicle_id)
+
+    def stop_charge(self, vehicle_id: str | None = None) -> None:
+        self._command("stop_charge", lambda vid: self._vm.stop_charge(vid), vehicle_id)
+
+    def set_charge_limits(
+        self, ac: int, dc: int, vehicle_id: str | None = None
+    ) -> None:
+        self._command(
+            "charge_limits",
+            lambda vid: self._vm.set_charge_limits(vid, ac, dc),
+            vehicle_id,
+        )
 
     def _temperature_range(self) -> Sequence[float] | None:
         """The current implementation's accepted temperature values, if it
@@ -488,7 +580,7 @@ class GenesisProvider:
         before login, where wire_temp falls back to a 0.5°C grid."""
         return getattr(getattr(self._vm, "api", None), "temperature_range", None)
 
-    def set_climate(self, req: ClimateSettings) -> None:
+    def set_climate(self, req: ClimateSettings, vehicle_id: str | None = None) -> None:
         def run(vid: str) -> None:
             if req.on:
                 # req.temp is Celsius (the proxy's API contract); the library
@@ -518,9 +610,9 @@ class GenesisProvider:
             else:
                 self._vm.stop_climate(vid)
 
-        self._command("climate", run)
+        self._command("climate", run, vehicle_id)
 
-    def _command(self, name: str, fn) -> None:
+    def _command(self, name: str, fn, vehicle_id: str | None = None) -> None:
         # Timing split answers "why was the first command slow": lock wait is
         # time blocked behind the warm-up thread's login, login/prepare is our
         # own Genesis auth, and the command call is Genesis relaying to the car
@@ -530,14 +622,14 @@ class GenesisProvider:
             lock_wait = time.monotonic() - t_req
             try:
                 t0 = time.monotonic()
-                vid = self._prepare()
+                vid = self._prepare(vehicle_id)
                 t1 = time.monotonic()
                 fn(vid)
                 logger.info(
                     "timing command %s: lock wait %.1fs, login/prepare %.1fs, command call %.1fs",
                     name, lock_wait, t1 - t0, time.monotonic() - t1,
                 )
-            except (UpstreamError, AuthError):
+            except (UpstreamError, AuthError, UnknownVehicleError):
                 raise
             except AuthenticationError as exc:
                 raise AuthError(self._scrub(exc)) from exc
