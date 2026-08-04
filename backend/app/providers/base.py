@@ -99,6 +99,14 @@ class VehicleStatus(BaseModel):
     warnings: list[str] = []
     # True when this is served from cache because upstream is unreachable
     stale: bool = False
+    # Which car this is, for accounts holding more than one. The client shows
+    # the name in place of the brand word only when vehicle_count > 1 — with
+    # a single car the brand word is the friendlier label, and older clients
+    # that ignore both fields keep their existing display. Name is whatever
+    # the owner called it upstream, falling back to the model; no VIN, which
+    # the client has no use for.
+    vehicle_name: str | None = None
+    vehicle_count: int | None = None
 
 
 class ClimateSettings(BaseModel):
@@ -110,40 +118,66 @@ class ClimateSettings(BaseModel):
     duration_minutes: int = 10
 
 
+# One account can hold several cars, so every per-car call takes an optional
+# vehicle_id. None means "the account's first vehicle" — the behaviour before
+# multi-car support existed, kept exactly so clients that never send a
+# selector are unaffected. An id that isn't on the account raises
+# UnknownVehicleError.
+
+
 class StatusProvider(Protocol):
-    def get_cached_status(self) -> VehicleStatus:
+    def get_cached_status(self, vehicle_id: str | None = None) -> VehicleStatus:
         """Return vehicle state from the provider's server-side cache.
         Must NOT wake the car."""
         ...
 
-    def force_refresh(self) -> VehicleStatus:
+    def force_refresh(self, vehicle_id: str | None = None) -> VehicleStatus:
         """Wake the car and fetch fresh state. Expensive and rate-limited
         by the caller."""
         ...
 
-    def get_raw_fields(self) -> dict:
+    def get_raw_fields(self, vehicle_id: str | None = None) -> dict:
         """Return the upstream vehicle data as plain JSON-able values, without
         mapping it onto VehicleStatus — so it still works when the mapping is
         exactly what's broken. Callers must redact it before showing anyone."""
         ...
 
+    def list_vehicles(self) -> list[dict]:
+        """Every car on the account: id, name, model, year. The id is the
+        stable handle the client sends back as vehicle_id. Deliberately no
+        VIN — the client has no use for one and it is the most identifying
+        thing the upstream holds."""
+        ...
+
 
 class CommandProvider(Protocol):
-    def lock(self) -> None: ...
+    def lock(self, vehicle_id: str | None = None) -> None: ...
 
-    def unlock(self) -> None: ...
+    def unlock(self, vehicle_id: str | None = None) -> None: ...
 
-    def set_climate(self, req: ClimateSettings) -> None: ...
+    def set_climate(
+        self, req: ClimateSettings, vehicle_id: str | None = None
+    ) -> None: ...
 
-    def start_charge(self) -> None: ...
+    def start_charge(self, vehicle_id: str | None = None) -> None: ...
 
-    def stop_charge(self) -> None: ...
+    def stop_charge(self, vehicle_id: str | None = None) -> None: ...
 
-    def set_charge_limits(self, ac: int, dc: int) -> None: ...
+    def set_charge_limits(
+        self, ac: int, dc: int, vehicle_id: str | None = None
+    ) -> None: ...
 
 
 class UpstreamError(Exception):
     """Raised when the vehicle API is unreachable or rejects the request."""
+
+
+class UnknownVehicleError(Exception):
+    """Raised when a requested vehicle_id isn't on this account — the car was
+    sold, the account changed, or the client is holding a stale list. Kept
+    separate from UpstreamError so the proxy answers 404 (a client-fixable
+    "re-fetch your car list") rather than 502 ("the car company is down"),
+    and so it is never retried: a bad id will still be bad next attempt."""
 
 
 class AuthError(Exception):

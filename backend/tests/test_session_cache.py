@@ -80,3 +80,26 @@ def test_max_sessions_evicts_least_recently_used():
     cache.get_or_create(creds(username="c"))  # evicts "a"
     assert len(cache._sessions) == 2
     assert cache.get_or_create(creds(username="a")) is not first
+
+
+def test_vehicle_id_is_not_part_of_the_key():
+    """Two cars on one account share a login.
+
+    vehicle_id is a per-request selector, not account identity — keying on it
+    would mean a second full Connected Services login per car, and the EU
+    endpoints rate-limit fresh logins.
+    """
+    calls = []
+    cache = SessionCache(factory=lambda c: calls.append(c) or object())
+    s1 = cache.get_or_create(creds(vehicle_id="v1"))
+    s2 = cache.get_or_create(creds(vehicle_id="v2"))
+    assert s1 is s2
+    assert len(calls) == 1
+
+
+def test_last_known_starts_empty_and_is_per_vehicle():
+    cache = SessionCache(factory=lambda c: object())
+    session = cache.get_or_create(creds())
+    assert session.last_known == {}
+    session.last_known["v1"] = "status-a"
+    assert cache.get_or_create(creds()).last_known == {"v1": "status-a"}

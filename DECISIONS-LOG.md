@@ -3,6 +3,50 @@
 Significant product/architecture decisions, newest first. One entry per
 decision: what changed, why, and what it rules out.
 
+## 2026-08-03 — Multi-car: the selector rides on credentials, one login per account
+
+**Decision:** `Credentials` gains an optional `vehicle_id`, and a new
+`POST /vehicles` lists the account's cars (`id`, `name`, `model`, `year` —
+deliberately no VIN). Omitting the selector keeps the old behaviour exactly:
+the account's first vehicle. The phone shows a picker in the Account section
+only when the account holds 2+ cars, and the HUD swaps the brand word for the
+car's name in that case. Requested by a Hyundai owner with two cars on one
+Bluelink account.
+
+**Why the selector is part of `Credentials` and not the session key:** it is a
+per-request choice, not account identity — the same argument that keeps
+`device_token` out of the key. Keying on it would mean a second full Connected
+Services login per car, and the EU endpoints rate-limit fresh logins. Both
+cars therefore share one `VehicleManager`, which in turn forces the two pieces
+of genuinely per-car state to become per-car maps: `_powertrain` →
+`_powertrains[vehicle_id]` (an account can pair an EV with an ICE, and one
+cached classification would render the wrong HUD and suppress the wrong
+fields) and `Session.last_known` → keyed by vehicle (serving car A's cached
+status for a question about car B is a confidently wrong answer, and it would
+arrive flagged `stale` as if it were about B).
+
+**Unknown ids are 404, not 502, and never retried.** A sold car is
+client-fixable — re-run Test connection — whereas the apps map 502 to "service
+unreachable" and send users chasing credentials. Retrying a bad id would also
+burn the ~10 s login backoff on something that cannot come right next attempt.
+
+**Rules out / accepted costs:**
+- **Force-refresh throttling stays per-account**, so refreshing car A blocks
+  car B for 15 min and both share the 20/day cap. Upstream daily command
+  budgets are account-scoped; splitting the throttle per car would quietly
+  double what we ask of the upstream.
+- **Vehicle discovery still fetches every car** once per provider life
+  (`update_all_vehicles_with_cached_state`). Optimising it would change the
+  known-good single-car path, which cannot be validated without a real
+  two-car account.
+- **No glasses-side car switching.** The menu is length-capped and priority
+  trimmed; switching is a settings action, like region.
+- **No VIN in `/vehicles`.** It is the most identifying field upstream holds
+  and the client has no use for it.
+
+Testable without a two-car account: `FAKE_VEHICLES=2 python
+scripts/fake_backend.py` serves an EV plus a fuel-only hybrid.
+
 ## 2026-07-25 — Car-reported warnings: per-car opt-in, proven from the payload
 
 **Decision:** `/status` gains `warnings: []` — stable, severity-ranked keys,
@@ -258,5 +302,5 @@ locally on the phone.
 - Render deployment (`render.yaml`, cold-start wake logic in the app) is
   removed. Transient EU-endpoint login-rejection retries stay — that is a
   Hyundai/Kia platform quirk, not a Render one.
-- Hosting: DigitalOcean VPS, Ubuntu 24.04, Docker Compose (Caddy for TLS +
-  the FastAPI proxy, internal-only).
+- Hosting: a Linux VPS running Docker Compose (Caddy for TLS + the FastAPI
+  proxy, internal-only). See `deploy/README.md`.

@@ -20,6 +20,7 @@ import {
   finderView,
   formatDistance,
   formatParkedAge,
+  headingPhrase,
   isUsableFix,
   octant,
   octantWithHysteresis,
@@ -149,6 +150,37 @@ describe("formatParkedAge", () => {
     expect(formatParkedAge(undefined, now)).toBeNull();
     expect(formatParkedAge("not a date", now)).toBeNull();
     expect(formatParkedAge(ago(-3600_000), now)).toBeNull();
+  });
+});
+
+describe("headingPhrase", () => {
+  it("names the band, and the side the car is actually on", () => {
+    expect(headingPhrase(0)).toBe("Straight ahead");
+    expect(headingPhrase(-19)).toBe("Straight ahead");
+    expect(headingPhrase(45)).toBe("Ahead and to your right");
+    expect(headingPhrase(-45)).toBe("Ahead and to your left");
+    expect(headingPhrase(90)).toBe("To your right");
+    expect(headingPhrase(-90)).toBe("To your left");
+    expect(headingPhrase(135)).toBe("Behind you to the right");
+    expect(headingPhrase(-135)).toBe("Behind you to the left");
+    expect(headingPhrase(180)).toBe("Behind you");
+  });
+
+  it("takes an unnormalised relative angle, from either direction", () => {
+    // 315° to the right is 45° to the left, and must read that way.
+    expect(headingPhrase(315)).toBe("Ahead and to your left");
+    expect(headingPhrase(-315)).toBe("Ahead and to your right");
+    expect(headingPhrase(720)).toBe("Straight ahead");
+  });
+
+  it("never says a side it cannot mean", () => {
+    // Straight ahead and dead behind have no side; every other band must.
+    for (let deg = -180; deg <= 180; deg += 1) {
+      const phrase = headingPhrase(deg);
+      const sided = phrase.includes("right") || phrase.includes("left");
+      const abs = Math.abs(deg);
+      expect(sided).toBe(abs > 20 && abs <= 160);
+    }
   });
 });
 

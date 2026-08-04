@@ -1,19 +1,26 @@
-/** Phone-form powertrain rule: the charge-limits section (AC/DC prefs +
- *  "Send limits to car") exists only for cars that plug in. The fuelOnly
+/** Phone-form powertrain rule: the charge-limits section (AC/DC prefs + the
+ *  contextual send button) exists only for cars that plug in. The fuelOnly
  *  flag means the status carried a fuel level with no EV battery — which the
- *  proxy only emits on genuine fuel evidence, never for an EV. */
+ *  proxy only emits on genuine fuel evidence, never for an EV.
+ *
+ *  Also the temperature maths, and the two pure rules behind the send button:
+ *  what the car is known to hold, and whether that disagrees with the form. */
 
 import { describe, expect, it } from "vitest";
 
 import {
+  CHARGE_LIMITS_SETTLE_MS,
   DEFAULT_SETTINGS,
   type AppSettings,
+  carKnownLimits,
   chargeLimitsRelevant,
   formatTemp,
   fromCanonicalC,
+  limitsNeedSending,
   resolveTempUnit,
   tempBounds,
   tempFieldState,
+  tempStep,
   toCanonicalC,
 } from "./settings";
 
@@ -159,6 +166,120 @@ describe("tempFieldState", () => {
         expect(Number(f.value)).toBeLessThanOrEqual(Number(f.max));
       }
     }
+  });
+});
+
+describe("stepping the climate target in Fahrenheit", () => {
+  // The stored value is Celsius on a 0.5 grid; the F field steps in whole
+  // degrees. A 1°F step is 0.56°C — only slightly wider than the 0.5°C grid —
+  // so this is exactly where a stepper can start showing the same number twice
+  // in a row, or a decimal that no car resolves. Walk the whole range.
+  const { min, max } = tempBounds("F");
+  const sweep = Array.from({ length: max - min + 1 }, (_, i) => min + i);
+
+  it("steps in whole degrees, so the field can never show a decimal", () => {
+    expect(tempStep("F")).toBe(1);
+    for (const f of sweep) expect(Number.isInteger(f)).toBe(true);
+  });
+
+  it("never shows the same reading twice — every °F is a distinct target", () => {
+    // The failure this rules out: two adjacent F readings snapping to the same
+    // 0.5°C, so pressing + appears to do nothing after a save/reload.
+    const stored = sweep.map((f) => toCanonicalC(f, "F"));
+    expect(new Set(stored).size).toBe(sweep.length);
+    for (let i = 1; i < stored.length; i++) {
+      expect(stored[i]).toBeGreaterThan(stored[i - 1]);
+    }
+  });
+
+  it("survives the round trip through 0.5°C storage at every step", () => {
+    // Step to a value, save, reopen: the field must read back what was set.
+    for (const f of sweep) {
+      const field = tempFieldState(toCanonicalC(f, "F"), "F");
+      expect(field.value).toBe(String(f));
+    }
+  });
+
+  it("keeps the whole sweep inside the field's own bounds", () => {
+    for (const f of sweep) {
+      const c = toCanonicalC(f, "F");
+      expect(c).toBeGreaterThanOrEqual(14);
+      expect(c).toBeLessThanOrEqual(30);
+      expect(fromCanonicalC(c, "F")).toBeGreaterThanOrEqual(min);
+      expect(fromCanonicalC(c, "F")).toBeLessThanOrEqual(max);
+    }
+  });
+});
+
+describe("carKnownLimits", () => {
+  const sent = { ac: 80, dc: 90, at: 1_000_000 };
+
+  it("believes the car when it reports its own limits", () => {
+    expect(carKnownLimits(undefined, { ac: 70, dc: 100 }, 0)).toEqual({
+      ac: 70,
+      dc: 100,
+    });
+  });
+
+  it("believes a fresh send over a status that hasn't caught up", () => {
+    // The car takes 30–90 s to apply; a poll inside that window still reports
+    // the old values, and trusting it would re-raise the send button seconds
+    // after a successful send.
+    const now = sent.at + CHARGE_LIMITS_SETTLE_MS - 1;
+    expect(carKnownLimits(sent, { ac: 50, dc: 50 }, now)).toEqual({
+      ac: 80,
+      dc: 90,
+    });
+  });
+
+  it("hands authority back to the car once the send has settled", () => {
+    // Otherwise a limit changed in the manufacturer's own app would be masked
+    // forever by a stale send record.
+    const now = sent.at + CHARGE_LIMITS_SETTLE_MS + 1;
+    expect(carKnownLimits(sent, { ac: 50, dc: 50 }, now)).toEqual({
+      ac: 50,
+      dc: 50,
+    });
+  });
+
+  it("trusts the last send FOREVER when the car reports nothing", () => {
+    // Plenty of EVs never send charge_limit_ac/dc. There is no second source to
+    // hand authority back to, so the settle window must not apply — ageing the
+    // send out would leave the button permanently offered on a car that can
+    // never satisfy it, greeting the user on every launch with an action they
+    // have already taken. A partial report is no report.
+    const aYearLater = sent.at + 365 * 24 * 3600_000;
+    expect(carKnownLimits(sent, {}, aYearLater)).toEqual({ ac: 80, dc: 90 });
+    expect(carKnownLimits(sent, { ac: 70, dc: null }, aYearLater)).toEqual({
+      ac: 80,
+      dc: 90,
+    });
+    // Which is the whole point: the button stays down until the form moves.
+    expect(limitsNeedSending(80, 90, carKnownLimits(sent, {}, aYearLater))).toBe(
+      false,
+    );
+    expect(
+      limitsNeedSending(80, 100, carKnownLimits(sent, {}, aYearLater)),
+    ).toBe(true);
+  });
+
+  it("admits it doesn't know when neither source has anything", () => {
+    expect(carKnownLimits(undefined, {}, 0)).toBeNull();
+    expect(carKnownLimits(undefined, { ac: 70 }, 0)).toBeNull();
+  });
+});
+
+describe("limitsNeedSending", () => {
+  it("offers the send only while the form and the car disagree", () => {
+    expect(limitsNeedSending(80, 90, { ac: 80, dc: 90 })).toBe(false);
+    expect(limitsNeedSending(90, 90, { ac: 80, dc: 90 })).toBe(true);
+    expect(limitsNeedSending(80, 100, { ac: 80, dc: 90 })).toBe(true);
+  });
+
+  it("offers the send when nothing is known about the car", () => {
+    // A car that doesn't report its limits and has never been sent any is the
+    // one case where the user has no other way to find out.
+    expect(limitsNeedSending(80, 90, null)).toBe(true);
   });
 });
 

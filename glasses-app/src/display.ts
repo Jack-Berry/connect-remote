@@ -58,6 +58,13 @@ export const FINDER_IMG_CONTAINER = {
 // label ("Refresh · updated 14:12" ≈ 200px + list item padding).
 export const MENU_LIST_WIDTH = 272;
 export const HUD_PADDING = 4;
+// Bottom band geometry. Three ~32px lines ending flush with the panel's
+// bottom edge (192 + 96 = 288), so the everyday one- and two-line content
+// lands on exactly the pixels it did when this box was 64px at y=224 — see
+// bottomAlign. The third line exists for a warning stacked above a charging
+// PHEV's EV+charging pair, the tallest combination the band can produce.
+export const HUD_NOTE_Y = 192;
+export const HUD_NOTE_H = 96;
 // Top row spans only the central 80% of the canvas — flush to the panel
 // edges it looked lopsided (left item tighter to the edge than the right).
 export const HUD_ROW_X = 58;
@@ -195,6 +202,70 @@ export function buildMenuItems(
   }));
 }
 
+/**
+ * Which items survive when the host will only take a short list, best first.
+ * "Find my car" ranks second — immediately after the way back — because a
+ * truncated menu that can't reach the finder is a menu that can't do the one
+ * thing this round exists for. (1.4.4 shipped a blind `slice(0, 3)`, which cut
+ * exactly that item and stranded the owner.)
+ *
+ * Quit ranks third so it survives even a three-slot menu — a list with no
+ * visible way out reads as broken — but `prioritiseMenu` pins it to the BOTTOM
+ * of the rendered list: an exit item in the middle of the menu is a mis-tap
+ * waiting to happen.
+ */
+export const MENU_PRIORITY: MenuKey[] = [
+  "hud",
+  "finder",
+  "quit",
+  "unlock",
+  "lock",
+  "climateOn",
+  "climateOff",
+  "refresh",
+  "chargeStart",
+  "chargeStop",
+];
+
+/**
+ * Keep the `max` highest-priority items (`max` of 0 = no cap), then restore a
+ * sensible reading order: the order `buildMenuItems` produced, with Quit last.
+ *
+ * Lives here rather than in main.ts because main.ts is unreachable from a test
+ * — the same trap that hid the 1.4.0 router regression. This function decides
+ * which item a tap index means, so it is the last place in the app that should
+ * be untestable.
+ */
+export function prioritiseMenu(items: MenuItem[], max: number): MenuItem[] {
+  const tidy = (list: MenuItem[]) => [
+    ...list.filter((i) => i.key !== "quit"),
+    ...list.filter((i) => i.key === "quit"),
+  ];
+  if (!max || items.length <= max) return tidy(items);
+  const rank = (i: MenuItem) => {
+    const r = MENU_PRIORITY.indexOf(i.key);
+    return r === -1 ? MENU_PRIORITY.length : r;
+  };
+  const kept = new Set(
+    [...items].sort((a, b) => rank(a) - rank(b)).slice(0, max),
+  );
+  return tidy(items.filter((i) => kept.has(i)));
+}
+
+/**
+ * Do these two lists describe the same on-screen menu?
+ *
+ * CALLERS MUST COMPARE LIKE WITH LIKE. This is the diff that decides whether a
+ * status poll may leave the menu alone or must rebuild the whole page, and it
+ * was fed a freshly-built (untruncated) list on one side and the truncated list
+ * actually on screen on the other. Those can never be equal once the host caps
+ * the item count, so every poll rebuilt the menu — including the one `openMenu`
+ * fires the instant the menu appears. That rebuild recreates the list container
+ * under the user's finger: the host's selection resets to item 0, so a tap
+ * aimed at "Find my car" lands on "Return to HUD" and reads as the press being
+ * ignored. Run the fresh list through `prioritiseMenu` with the accepted
+ * variant's cap before calling this.
+ */
 export function sameMenu(a: MenuItem[], b: MenuItem[]): boolean {
   return (
     a.length === b.length && a.every((item, i) => item.label === b[i].label)
@@ -284,29 +355,57 @@ export function formatHudRow(status: VehicleStatus | null): string {
   return justifyRow(items, HUD_ROW_INNER_W);
 }
 
-// HUD bottom block, centred. Transient notes (command sent / errors) take
-// precedence over everything, then:
+// How many ~32px text lines the bottom band's container can hold. The band is
+// bottom-aligned by padding short blocks up to this many lines, so the
+// everyday one-line content (charging / a note) sits exactly where it always
+// has while a three-line stack still has somewhere to go. See
+// HUD_NOTE_Y/HUD_NOTE_H in main.ts — they must agree with this.
+export const HUD_NOTE_LINES = 3;
+
+// HUD bottom block, centred and bottom-aligned. Transient notes (command sent
+// / errors) take precedence over everything, then, stacked top-down:
+//   · a car-reported warning (~5 s, highest severity only — see warnings.ts);
 //   · both-sides cars (PHEV): the EV line ("25 mi  55%"), with the charging
 //     line stacked directly below it while charging — same spot where a
 //     pure EV's charging line lives;
 //   · pure EV: the charging line while charging;
 //   · a car with no renderable energy data at all: an honest "limited data"
 //     notice so the near-empty top row doesn't read as a malfunction.
+//
+// The warning STACKS ABOVE the energy lines rather than evicting them: on a
+// PHEV that band is the car's only EV readout, and blanking it for five
+// seconds to report low washer fluid would be a bad trade. It does replace
+// the "limited data" fallback, which exists only to fill an empty band.
 export function formatHudBottom(
   status: VehicleStatus | null,
   note = "",
+  warning = "",
 ): string {
   let text = note;
-  if (!text && status) {
+  if (!text) {
     const lines: string[] = [];
-    if (isBothSides(status)) lines.push(evItems(status).join("  "));
-    if (status.charging) lines.push(chargingLine(status));
-    if (!lines.length && !hasEnergyData(status))
-      lines.push("Limited data for this vehicle");
+    if (warning) lines.push(warning);
+    if (status) {
+      if (isBothSides(status)) lines.push(evItems(status).join("  "));
+      if (status.charging) lines.push(chargingLine(status));
+      if (!lines.length && !hasEnergyData(status))
+        lines.push("Limited data for this vehicle");
+    }
     text = lines.join("\n");
   }
   if (!text) return " ";
-  return centerBlock(text, HUD_INNER_W);
+  return bottomAlign(centerBlock(text, HUD_INNER_W));
+}
+
+// Pad a block up to HUD_NOTE_LINES with blank lines ON TOP. The container
+// renders from its top edge, so without this a two-line block would start
+// where a one-line block starts and the whole band would visibly jump every
+// time the charging line appeared. A space, not an empty string: an empty
+// line's height is the renderer's business, a space's is not.
+function bottomAlign(block: string): string {
+  const lines = block.split("\n");
+  const pad = Math.max(0, HUD_NOTE_LINES - lines.length);
+  return [...Array(pad).fill(" "), ...lines].join("\n");
 }
 
 // Connecting page: no HUD until the first successful /status — a HUD of

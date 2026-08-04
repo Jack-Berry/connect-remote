@@ -8,6 +8,7 @@ from app.providers.base import (
     AuthError,
     ProviderDataError,
     ReenrollRequired,
+    UnknownVehicleError,
     UpstreamError,
     VehicleStatus,
 )
@@ -49,13 +50,25 @@ class FakeProvider:
         self.fail_auth = False
         self.fail_reenroll = False
         self.commands: list[str] = []
+        # Every vehicle_id the app threaded down, in call order — proves the
+        # selector reaches the provider rather than being dropped en route.
+        self.seen_vehicle_ids: list[str | None] = []
+        # Ids this fake claims to own; anything else raises like the real one.
+        self.known_ids = ["v1", "v2"]
+        self.vehicles = [
+            {"id": "v1", "name": "Ioniq", "model": "IONIQ 5", "year": 2024},
+            {"id": "v2", "name": None, "model": "TUCSON", "year": 2021},
+        ]
         # Enrollment tracking
         self.enrollment_started = False
         self.enrollment_verified = False
         self.enrollment_fail_verify = False
         self.enrollment_expired = False
 
-    def _check(self):
+    def _check(self, vehicle_id=None):
+        self.seen_vehicle_ids.append(vehicle_id)
+        if vehicle_id is not None and vehicle_id not in self.known_ids:
+            raise UnknownVehicleError("vehicle not found on this account")
         if self.fail_reenroll:
             raise ReenrollRequired("device enrollment required")
         if self.fail_auth:
@@ -65,18 +78,30 @@ class FakeProvider:
         if self.fail_parse:
             raise ProviderDataError("soc_percent: int_from_float")
 
-    def get_cached_status(self):
-        self._check()
+    def get_cached_status(self, vehicle_id=None):
+        self._check(vehicle_id)
         return self.status
 
-    def force_refresh(self):
-        self._check()
+    def force_refresh(self, vehicle_id=None):
+        self._check(vehicle_id)
         return self.status
 
-    def get_raw_fields(self):
+    def list_vehicles(self):
+        if self.fail_reenroll:
+            raise ReenrollRequired("device enrollment required")
+        if self.fail_auth:
+            raise AuthError("bad credentials")
+        if self.fail:
+            raise UpstreamError("upstream down")
+        return self.vehicles
+
+    def get_raw_fields(self, vehicle_id=None):
         # Like the real provider: never builds VehicleStatus, so a parse
         # failure (fail_parse) can't stop it — only auth/upstream failures.
         # ReenrollRequired fires from _prepare, which get_raw_fields calls too.
+        self.seen_vehicle_ids.append(vehicle_id)
+        if vehicle_id is not None and vehicle_id not in self.known_ids:
+            raise UnknownVehicleError("vehicle not found on this account")
         if self.fail_reenroll:
             raise ReenrollRequired("device enrollment required")
         if self.fail_auth:
@@ -95,28 +120,28 @@ class FakeProvider:
             "raw": {"vehicleStatus": {"evStatus": {"batteryStatus": 74.5}}},
         }
 
-    def lock(self):
-        self._check()
+    def lock(self, vehicle_id=None):
+        self._check(vehicle_id)
         self.commands.append("lock")
 
-    def unlock(self):
-        self._check()
+    def unlock(self, vehicle_id=None):
+        self._check(vehicle_id)
         self.commands.append("unlock")
 
-    def set_climate(self, req):
-        self._check()
+    def set_climate(self, req, vehicle_id=None):
+        self._check(vehicle_id)
         self.commands.append(f"climate:{req.on}:{req.temp}:{req.defrost}:{req.heating}")
 
-    def set_charge_limits(self, ac, dc):
-        self._check()
+    def set_charge_limits(self, ac, dc, vehicle_id=None):
+        self._check(vehicle_id)
         self.commands.append(f"charge-limits:{ac}:{dc}")
 
-    def start_charge(self):
-        self._check()
+    def start_charge(self, vehicle_id=None):
+        self._check(vehicle_id)
         self.commands.append("charge:start")
 
-    def stop_charge(self):
-        self._check()
+    def stop_charge(self, vehicle_id=None):
+        self._check(vehicle_id)
         self.commands.append("charge:stop")
 
     def start_enrollment(self, notify_type):
@@ -824,3 +849,130 @@ def test_device_token_field_is_optional_and_backward_compatible(client):
         json={"credentials": {**CREDS, "device_token": None}},
     )
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Multi-car. The selector rides on credentials (like device_token) so every
+# endpoint gets it for free; it must never leak into the session cache key.
+
+
+def car(vehicle_id, **extra) -> dict:
+    return {"credentials": {**CREDS, "vehicle_id": vehicle_id}, **extra}
+
+
+def test_vehicles_lists_the_account(client, factory):
+    r = client.post("/vehicles", json=body())
+    assert r.status_code == 200
+    assert r.json() == {
+        "vehicles": [
+            {"id": "v1", "name": "Ioniq", "model": "IONIQ 5", "year": 2024},
+            {"id": "v2", "name": None, "model": "TUCSON", "year": 2021},
+        ]
+    }
+
+
+def test_vehicles_response_carries_no_vin(client, factory):
+    assert "VIN" not in client.post("/vehicles", json=body()).text.upper()
+
+
+def test_vehicles_bad_credentials_is_401(client, factory):
+    factory.provider.fail_auth = True
+    assert client.post("/vehicles", json=body()).status_code == 401
+
+
+def test_vehicles_upstream_error_is_502(client, factory):
+    factory.provider.fail = True
+    assert client.post("/vehicles", json=body()).status_code == 502
+
+
+def test_selector_reaches_the_provider(client, factory):
+    client.post("/status", json=car("v2"))
+    assert factory.provider.seen_vehicle_ids == ["v2"]
+
+
+def test_absent_selector_stays_none(client, factory):
+    # Backward compatibility: an already-shipped app sends no vehicle_id and
+    # the provider must see None (its "first vehicle" default), not "".
+    client.post("/status", json=body())
+    assert factory.provider.seen_vehicle_ids == [None]
+
+
+def test_selector_reaches_every_command(client, factory):
+    client.post("/lock", json=car("v2"))
+    client.post("/unlock", json=car("v2"))
+    client.post("/charge", json=car("v2", on=True))
+    client.post("/charge-limits", json=car("v2", ac=80, dc=90))
+    client.post("/climate", json=car("v2", on=True, temp=21))
+    client.post("/debug/fields", json=car("v2"))
+    assert factory.provider.seen_vehicle_ids == ["v2"] * 6
+
+
+def test_unknown_vehicle_is_404_not_502(client, factory):
+    # A sold car is the client's problem to fix (re-fetch the list), not an
+    # upstream outage — and the app maps 502 to "service unreachable".
+    r = client.post("/status", json=car("v9"))
+    assert r.status_code == 404
+    assert "refresh the car list" in r.json()["detail"]
+
+
+def test_unknown_vehicle_detail_names_no_ids(client, factory):
+    assert "v9" not in client.post("/status", json=car("v9")).json()["detail"]
+
+
+def test_unknown_vehicle_on_a_command_is_404(client, factory):
+    assert client.post("/lock", json=car("v9")).status_code == 404
+
+
+def test_unknown_vehicle_does_not_evict_the_session(client, factory):
+    # The login is perfectly good; only the id was wrong.
+    client.post("/status", json=body())
+    client.post("/status", json=car("v9"))
+    client.post("/status", json=body())
+    assert factory.calls == 1
+
+
+def test_both_cars_share_one_login(client, factory):
+    client.post("/status", json=car("v1"))
+    client.post("/status", json=car("v2"))
+    assert factory.calls == 1
+
+
+def test_stale_status_is_not_served_across_cars(client, factory):
+    # The bug this guards: one last_known per account would answer a question
+    # about car B with car A's cached state — confidently wrong, and marked
+    # `stale` as if it were about B.
+    client.post("/status", json=car("v1"))
+    factory.provider.fail = True
+    assert client.post("/status", json=car("v2")).status_code == 502
+    r = client.post("/status", json=car("v1"))
+    assert r.status_code == 200 and r.json()["stale"] is True
+
+
+def test_stale_slots_are_separate_for_selector_and_no_selector(client, factory):
+    client.post("/status", json=body())
+    factory.provider.fail = True
+    assert client.post("/status", json=car("v2")).status_code == 502
+    assert client.post("/status", json=body()).json()["stale"] is True
+
+
+def test_vehicle_id_does_not_change_the_session_key(client, factory):
+    from app.session_cache import credentials_key
+
+    key = credentials_key(
+        CREDS["username"], CREDS["password"], CREDS["pin"],
+        CREDS["region"], CREDS["brand"],
+    )
+    client.post("/status", json=car("v2"))
+    assert list(client.app.state.cache._sessions) == [key]
+
+
+def test_status_reports_vehicle_name_and_count(client, factory):
+    factory.provider.status = make_status(vehicle_name="Ioniq", vehicle_count=2)
+    r = client.post("/status", json=car("v1")).json()
+    assert (r["vehicle_name"], r["vehicle_count"]) == ("Ioniq", 2)
+
+
+def test_status_without_vehicle_fields_still_validates(client, factory):
+    # An older provider (or a single-car account) sends neither field.
+    r = client.post("/status", json=body()).json()
+    assert r["vehicle_name"] is None and r["vehicle_count"] is None

@@ -11,7 +11,7 @@ expiry, eviction) only costs the next request a fresh login.
 import hashlib
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .providers.base import VehicleStatus
@@ -31,8 +31,12 @@ class Session:
     # Implements both StatusProvider and CommandProvider (see providers.base).
     provider: Any
     last_used: float
-    # Last successful status, served marked-stale when upstream is down.
-    last_known: VehicleStatus | None = None
+    # Last successful status per vehicle, served marked-stale when upstream is
+    # down. Keyed by the requested vehicle id ("" when the client sent no
+    # selector, i.e. the account's first car): one account can hold several
+    # cars, and serving car A's cached status for a request about car B would
+    # be a confidently wrong answer rather than an honest failure.
+    last_known: dict[str, VehicleStatus] = field(default_factory=dict)
 
 
 class SessionCache:

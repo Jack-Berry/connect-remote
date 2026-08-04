@@ -30,6 +30,7 @@ from .providers.base import (
     ClimateSettings,
     ProviderDataError,
     ReenrollRequired,
+    UnknownVehicleError,
     UpstreamError,
     VehicleStatus,
 )
@@ -152,6 +153,12 @@ class Credentials(BaseModel):
     # rmtoken). Sent per-request so the proxy stays stateless. Not included
     # in the session cache key — it's derived state, not account identity.
     device_token: dict | None = Field(default=None, repr=False)
+    # Which car, for accounts holding more than one. Omitted means "the
+    # account's first vehicle" — the behaviour before multi-car support, so
+    # already-shipped app versions are unaffected. Like device_token this is
+    # a per-request selector, not account identity, so it is NOT part of the
+    # session cache key: both cars share one login.
+    vehicle_id: str | None = Field(default=None)
 
     @field_validator("region")
     @classmethod
@@ -188,6 +195,21 @@ class ChargeLimitsBody(CredentialedRequest):
     # car reject odd steps rather than second-guessing per-model rules.
     ac: int = Field(ge=50, le=100)
     dc: int = Field(ge=50, le=100)
+
+
+class VehicleInfo(BaseModel):
+    # `id` is the stable handle the client sends back as credentials.vehicle_id
+    # — unlike list position, it survives the upstream reordering the account.
+    # No VIN: the client has no use for one, and it is the most identifying
+    # field the upstream holds.
+    id: str
+    name: str | None = None
+    model: str | None = None
+    year: int | None = None
+
+
+class VehiclesResponse(BaseModel):
+    vehicles: list[VehicleInfo]
 
 
 class CommandAccepted(BaseModel):
@@ -236,6 +258,18 @@ def _reenroll_needed(request: Request, session: Session, exc: ReenrollRequired) 
     return HTTPException(status_code=409, detail=str(exc))
 
 
+def _unknown_vehicle() -> HTTPException:
+    """The requested vehicle_id isn't on this account — sold, swapped, or the
+    client is holding a stale car list. 404 (client-fixable by re-fetching
+    /vehicles), not 502, and no session eviction: the login is perfectly
+    good. The detail deliberately names no ids."""
+    return HTTPException(
+        status_code=404,
+        detail="that car is no longer on this account — "
+        "run Test connection again to refresh the car list",
+    )
+
+
 def _auth_ok(request: Request) -> None:
     """An upstream call authenticated fine — forget the IP's failed sign-ins
     so a user who mistypes, then fixes it, never accumulates toward a block."""
@@ -264,15 +298,21 @@ def healthz() -> dict:
 @app.post("/status", response_model=VehicleStatus)
 def get_status(body: CredentialedRequest, request: Request) -> VehicleStatus:
     session = _session(request, body.credentials)
+    # "" is the no-selector slot: whichever car the provider defaults to.
+    vid_key = body.credentials.vehicle_id or ""
     try:
-        status = session.provider.get_cached_status()
-        session.last_known = status
+        status = session.provider.get_cached_status(
+            vehicle_id=body.credentials.vehicle_id
+        )
+        session.last_known[vid_key] = status
         _auth_ok(request)
         return status
     except ReenrollRequired as exc:
         raise _reenroll_needed(request, session, exc)
     except AuthError as exc:
         raise _auth_failed(request, session, exc)
+    except UnknownVehicleError:
+        raise _unknown_vehicle()
     except ProviderDataError as exc:
         # Upstream answered but we couldn't decode it — a backend bug, not an
         # outage. Surface it loudly instead of masking it with stale data;
@@ -280,16 +320,17 @@ def get_status(body: CredentialedRequest, request: Request) -> VehicleStatus:
         raise _parse_bug_response(exc)
     except UpstreamError as exc:
         # Degrade gracefully: serve last-known state marked stale, not a 500.
-        if session.last_known is not None:
+        # Per-vehicle: another car's cached status is not an answer about this
+        # one, so a car we've never successfully fetched still 502s.
+        cached = session.last_known.get(vid_key)
+        if cached is not None:
             logger.warning("upstream failed, serving stale status: %s", exc)
             # Warnings are dropped, not carried: a warning is a claim about the
             # car RIGHT NOW, and this payload is by definition not now. Same
             # rule as the age gate in app/warnings.py, applied one layer up
             # where the staleness is ours rather than the car's. `stale: true`
             # is itself the explanation for the empty array — no new field.
-            return session.last_known.model_copy(
-                update={"stale": True, "warnings": []}
-            )
+            return cached.model_copy(update={"stale": True, "warnings": []})
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}")
 
 
@@ -306,16 +347,36 @@ def force_refresh(body: CredentialedRequest, request: Request) -> VehicleStatus:
             headers={"Retry-After": str(retry_after)},
         )
     try:
-        status = session.provider.force_refresh()
-        session.last_known = status
+        status = session.provider.force_refresh(vehicle_id=body.credentials.vehicle_id)
+        session.last_known[body.credentials.vehicle_id or ""] = status
         _auth_ok(request)
         return status
     except ReenrollRequired as exc:
         raise _reenroll_needed(request, session, exc)
     except AuthError as exc:
         raise _auth_failed(request, session, exc)
+    except UnknownVehicleError:
+        raise _unknown_vehicle()
     except ProviderDataError as exc:
         raise _parse_bug_response(exc)
+    except UpstreamError as exc:
+        raise HTTPException(status_code=502, detail=f"upstream error: {exc}")
+
+
+@app.post("/vehicles", response_model=VehiclesResponse)
+def list_vehicles(body: CredentialedRequest, request: Request) -> VehiclesResponse:
+    """Every car on the account, so a client can offer a picker. Shares the
+    session with /status — listing costs a login only if there isn't one
+    already cached."""
+    session = _session(request, body.credentials)
+    try:
+        vehicles = session.provider.list_vehicles()
+        _auth_ok(request)
+        return VehiclesResponse(vehicles=[VehicleInfo(**v) for v in vehicles])
+    except ReenrollRequired as exc:
+        raise _reenroll_needed(request, session, exc)
+    except AuthError as exc:
+        raise _auth_failed(request, session, exc)
     except UpstreamError as exc:
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}")
 
@@ -329,11 +390,13 @@ def debug_fields(body: CredentialedRequest, request: Request) -> Response:
     VehicleStatus chokes on. Pretty-printed to read in a browser/bug report."""
     session = _session(request, body.credentials)
     try:
-        raw = session.provider.get_raw_fields()
+        raw = session.provider.get_raw_fields(vehicle_id=body.credentials.vehicle_id)
     except ReenrollRequired as exc:
         raise _reenroll_needed(request, session, exc)
     except AuthError as exc:
         raise _auth_failed(request, session, exc)
+    except UnknownVehicleError:
+        raise _unknown_vehicle()
     except UpstreamError as exc:
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}")
     _auth_ok(request)
@@ -370,13 +433,18 @@ def debug_shapes(request: Request) -> dict:
 
 
 def _send_command(request: Request, creds: Credentials, fn) -> CommandAccepted:
+    """fn receives (provider, vehicle_id) — the id is threaded here rather
+    than captured per-endpoint so no command can forget it and silently drive
+    the wrong car."""
     session = _session(request, creds)
     try:
-        fn(session.provider)
+        fn(session.provider, creds.vehicle_id)
     except ReenrollRequired as exc:
         raise _reenroll_needed(request, session, exc)
     except AuthError as exc:
         raise _auth_failed(request, session, exc)
+    except UnknownVehicleError:
+        raise _unknown_vehicle()
     except UpstreamError as exc:
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}")
     _auth_ok(request)
@@ -388,10 +456,11 @@ def climate(body: ClimateBody, request: Request) -> CommandAccepted:
     return _send_command(
         request,
         body.credentials,
-        lambda p: p.set_climate(
+        lambda p, vid: p.set_climate(
             ClimateSettings(
                 on=body.on, temp=body.temp, defrost=body.defrost, heating=body.heating
-            )
+            ),
+            vehicle_id=vid,
         ),
     )
 
@@ -401,25 +470,31 @@ def charge(body: ChargeBody, request: Request) -> CommandAccepted:
     return _send_command(
         request,
         body.credentials,
-        lambda p: p.start_charge() if body.on else p.stop_charge(),
+        lambda p, vid: (
+            p.start_charge(vehicle_id=vid) if body.on else p.stop_charge(vehicle_id=vid)
+        ),
     )
 
 
 @app.post("/charge-limits", response_model=CommandAccepted)
 def charge_limits(body: ChargeLimitsBody, request: Request) -> CommandAccepted:
     return _send_command(
-        request, body.credentials, lambda p: p.set_charge_limits(body.ac, body.dc)
+        request,
+        body.credentials,
+        lambda p, vid: p.set_charge_limits(body.ac, body.dc, vehicle_id=vid),
     )
 
 
 @app.post("/lock", response_model=CommandAccepted)
 def lock(body: CredentialedRequest, request: Request) -> CommandAccepted:
-    return _send_command(request, body.credentials, lambda p: p.lock())
+    return _send_command(request, body.credentials, lambda p, vid: p.lock(vehicle_id=vid))
 
 
 @app.post("/unlock", response_model=CommandAccepted)
 def unlock(body: CredentialedRequest, request: Request) -> CommandAccepted:
-    return _send_command(request, body.credentials, lambda p: p.unlock())
+    return _send_command(
+        request, body.credentials, lambda p, vid: p.unlock(vehicle_id=vid)
+    )
 
 
 # -- Kia-US OTP enrollment ---------------------------------------------------

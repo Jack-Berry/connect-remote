@@ -64,6 +64,12 @@ The relay's source code is in this repository, so what it does is auditable.
 
 - **Settings** (credentials, climate preferences, charge limits) are stored
   locally in the Even phone app's storage on your device, and nowhere else.
+  If your account has more than one vehicle, the app also stores that list of
+  vehicles (the name, model and year your manufacturer reports for each, never
+  the VIN) and which one you selected, so the car picker works without
+  re-fetching. Like the rest of your settings this stays on your phone; the
+  relay reads the list from your manufacturer to answer the request and keeps
+  no copy.
   For Kia US accounts, a device-trust token (containing no password) is also
   stored on your phone alongside your credentials and sent with each request;
   it allows the relay to re-use a trusted device identity without a fresh

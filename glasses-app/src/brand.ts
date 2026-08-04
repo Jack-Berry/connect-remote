@@ -71,6 +71,12 @@ export const BRAND: Brand = BRANDS[requested as BrandId]
 export function applyBrand(doc: Document = document): void {
   document.title = BRAND.appName
 
+  // The phone stylesheet's one per-brand value: `--accent`, switched off
+  // `data-brand-id` on <html>. Deliberately NOT `data-brand` — that attribute
+  // is the copy-injection hook walked below, and a root element carrying it
+  // would be treated as a (nonexistent) copy key.
+  doc.documentElement.dataset.brandId = BRAND.id
+
   for (const el of doc.querySelectorAll<HTMLElement>('[data-brand]')) {
     const key = el.dataset.brand as keyof Brand | undefined
     const value = key && key in BRAND ? BRAND[key] : undefined

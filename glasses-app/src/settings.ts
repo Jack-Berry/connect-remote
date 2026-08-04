@@ -26,9 +26,17 @@ export interface AppSettings {
   climateDefrost: boolean
   // Steering wheel + rear window/mirror heat with climate
   climateHeating: boolean
-  // AC/DC charge targets (percent, 50–100) sent via "Send limits to car"
+  // AC/DC charge targets (percent, 50–100). These are the values ON THE FORM:
+  // saved like any other preference, whether or not the car has been told
+  // about them. Sending them is a separate, deliberate action.
   chargeLimitAc: number
   chargeLimitDc: number
+  // The last limits we know the car accepted, and when. Persisted so a value
+  // typed but never sent still offers its send button after a reload, and so
+  // a value that WAS sent doesn't nag. Absent until the first successful send.
+  // See `carKnownLimits` in main.ts for how this ranks against the car's own
+  // reported values.
+  chargeLimitsSent?: { ac: number; dc: number; at: number }
   // Kia-US only: stored device token from OTP enrollment. Contains
   // device_id + refresh_token (no credentials — they're stripped by the
   // proxy). Sent per-request so the proxy can reuse a trusted device
@@ -190,8 +198,78 @@ export function tempFieldState(celsius: number, unit: TempUnit): TempFieldState 
   }
 }
 
-// Phone form: does the charge-limits section (AC/DC prefs + "Send limits to
-// car") apply to this car? Only cars that plug in. Positive HEV/ICE hide it;
+// ---------------------------------------------------------------------------
+// Charge limits: what does the car actually hold?
+//
+// The send button is contextual — it exists only while the form disagrees with
+// the car — so "what does the car hold" has to be answerable, and there are two
+// sources that can disagree:
+//
+//   · what we last successfully sent, and
+//   · what the car itself reports on /status.
+//
+// The car is the authority WHENEVER IT REPORTS THE FIELDS AT ALL, and the
+// settle window below exists only to arbitrate between the two — it never
+// applies when there is only one source. Three cases, and the third is the one
+// worth stating out loud:
+//
+//   1. Car reports, and the send is older than the settle window → the car.
+//      This is what makes a limit changed in the manufacturer's own app show up
+//      here rather than being masked forever by a stale send record.
+//   2. Car reports, but the send is INSIDE the window → the send. The car takes
+//      30–90 s to apply, so a poll landing in that window still reports the OLD
+//      values; trusting it would pop the button back up seconds after a
+//      successful send and invite the user to send again.
+//   3. Car reports nothing (plenty of EVs never send these fields) → the send,
+//      indefinitely. The window is irrelevant here: there is no second source
+//      to hand authority back to, so ageing out a send would leave the button
+//      permanently offered on a car that can never satisfy it — greeting the
+//      user on every launch with an action that has already been taken.
+//
+// With neither source we genuinely don't know; see `limitsNeedSending`.
+// ---------------------------------------------------------------------------
+
+export interface ChargeLimits {
+  ac: number
+  dc: number
+}
+
+/** How long a successful send outranks the car's own reported values. Covers
+ *  the documented 30–90 s apply latency with room for a slow status poll. */
+export const CHARGE_LIMITS_SETTLE_MS = 3 * 60_000
+
+export function carKnownLimits(
+  sent: { ac: number; dc: number; at: number } | undefined,
+  reported: { ac?: number | null; dc?: number | null },
+  now: number,
+): ChargeLimits | null {
+  const hasReported = reported.ac != null && reported.dc != null
+  if (sent && (!hasReported || now - sent.at < CHARGE_LIMITS_SETTLE_MS)) {
+    return { ac: sent.ac, dc: sent.dc }
+  }
+  if (hasReported) return { ac: reported.ac as number, dc: reported.dc as number }
+  return null
+}
+
+/**
+ * Should the send button be offered for these form values?
+ *
+ * Unknown counts as "offer it": a car that doesn't report its limits and has
+ * never been sent any is exactly the case where the user has no other way to
+ * find out, and a send is harmless. Silence there would leave no route to the
+ * car at all.
+ */
+export function limitsNeedSending(
+  formAc: number,
+  formDc: number,
+  known: ChargeLimits | null,
+): boolean {
+  if (!known) return true
+  return formAc !== known.ac || formDc !== known.dc
+}
+
+// Phone form: does the charge-limits section (AC/DC prefs + the contextual
+// send button) apply to this car? Only cars that plug in. Positive HEV/ICE hide it;
 // UNKNOWN or a label this build doesn't recognise stays permissive UNLESS the
 // status carried fuel-only evidence: the proxy emits fuel fields only on
 // genuine fuel evidence, never for an EV (POWERTRAIN-FIELDS landmines 1–2),
