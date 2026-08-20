@@ -160,6 +160,54 @@ def test_unknown_offset_is_not_treated_as_stale():
 
 
 # --------------------------------------------------------------------------
+# Transport
+
+
+def test_requests_carry_an_explicit_user_agent(monkeypatch):
+    """AirLabs answers 403 to urllib's default `Python-urllib/3.x` UA.
+
+    Confirmed on the server: same URL, same key, 403 with the default and 200
+    with any explicit one. This shipped once without it — every AirLabs call
+    403'd, the chain fell through to aviationstack, and the gate silently went
+    missing again with nothing in the response to say why.
+    """
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"response": {"flight_iata": "BA1373"}}'
+
+    def capture(request, timeout=None):
+        seen["ua"] = request.get_header("User-agent")
+        return FakeResponse()
+
+    monkeypatch.setattr(airlabs.urllib.request, "urlopen", capture)
+    airlabs.fetch("BA1373", key="k")
+    assert seen["ua"]
+    assert "urllib" not in seen["ua"].lower()
+
+
+def test_the_api_key_never_appears_in_a_log_line(monkeypatch, caplog):
+    """The key rides in the query string, so any log line quoting the URL
+    would leak it."""
+    def boom(request, timeout=None):
+        raise airlabs.urllib.error.HTTPError(request.full_url, 500, "nope", {}, None)
+
+    monkeypatch.setattr(airlabs.urllib.request, "urlopen", boom)
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(airlabs.Unavailable) as exc:
+            airlabs.fetch("BA1373", key="super-secret-key")
+    assert "super-secret-key" not in str(exc.value)
+    assert "super-secret-key" not in caplog.text
+
+
+# --------------------------------------------------------------------------
 # Envelope handling
 
 

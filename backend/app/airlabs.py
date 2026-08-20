@@ -47,6 +47,13 @@ API_URL = "https://airlabs.co/api/v9/flight"
 
 UPSTREAM_TIMEOUT_SECONDS = 10.0
 
+# AirLabs answers 403 to urllib's default `Python-urllib/3.x` User-Agent.
+# Confirmed on the server: identical URL and key, 403 with the default UA and
+# 200 with any explicit one. Without this every AirLabs call fails, the chain
+# quietly falls through to aviationstack, and the gate — the entire reason this
+# source exists — silently goes missing again.
+USER_AGENT = "flight-tracker/1.0 (+https://flight.berrydev.co.uk)"
+
 # Three letters is ICAO (EZY2229, BAW117); two characters is IATA (U22229,
 # BA117). AirLabs has a separate parameter for each and answers "not found" if
 # you use the wrong one — silently spending a request to learn nothing.
@@ -78,7 +85,8 @@ def fetch(flight_number: str, *, key: str) -> dict:
         {query_field(flight_number): flight_number, "api_key": key}
     )
     request = urllib.request.Request(
-        f"{API_URL}?{query}", headers={"Accept": "application/json"}
+        f"{API_URL}?{query}",
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
     )
     try:
         with urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT_SECONDS) as response:
