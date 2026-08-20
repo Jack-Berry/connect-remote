@@ -6,6 +6,8 @@ The fixtures below mirror the shape of a real aviationstack response for BA117
 If aviationstack ever changes either, these tests are what will notice.
 """
 
+import json
+import pathlib
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -55,8 +57,9 @@ def operating(date: str, **overrides) -> dict:
             "actual": None,
         },
         "airline": {"name": "British Airways", "iata": "BA"},
+        # No `codeshared` key inside `flight` — that absence is what marks the
+        # operating carrier. Note it is NESTED here, matching the real API.
         "flight": {"number": "117", "iata": "BA117", "icao": "BAW117"},
-        "codeshared": None,
     }
     record.update(overrides)
     return record
@@ -93,12 +96,20 @@ def marketing(date: str, iata: str) -> dict:
             "estimated": None,
             "actual": None,
         },
-        "flight": {"number": iata[2:], "iata": iata},
-        "codeshared": {
-            "airline_name": "british airways",
-            "airline_iata": "ba",
-            "flight_number": "117",
-            "flight_iata": "ba117",
+        # `codeshared` NESTED inside `flight`, exactly where the real API puts
+        # it, and lowercase exactly as the real API spells it.
+        "flight": {
+            "number": iata[2:],
+            "iata": iata,
+            "icao": None,
+            "codeshared": {
+                "airline_name": "british airways",
+                "airline_iata": "ba",
+                "airline_icao": "baw",
+                "flight_number": "117",
+                "flight_iata": "ba117",
+                "flight_icao": "baw117",
+            },
         },
     }
 
@@ -116,6 +127,21 @@ def ba117_set(date: str | None = None) -> list[dict]:
     ]
 
 
+FIXTURES = pathlib.Path(__file__).parent / "fixtures"
+
+
+def real_ba117() -> list[dict]:
+    """The VERBATIM aviationstack response for BA117, captured 2026-08-20.
+
+    Six records for one aircraft (LHR T5 -> JFK T8) under six different flight
+    numbers — and `codeshared` is null on ALL SIX, including the marketing
+    ones. This is the response that proved the original "pick codeshared is
+    null" rule cannot discriminate, and it is why the exact flight number now
+    leads. Do not hand-edit: re-capture it if the upstream shape changes.
+    """
+    return json.loads((FIXTURES / "ba117-aviationstack.json").read_text())["data"]
+
+
 @pytest.fixture(autouse=True)
 def clear_cache():
     flight._cache.clear()
@@ -124,34 +150,123 @@ def clear_cache():
 
 
 # --------------------------------------------------------------------------
-# Record selection
+# Record selection, against the real captured response
+
+
+def test_real_response_returns_the_number_the_user_asked_for():
+    """The regression that shipped: BA117 answered AA6930.
+
+    All six records have codeshared=null, so the operating-carrier rule
+    matched every one of them and an arbitrary tie-break won. The exact
+    flight number is the only field that identifies the right record.
+    """
+    records = real_ba117()
+    assert len(records) == 6
+
+    # THE BUG, pinned: there is no top-level `codeshared` key on ANY record, so
+    # the original `record["codeshared"] is None` test was true for all six and
+    # an arbitrary tie-break answered AA6930. The block lives one level down.
+    assert all("codeshared" not in r for r in records)
+    assert sum(1 for r in records if (r["flight"].get("codeshared")) is None) == 1
+
+    record, _ = flight.select_record(records, "BA117")
+    assert record["flight"]["iata"] == "BA117"
+    assert flight._codeshare_of(record) is None
+
+
+def test_real_response_is_flagged_stale_not_presented_as_current():
+    """Captured on 2026-08-20; every record is dated 2026-08-19 and landed.
+    Presenting that as current status is the worst failure this app has."""
+    records = real_ba117()
+    assert all(r["flight_date"] == "2026-08-19" for r in records)
+    _, stale = flight.select_record(records, "BA117")
+    assert stale is True
+
+
+def test_real_response_shapes_into_the_wire_payload():
+    record, stale = flight.select_record(real_ba117(), "BA117")
+    payload = flight.shape(record, stale)
+    assert payload.flight_iata == "BA117"
+    assert payload.status == "landed"
+    assert payload.departure.iata == "LHR"
+    assert payload.departure.terminal == "5"
+    assert payload.arrival.iata == "JFK"
+    assert payload.arrival.terminal == "8"
+    assert payload.stale is True
+
+
+def test_any_marketing_number_resolves_to_the_operating_carrier():
+    """Ask for AA6930 — a codeshare sold by American — and get BA117.
+
+    That is the specified behaviour and the right one: the operating record is
+    the one carrying authoritative gate, terminal and baggage data. The
+    traveller sees the number the aircraft actually flies under, which is also
+    what the departure board shows.
+    """
+    for sold_as in ("AA6930", "AS5255", "IB3545", "EI8817", "AY5517", "BA117"):
+        record, _ = flight.select_record(real_ba117(), sold_as)
+        assert record["flight"]["iata"] == "BA117", sold_as
+
+
+def test_real_set_is_matched_by_icao_number_too():
+    """BAW117 is BA117 in the other alphabet. easyJet's EZY2229 is the case
+    that matters in practice — its IATA form is U22229."""
+    record, _ = flight.select_record(real_ba117(), "BAW117")
+    assert record["flight"]["iata"] == "BA117"
+
+
+def test_lowercase_request_still_finds_the_real_record():
+    record, _ = flight.select_record(real_ba117(), "ba117")
+    assert record["flight"]["iata"] == "BA117"
+
+
+# --------------------------------------------------------------------------
+# Record selection, synthetic
 
 
 def test_picks_operating_carrier_out_of_a_codeshare_set():
     record, stale = flight.select_record(ba117_set(), "BA117")
     assert record["flight"]["iata"] == "BA117"
-    assert record["codeshared"] is None
+    # Operating carrier = no codeshare block, read from the NESTED path.
+    assert flight._codeshare_of(record) is None
     assert stale is False
     # The whole point: the operating record is the one carrying gate data.
     assert record["departure"]["terminal"] == "5"
 
 
-def test_marketing_number_falls_back_to_case_insensitive_iata_match():
-    """User booked AA6167. There is no operating record for that number in the
-    set we get back, so honour the number they typed."""
-    date = today_lhr()
-    # No operating record at all — every copy is a codeshare.
-    records = [marketing(date, "AA6167"), marketing(date, "IB7458")]
-    record, stale = flight.select_record(records, "aa6167")
-    assert record["flight"]["iata"] == "AA6167"
+def test_marketing_number_resolves_to_the_operating_record_it_shadows():
+    """User booked AA6167, which is operated as BA117. The BA117 record is in
+    the same response and is the one with real gate data, so it wins."""
+    record, stale = flight.select_record(ba117_set(), "AA6167")
+    assert record["flight"]["iata"] == "BA117"
     assert stale is False
 
 
-def test_iata_comparison_is_case_insensitive():
-    assert flight._iata_eq("BA117", "ba117")
-    assert flight._iata_eq(" ba117 ", "BA117")
-    assert not flight._iata_eq("BA117", "BA118")
-    assert not flight._iata_eq(None, "BA117")
+def test_marketing_number_used_when_no_operating_record_came_back():
+    """Tier 2: every record is a codeshare, so honour the number typed."""
+    date = today_lhr()
+    records = [marketing(date, "AA6167"), marketing(date, "IB7458")]
+    record, _ = flight.select_record(records, "aa6167")
+    assert record["flight"]["iata"] == "AA6167"
+
+
+def test_codeshare_block_naming_the_requested_flight_is_tier_three():
+    """Tier 3: the user asked for BA117, no BA117 record came back, but the
+    marketing copies name `ba117` (lowercase) as the flight they shadow.
+    Same aircraft, same gate — better than a 404."""
+    date = today_lhr()
+    records = [marketing(date, "AA6167"), marketing(date, "IB7458")]
+    record, _ = flight.select_record(records, "BA117")
+    assert flight._shadows_number(record, "BA117")
+
+
+def test_number_comparison_is_case_insensitive():
+    # The codeshare block spells it "ba117"; the flight object spells it
+    # "BA117". Without this the tier-3 fallback silently finds nothing.
+    assert flight._number_eq("BA117", "ba117")
+    assert flight._number_eq(" ba117 ", "BA117")
+    assert not flight._number_eq("BA117", "BA118")
+    assert not flight._number_eq(None, "BA117")
 
 
 def test_yesterdays_flight_is_returned_but_flagged_stale():
@@ -245,7 +360,7 @@ def client(monkeypatch):
 
 
 def test_endpoint_returns_the_operating_carrier(client, monkeypatch):
-    monkeypatch.setattr(flight, "_fetch", lambda iata, *, key: ba117_set())
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
     response = client.get("/flight/BA117")
     assert response.status_code == 200
     body = response.json()
@@ -257,8 +372,8 @@ def test_endpoint_returns_the_operating_carrier(client, monkeypatch):
 def test_endpoint_uppercases_the_path_segment(client, monkeypatch):
     seen = []
 
-    def fake(iata, *, key):
-        seen.append(iata)
+    def fake(number, *, key):
+        seen.append(number)
         return ba117_set()
 
     monkeypatch.setattr(flight, "_fetch", fake)
@@ -267,19 +382,37 @@ def test_endpoint_uppercases_the_path_segment(client, monkeypatch):
 
 
 def test_endpoint_rejects_junk_without_calling_upstream(client, monkeypatch):
-    def explode(iata, *, key):  # pragma: no cover - must never run
+    def explode(number, *, key):  # pragma: no cover - must never run
         raise AssertionError("upstream called for a malformed flight number")
 
     monkeypatch.setattr(flight, "_fetch", explode)
-    for bad in ("hello", "1", "BA", "BA12345", "12345", "BAW117", "../etc/passwd"):
+    for bad in ("hello", "1", "BA", "BAW", "BA12345", "12345", "EZY22299", "../etc/passwd"):
         assert client.get(f"/flight/{bad}").status_code in (400, 404), bad
+
+
+def test_endpoint_accepts_both_alphabets(client, monkeypatch):
+    """BAW117 and EZY2229 are ICAO; BA117 and U22229 are IATA. A traveller
+    types whichever their booking shows."""
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
+    for good in ("BA117", "U22229", "BAW117", "EZY2229", "9W123"):
+        assert client.get(f"/flight/{good}").status_code == 200, good
+
+
+def test_icao_numbers_go_to_the_icao_upstream_filter():
+    """Sending an ICAO number to `flight_iata` matches nothing upstream and
+    silently spends one of the month's hundred requests."""
+    assert flight._query_field("EZY2229") == "flight_icao"
+    assert flight._query_field("BAW117") == "flight_icao"
+    assert flight._query_field("BA117") == "flight_iata"
+    assert flight._query_field("U22229") == "flight_iata"
+    assert flight._query_field("9W123") == "flight_iata"
 
 
 def test_cache_serves_the_second_request_without_a_second_upstream_call(client, monkeypatch):
     calls = []
 
-    def fake(iata, *, key):
-        calls.append(iata)
+    def fake(number, *, key):
+        calls.append(number)
         return ba117_set()
 
     monkeypatch.setattr(flight, "_fetch", fake)
@@ -292,8 +425,8 @@ def test_cache_serves_the_second_request_without_a_second_upstream_call(client, 
 def test_cache_is_keyed_per_flight(client, monkeypatch):
     calls = []
 
-    def fake(iata, *, key):
-        calls.append(iata)
+    def fake(number, *, key):
+        calls.append(number)
         return ba117_set()
 
     monkeypatch.setattr(flight, "_fetch", fake)
@@ -305,8 +438,8 @@ def test_cache_is_keyed_per_flight(client, monkeypatch):
 def test_cache_expires(client, monkeypatch):
     calls = []
 
-    def fake(iata, *, key):
-        calls.append(iata)
+    def fake(number, *, key):
+        calls.append(number)
         return ba117_set()
 
     monkeypatch.setattr(flight, "_fetch", fake)
@@ -317,7 +450,7 @@ def test_cache_expires(client, monkeypatch):
 
 
 def test_upstream_failure_is_a_502(client, monkeypatch):
-    def fail(iata, *, key):
+    def fail(number, *, key):
         raise flight.FlightUnavailable("flight service unreachable")
 
     monkeypatch.setattr(flight, "_fetch", fail)
@@ -328,8 +461,8 @@ def test_upstream_failure_is_a_502(client, monkeypatch):
 def test_upstream_failure_is_cached_so_retries_do_not_burn_quota(client, monkeypatch):
     calls = []
 
-    def fail(iata, *, key):
-        calls.append(iata)
+    def fail(number, *, key):
+        calls.append(number)
         raise flight.FlightUnavailable("flight service unreachable")
 
     monkeypatch.setattr(flight, "_fetch", fail)
@@ -344,18 +477,18 @@ def test_missing_api_key_is_a_503_and_is_not_cached(monkeypatch):
     assert client.get("/flight/BA117").status_code == 503
     # A deployment fix must take effect on the very next request, not in 60s.
     monkeypatch.setenv("AVIATIONSTACK_KEY", "now-configured")
-    monkeypatch.setattr(flight, "_fetch", lambda iata, *, key: ba117_set())
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
     assert client.get("/flight/BA117").status_code == 200
 
 
 def test_stale_records_are_flagged_on_the_wire(client, monkeypatch):
-    monkeypatch.setattr(flight, "_fetch", lambda iata, *, key: ba117_set(yesterday_lhr()))
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set(yesterday_lhr()))
     body = client.get("/flight/BA117").json()
     assert body["stale"] is True
 
 
 def test_cors_is_wide_open(client, monkeypatch):
-    monkeypatch.setattr(flight, "_fetch", lambda iata, *, key: ba117_set())
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
     response = client.get("/flight/BA117", headers={"Origin": "http://127.0.0.1:54321"})
     assert response.headers["access-control-allow-origin"] == "*"
 

@@ -8,17 +8,24 @@ THREE UPSTREAM FACTS drive almost every line below. All three were confirmed
 against a real response for BA117 (LHR -> JFK) rather than inferred from the
 aviationstack docs, which document none of them:
 
- 1. **Codeshare duplicates.** One physical flight comes back many times — BA117
-    returned SIX records: the British Airways one plus AA/IB/EI/AY marketing
-    numbers. They are not near-duplicates to be de-duped by content; they carry
-    DIFFERENT flight numbers for the SAME aircraft. Picking the wrong one shows
-    the user a flight number they never booked under. The operating carrier is
-    the record whose `codeshared` is null; every marketing copy has an object
-    there naming the flight it shadows. See `_select_carrier`.
+ 1. **Codeshare duplicates, and the block is NESTED.** One physical flight comes
+    back many times — BA117 returned SIX records: the British Airways one plus
+    AA/AS/IB/EI/AY marketing numbers, all LHR T5 -> JFK T8. They are not
+    near-duplicates to be de-duped by content; they carry DIFFERENT flight
+    numbers for the SAME aircraft, and picking the wrong one shows the user a
+    number they never booked under.
 
- 2. **Codeshare blocks are lowercase.** Inside `codeshared`, `flight_iata` reads
-    `"ba117"`, not `"BA117"`. Any match on it must be case-insensitive or the
-    fallback path silently finds nothing. See `_iata_eq`.
+    The operating carrier is the record with no codeshare block — but that
+    block lives at **`flight.codeshared`**, not at the record's top level.
+    Reading `record["codeshared"]` finds a key that does not exist, so every
+    record looks like an operating carrier, the rule matches all six, and an
+    arbitrary tie-break wins. That shipped, and answered AA6930 to a request
+    for BA117. See `_codeshare_of`.
+
+ 2. **Codeshare blocks are lowercase.** Inside `flight.codeshared`,
+    `flight_iata` reads `"ba117"`, not `"BA117"`. Any match on it must be
+    case-insensitive or the fallback path silently finds nothing. See
+    `_number_eq`.
 
  3. **`flight_date` is not today.** The free plan happily returns yesterday's
     completed flight for a number that also flies today. A landed flight from
@@ -29,13 +36,18 @@ aviationstack docs, which document none of them:
     with `stale: true` rather than 404. An honestly-labelled stale record beats
     a blank screen; the app prints the marker.
 
+IATA *or* ICAO. Travellers read whichever number their booking shows, and the
+two alphabets disagree: BA117 is IATA and BAW117 ICAO, while easyJet's EZY2229
+is ICAO for what IATA calls U22229. Both forms are accepted and each is sent to
+the matching upstream filter — `flight_iata` or `flight_icao`. See
+`_query_field`.
+
 QUOTA is the other constraint: the free plan allows 100 requests per MONTH.
-That is roughly three per day, against an app that polls every 5 minutes. The
-in-memory cache is therefore not an optimisation, it is the only reason the app
-can run at all — a single flight polled all day costs one upstream call per
-5-minute bucket, and every extra viewer of that same flight costs nothing.
-Upstream failures are cached too (briefly): a broken key that answered 100
-times would burn the month's budget in under an hour.
+That is roughly three per day. The in-memory cache is therefore not an
+optimisation, it is the only reason the app can run at all — a flight looked up
+repeatedly costs one upstream call per 5-minute bucket, and every extra viewer
+of that same flight costs nothing. Upstream failures are cached too (briefly):
+a broken key that answered 100 times would burn the month's budget in an hour.
 
 PLAIN HTTP, deliberately. The free plan rejects HTTPS on api.aviationstack.com
 (paid tiers only), so the upstream hop is unencrypted. That is acceptable
@@ -50,6 +62,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -63,12 +76,30 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
+# The two flight-number alphabets, as regexes, so the API layer and this module
+# validate identically. IATA: a two-character airline designator with at least
+# one letter (BA, U2, 9W), then 1-4 digits and an optional suffix letter. ICAO:
+# three letters (BAW, EZY, RYR), then the same.
+#
+# The alternation in the IATA form is not decoration. `[A-Z0-9]{2,3}` accepts
+# "12345" as an all-digit designator and, because it can eat a digit, also
+# accepts "BA12345" as BA1 + 2345. A test caught the second one.
+IATA_PATTERN = re.compile(r"(?:[A-Z]{2}|[A-Z]\d|\d[A-Z])\d{1,4}[A-Z]?")
+ICAO_PATTERN = re.compile(r"[A-Z]{3}\d{1,4}[A-Z]?")
+
+
+def is_flight_number(value: str) -> bool:
+    """Accept either alphabet. Validation happens before the upstream call so a
+    junk path segment costs nothing out of a 100-request MONTHLY budget."""
+    return bool(IATA_PATTERN.fullmatch(value) or ICAO_PATTERN.fullmatch(value))
+
 # Free plan: HTTP only. See the module docstring before "fixing" this to https.
 API_URL = "http://api.aviationstack.com/v1/flights"
 
-# How long a successful lookup is served from memory. The app polls every 5
-# minutes, so this makes the steady-state cost exactly one upstream call per
-# flight per poll interval — the arithmetic that keeps a 100/month plan alive.
+# How long a successful lookup is served from memory. The glasses app has no
+# poll timer — it calls on launch, on save and on tap — so this is what bounds
+# a user tapping repeatedly while watching for a gate: one upstream call per
+# flight per 5 minutes, however fast they tap.
 CACHE_TTL_SECONDS = 300
 
 # Failures are cached far more briefly: long enough to stop a retry loop from
@@ -182,43 +213,105 @@ _cache = _Cache()
 # Record selection
 
 
-def _iata_eq(a: str | None, b: str | None) -> bool:
-    """Case-insensitive IATA comparison. Load-bearing: codeshare blocks spell
-    the number lowercase (`"ba117"`) while the top-level flight object spells it
-    uppercase (`"BA117"`). See upstream fact 2."""
+def _number_eq(a: str | None, b: str | None) -> bool:
+    """Case-insensitive flight-number comparison.
+
+    Load-bearing: the codeshare block spells the number lowercase
+    (`"ba117"`) while the top-level flight object spells it uppercase
+    (`"BA117"`). Confirmed in the captured response — see the fixture.
+    """
     if a is None or b is None:
         return False
     return a.strip().lower() == b.strip().lower()
 
 
-def _select_carrier(records: list[dict], flight_iata: str) -> list[dict]:
-    """Narrow a codeshare set to the records that describe the flight the user
-    asked about, operating carrier first.
+def _codeshare_of(record: dict) -> dict | None:
+    """The codeshare block, which lives at `flight.codeshared` — NESTED inside
+    the flight object, NOT at the top level of the record.
 
-    Three tiers, in order:
-
-      1. `codeshared is null` — the operating carrier's own record. This is the
-         one with real gate/terminal/baggage data and the flight number printed
-         on the aircraft.
-      2. Exact (case-insensitive) match on `flight.iata` — used when the user
-         asked for a MARKETING number (they booked AA6167, which is BA117). The
-         operating record exists but is not the flight number they know, so we
-         honour the number they typed.
-      3. Everything. Reached only if the upstream returned records for a
-         different number entirely, which we surface rather than 404 — being
-         wrong loudly beats being blank.
+    This one path cost a wrong answer in production: reading
+    `record["codeshared"]` finds nothing, because that key does not exist at
+    all. Every record then looks like an operating carrier, the selection rule
+    matches all six, and an arbitrary tie-break answered AA6930 to a request
+    for BA117. The fixture pins the real nesting.
     """
-    operating = [r for r in records if r.get("codeshared") is None]
-    if operating:
-        return operating
+    return (record.get("flight") or {}).get("codeshared")
 
-    exact = [r for r in records if _iata_eq((r.get("flight") or {}).get("iata"), flight_iata)]
+
+def _is_operating(record: dict) -> bool:
+    """True for the carrier that actually flies the aircraft — the record with
+    no codeshare block, carrying the authoritative gate/terminal/baggage."""
+    return _codeshare_of(record) is None
+
+
+def _matches_number(record: dict, requested: str) -> bool:
+    """Does this record carry the number the user typed, in either alphabet?
+
+    Both are checked because the two coexist in the wild: BA117 is the IATA
+    form and BAW117 the ICAO one, and easyJet's EZY2229 is an ICAO number
+    whose IATA form is U22229. Travellers use whichever their booking shows.
+    """
+    flight_block = record.get("flight") or {}
+    return _number_eq(flight_block.get("iata"), requested) or _number_eq(
+        flight_block.get("icao"), requested
+    )
+
+
+def _shadows_number(record: dict, requested: str) -> bool:
+    """This record is a marketing copy OF the requested flight — its codeshare
+    block names it. Used when the operating record itself is absent."""
+    codeshare = _codeshare_of(record)
+    if not codeshare:
+        return False
+    return _number_eq(codeshare.get("flight_iata"), requested) or _number_eq(
+        codeshare.get("flight_icao"), requested
+    )
+
+
+def _select_carrier(records: list[dict], flight_number: str) -> list[dict]:
+    """Narrow a codeshare set to the records describing the flight asked about.
+
+    THE SHAPE OF THE PROBLEM, from a real BA117 response (saved verbatim in
+    tests/fixtures/ba117-aviationstack.json): one aircraft, LHR T5 -> JFK T8,
+    returned SIX times — as AA6930, AS5255, IB3545, EI8817, AY5517 and BA117.
+    Five carry `flight.codeshared` naming `"ba117"`; only BA117 itself has no
+    codeshare block. Picking the wrong one shows a flight number the traveller
+    never booked under.
+
+    Four tiers, in order:
+
+      1. The operating carrier (no codeshare block). This is the record with
+         real gate/terminal/baggage data and the number printed on the
+         aircraft. Where several operating records come back, one matching the
+         requested number wins.
+      2. Exact match on `flight.iata` or `flight.icao` — the operating record
+         is absent, so honour the number the user typed.
+      3. A marketing record whose codeshare block NAMES the requested flight.
+         Same aircraft, same gate, different number on the ticket.
+      4. Everything. Reached only if upstream answered about a different
+         flight entirely, which we surface rather than 404 — being wrong
+         loudly beats being blank.
+    """
+    operating = [r for r in records if _is_operating(r)]
+    if operating:
+        exact = [r for r in operating if _matches_number(r, flight_number)]
+        return exact or operating
+
+    exact = [r for r in records if _matches_number(r, flight_number)]
     if exact:
         return exact
 
+    shadowing = [r for r in records if _shadows_number(r, flight_number)]
+    if shadowing:
+        logger.info(
+            "flight %s: no operating record; using a marketing copy of it",
+            flight_number,
+        )
+        return shadowing
+
     logger.warning(
-        "flight %s: no operating-carrier record and no exact iata match in %d records",
-        flight_iata,
+        "flight %s: nothing in %d records matches by number or codeshare",
+        flight_number,
         len(records),
     )
     return records
@@ -254,16 +347,16 @@ def _sort_key(record: dict) -> str:
     return f"{date}T{scheduled}"
 
 
-def select_record(records: list[dict], flight_iata: str) -> tuple[dict, bool]:
+def select_record(records: list[dict], flight_number: str) -> tuple[dict, bool]:
     """Pick the one record to render, and say whether it is stale.
 
     Returns `(record, stale)`. Raises `FlightUnavailable(404)` only when there
     is genuinely nothing to choose from.
     """
     if not records:
-        raise FlightUnavailable(f"no flights found for {flight_iata}", status=404)
+        raise FlightUnavailable(f"no flights found for {flight_number}", status=404)
 
-    candidates = _select_carrier(records, flight_iata)
+    candidates = _select_carrier(records, flight_number)
 
     # A record with no departure timezone can't be date-filtered, so it is never
     # rejected as "not today" — absent evidence is not evidence of staleness.
@@ -325,14 +418,27 @@ def _api_key() -> str:
     return key
 
 
-def _fetch(flight_iata: str, *, key: str) -> list[dict]:
+def _query_field(flight_number: str) -> str:
+    """Which upstream filter this number belongs in.
+
+    A three-letter airline designator is ICAO (BAW117, EZY2229); a two-character
+    one is IATA (BA117, U22229). Sending an ICAO number to `flight_iata` matches
+    nothing and silently spends one of the month's hundred requests, so the
+    choice is made from the shape of the number, not guessed.
+    """
+    return "flight_icao" if ICAO_PATTERN.fullmatch(flight_number) else "flight_iata"
+
+
+def _fetch(flight_number: str, *, key: str) -> list[dict]:
     """One upstream call. Returns the raw `data` array.
 
     aviationstack signals failure with HTTP 200 and an `error` object as often
     as with a status code (quota exhaustion in particular), so the envelope is
     checked before the payload.
     """
-    query = urllib.parse.urlencode({"access_key": key, "flight_iata": flight_iata})
+    query = urllib.parse.urlencode(
+        {"access_key": key, _query_field(flight_number): flight_number}
+    )
     request = urllib.request.Request(
         f"{API_URL}?{query}",
         headers={"Accept": "application/json"},
@@ -365,9 +471,9 @@ def _fetch(flight_iata: str, *, key: str) -> list[dict]:
     return data
 
 
-def lookup(flight_iata: str) -> FlightStatus:
+def lookup(flight_number: str) -> FlightStatus:
     """Cached, deduped flight lookup. The only entry point main.py uses."""
-    key = flight_iata.strip().upper()
+    key = flight_number.strip().upper()
 
     cached = _cache.get(key)
     if cached is not None:

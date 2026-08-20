@@ -298,7 +298,7 @@ def healthz() -> dict:
 
 @app.get("/flight/{flight_iata}", response_model=flight.FlightStatus)
 def get_flight(flight_iata: str) -> flight.FlightStatus:
-    """Flight status for an IATA flight number, e.g. /flight/BA117.
+    """Flight status for a flight number, e.g. /flight/BA117 or /flight/EZY2229.
 
     Unrelated to the car endpoints — it shares this process only to reuse the
     deployment (see app/flight.py). No credentials, no session, no upstream
@@ -311,24 +311,18 @@ def get_flight(flight_iata: str) -> flight.FlightStatus:
     Sync `def`, like every other route here: `flight.lookup` blocks on a socket
     and on a per-flight lock, so it belongs in the threadpool, not the loop.
     """
-    iata = flight_iata.strip().upper()
-    # An IATA designator is exactly two characters with at least one letter
-    # (BA, U2, 9W — three letters is ICAO, and this endpoint queries by IATA),
-    # then a 1-4 digit number and an optional operational suffix letter.
-    #
-    # Spelling the designator out as an alternation rather than `[A-Z0-9]{2}`
-    # is deliberate on both counts: the loose form accepts "12345" (all-digit
-    # designator) and, because `[A-Z0-9]{2,3}` can eat a digit, it also accepts
-    # "BA12345" as BA1 + 2345. A test caught the second one. Validation happens
-    # before the upstream call so a junk path segment costs nothing out of a
-    # 100-request MONTHLY budget — that is the whole point of validating here.
-    if not re.fullmatch(r"(?:[A-Z]{2}|[A-Z]\d|\d[A-Z])\d{1,4}[A-Z]?", iata):
+    number = flight_iata.strip().upper()
+    # Both alphabets, validated by the same patterns the lookup uses — see
+    # app/flight.py. IATA (BA117, U22229) and ICAO (BAW117, EZY2229) are each
+    # routed to the matching upstream filter. Validating here means a junk path
+    # segment costs nothing out of a 100-request MONTHLY budget.
+    if not flight.is_flight_number(number):
         raise HTTPException(
             status_code=400,
-            detail="not a flight number — expected something like BA117 or U21234",
+            detail="not a flight number — expected something like BA117, U22229 or EZY2229",
         )
     try:
-        return flight.lookup(iata)
+        return flight.lookup(number)
     except flight.FlightUnavailable as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc))
 
