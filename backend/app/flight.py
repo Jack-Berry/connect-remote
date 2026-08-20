@@ -72,7 +72,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel
 
-from . import flight_store
+from . import airlabs, flight_store
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +316,27 @@ def _departure_today(record: dict) -> str | None:
     return datetime.now(tz).date().isoformat()
 
 
+def _preference(record: dict) -> tuple:
+    """Ranking between records of the same flight on the same date. Lower wins.
+
+    STATUS FIRST, and not merely as a preference — it is the one field that
+    cannot be recovered from anywhere else. Upstream's two feeds disagree:
+    BA1373 on 2026-08-19 came back as {status: null, gate: "A9"} and
+    {status: "scheduled", gate: null}. Ranking by gate picked the first and
+    the display lost the status entirely. Ranking by status picks the second,
+    and `_fill_from_siblings` then recovers gate A9 from the first — so the
+    user gets both, which no single record offered.
+
+    Gate is still a tiebreak below status, for the case where two records are
+    equally well-statused and only one names a gate.
+    """
+    return (
+        record.get("flight_status") is None,
+        (record.get("departure") or {}).get("gate") is None,
+        _sort_key(record),
+    )
+
+
 def _sort_key(record: dict) -> str:
     """Newest-last ordering for the stale fallback. `flight_date` is an ISO
     date so it sorts lexicographically; scheduled departure breaks ties between
@@ -345,16 +366,79 @@ def select_record(records: list[dict], flight_number: str) -> tuple[dict, bool]:
             today.append(record)
 
     if today:
-        # More than one match means the same number flies twice today; the
-        # earliest scheduled departure is the one still ahead of the traveller
-        # often enough, and upstream orders them that way already.
-        return min(today, key=_sort_key), False
+        # Several matches means either the same number flying twice today, or —
+        # far more commonly — the same departure returned by two feeds. Prefer
+        # the record carrying an actual gate, then the earliest departure.
+        # `_fill_from_siblings` then tops up whatever is still missing.
+        chosen = min(today, key=_preference)
+        return _fill_from_siblings(chosen, records), False
 
-    return max(candidates, key=_sort_key), True
+    chosen = max(candidates, key=_sort_key)
+    return _fill_from_siblings(chosen, records), True
 
 
 # --------------------------------------------------------------------------
 # Shaping
+
+
+# Fields worth rescuing from a sibling record. All are "announced late" details
+# that one copy of a flight often has and another does not — never times or
+# status, which must come from a single coherent record.
+_FILLABLE = ("terminal", "gate", "baggage")
+
+
+def _same_flight(a: dict, b: dict) -> bool:
+    """Two records describing the SAME departure, not merely the same number.
+
+    Same date AND same scheduled departure time. The date alone is not enough:
+    a number can operate twice in a day, and merging a gate across two
+    rotations would send someone to the wrong one.
+    """
+    if a.get("flight_date") != b.get("flight_date"):
+        return False
+    a_sched = (a.get("departure") or {}).get("scheduled")
+    b_sched = (b.get("departure") or {}).get("scheduled")
+    return bool(a_sched) and a_sched == b_sched
+
+
+def _fill_from_siblings(chosen: dict, records: list[dict]) -> dict:
+    """Fill null terminal/gate/baggage from another record of the same flight.
+
+    WHY. Upstream returns the same departure more than once, from what are
+    plainly different feeds, and they disagree about coverage. BA1373 on
+    2026-08-19 came back twice: one record carried departure gate A9, its twin
+    carried null. Whichever the selection rule happened to pick decided whether
+    the user saw a gate at all — and the gate is the single thing this app
+    exists to show.
+
+    ONLY the three fields above, and ONLY from a record that agrees on date and
+    scheduled time (see `_same_flight`). Times, status and delay are never
+    merged: those must stay internally consistent, and a status from one feed
+    beside a time from another is a record that never existed.
+
+    Returns a copy — the stored fixture and the caller's list stay untouched.
+    """
+    merged = {**chosen, "departure": dict(chosen.get("departure") or {}),
+              "arrival": dict(chosen.get("arrival") or {})}
+    filled: list[str] = []
+
+    for other in records:
+        if other is chosen or not _same_flight(chosen, other):
+            continue
+        for side in ("departure", "arrival"):
+            source = other.get(side) or {}
+            for field in _FILLABLE:
+                if merged[side].get(field) is None and source.get(field) is not None:
+                    merged[side][field] = source[field]
+                    filled.append(f"{side}.{field}")
+
+    if filled:
+        logger.info(
+            "flight %s: filled %s from a sibling record",
+            (chosen.get("flight") or {}).get("iata"),
+            ", ".join(filled),
+        )
+    return merged
 
 
 def _endpoint(block: dict | None, *, include_baggage: bool) -> Endpoint:
@@ -389,12 +473,11 @@ def shape(record: dict, stale: bool) -> FlightStatus:
 # Upstream
 
 
-def _api_key() -> str:
-    key = os.environ.get("AVIATIONSTACK_KEY", "").strip()
-    if not key:
-        # 503, not 500: the code is fine, the deployment is missing a secret.
-        raise FlightUnavailable("flight lookup is not configured on this server", status=503)
-    return key
+def _key(name: str) -> str:
+    """A provider's key, or empty if it is not configured. Absence is normal —
+    either source alone is enough to run — so this does NOT raise; the lookup
+    chain decides what to do when nothing is configured at all."""
+    return os.environ.get(name, "").strip()
 
 
 def _query_field(flight_number: str) -> str:
@@ -458,19 +541,70 @@ def _from_entry(entry: flight_store.Entry) -> FlightStatus:
     return FlightStatus.model_validate(payload)
 
 
-def lookup(flight_number: str) -> FlightStatus:
-    """Flight status, from storage where possible and upstream only when not.
+# What a source attempt did. The distinction that matters is MISSING vs BROKEN:
+# every source answering "no such flight" is a 404, but every source being down
+# is a 502, and telling a user their flight number is wrong when the truth is
+# that both providers are unreachable sends them to re-check a boarding pass
+# that was right all along.
+SKIPPED, FOUND, MISSING, BROKEN = "skipped", "found", "missing", "broken"
 
-    The order here IS the quota policy:
+
+def _try_airlabs(number: str) -> tuple[dict | None, str]:
+    """AirLabs, the primary. Returns `(payload, outcome)`."""
+    key = _key("AIRLABS_KEY")
+    if not key:
+        return None, SKIPPED
+    if not store.reserve("airlabs"):
+        return None, SKIPPED
+    try:
+        return airlabs.shape(airlabs.fetch(number, key=key)), FOUND
+    except airlabs.NotFound:
+        # Coverage gap, not an error. aviationstack holds flights AirLabs does
+        # not, and the reverse happens too.
+        logger.info("flight %s: airlabs has no record; falling back", number)
+        return None, MISSING
+    except airlabs.Unavailable as exc:
+        logger.warning("flight %s: airlabs unavailable (%s); falling back", number, exc)
+        return None, BROKEN
+
+
+def _try_aviationstack(number: str) -> tuple[dict | None, str]:
+    """The fallback. Returns `(payload, outcome)`.
+
+    Kept despite its null gates because its coverage differs: it holds flights
+    AirLabs does not, and its codeshare handling (see `_select_carrier`) has no
+    equivalent here — AirLabs resolves codeshares itself.
+    """
+    key = _key("AVIATIONSTACK_KEY")
+    if not key:
+        return None, SKIPPED
+    if not store.reserve("aviationstack"):
+        return None, SKIPPED
+    try:
+        records = _fetch(number, key=key)
+        record, stale = select_record(records, number)
+    except FlightUnavailable as exc:
+        logger.warning("flight %s: aviationstack failed (%s)", number, exc)
+        # 404 from this source means the flight is genuinely absent; anything
+        # else means the source itself is the problem.
+        return None, MISSING if exc.status == 404 else BROKEN
+    return shape(record, stale).model_dump(), FOUND
+
+
+def lookup(flight_number: str) -> FlightStatus:
+    """Flight status: from storage where possible, then AirLabs, then
+    aviationstack.
+
+    The order here IS the policy:
 
       1. A stored result inside the freshness window is returned as-is. No
          network, no budget spent, however many times it is asked for.
-      2. Past the window we want a refresh — but only if the month's budget
-         allows one. Exhausted budget serves the stored copy rather than an
-         error, because old gate information beats none.
-      3. A refresh that fails falls back to the stored copy for the same
-         reason. Only a flight we have never successfully fetched can produce
-         an error.
+      2. AirLabs, because it is the only one of the two that reliably returns a
+         GATE while the gate still matters — measured, see airlabs.py.
+      3. aviationstack, when AirLabs has no record or is having a bad day.
+      4. Failing all of that, the stored copy however old it is, because old
+         gate information beats an error screen. Only a flight we have never
+         successfully fetched can produce an error.
     """
     number = flight_number.strip().upper()
     entry = store.get(number)
@@ -480,36 +614,37 @@ def lookup(flight_number: str) -> FlightStatus:
     # Serialise cold misses per flight so concurrent callers spend one upstream
     # request between them, not one each.
     with _lock_for(number):
-        # Re-read: another thread may have refreshed while we waited.
         entry = store.get(number)
         if entry is not None and store.is_fresh(entry):
             return _from_entry(entry)
 
-        if not store.reserve():
-            if entry is not None:
-                logger.warning(
-                    "flight %s: monthly budget spent — serving stored result from %s",
-                    number, flight_store.iso(entry.fetched_at),
-                )
-                return _from_entry(entry)
-            raise FlightUnavailable(
-                "flight lookups are over their monthly quota", status=503
+        payload, outcome = _try_airlabs(number)
+        outcomes = [outcome]
+        if payload is None:
+            payload, outcome = _try_aviationstack(number)
+            outcomes.append(outcome)
+
+        if payload is not None:
+            return _from_entry(store.put(number, payload))
+
+        if entry is not None:
+            # Had good data once; an error screen would take it away and give
+            # nothing back.
+            logger.warning(
+                "flight %s: no source answered — serving stored result from %s",
+                number, flight_store.iso(entry.fetched_at),
             )
+            return _from_entry(entry)
 
-        try:
-            records = _fetch(number, key=_api_key())
-            record, stale = select_record(records, number)
-        except FlightUnavailable as exc:
-            if entry is not None:
-                # The traveller had good data a moment ago; an error screen
-                # would take it away and give nothing back.
-                logger.warning(
-                    "flight %s: refresh failed (%s) — serving stored result from %s",
-                    number, exc, flight_store.iso(entry.fetched_at),
-                )
-                return _from_entry(entry)
-            raise
-
-        payload = shape(record, stale).model_dump()
-        stored = store.put(number, payload)
-        return _from_entry(stored)
+        if BROKEN in outcomes:
+            raise FlightUnavailable("flight service unavailable", status=502)
+        if MISSING in outcomes:
+            raise FlightUnavailable(f"no flights found for {number}", status=404)
+        # Every source skipped: unconfigured, or both budgets spent.
+        if not _key("AIRLABS_KEY") and not _key("AVIATIONSTACK_KEY"):
+            raise FlightUnavailable(
+                "flight lookup is not configured on this server", status=503
+            )
+        raise FlightUnavailable(
+            "flight lookups are over their monthly quota", status=503
+        )

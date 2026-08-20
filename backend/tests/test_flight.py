@@ -359,7 +359,10 @@ def test_null_delay_survives_as_null():
 
 @pytest.fixture
 def client(monkeypatch):
+    """aviationstack configured, AirLabs deliberately NOT — so these tests
+    exercise the fallback source directly. AirLabs has its own file."""
     monkeypatch.setenv("AVIATIONSTACK_KEY", "test-key")
+    monkeypatch.delenv("AIRLABS_KEY", raising=False)
     return TestClient(app)
 
 
@@ -459,6 +462,7 @@ def test_results_survive_a_restart(tmp_path, monkeypatch):
     and pay for it out of the monthly budget."""
     path = str(tmp_path / "flights.json")
     monkeypatch.setenv("AVIATIONSTACK_KEY", "test-key")
+    monkeypatch.delenv("AIRLABS_KEY", raising=False)
 
     calls = []
 
@@ -489,7 +493,7 @@ def test_fetched_at_reports_the_real_retrieval_time_not_the_serve_time(client, m
     entry = flight.store.get("BA117")
     entry.fetched_at -= 3600
     aged_to = flight_store.iso(entry.fetched_at)
-    flight.store._calls = flight.store._monthly_budget
+    flight.store.spend_all("aviationstack")
 
     second = client.get("/flight/BA117").json()
     # The served payload reports the hour-old retrieval time, NOT now. This is
@@ -518,11 +522,19 @@ def test_upstream_failure_falls_back_to_the_stored_result(client, monkeypatch):
 
 
 def test_upstream_failure_with_nothing_stored_is_a_502(client, monkeypatch):
+    """A broken source is a 502, not a 404. Telling a user their flight number
+    is wrong when both providers are down sends them to re-check a boarding
+    pass that was right all along."""
     def fail(number, *, key):
         raise flight.FlightUnavailable("flight service unreachable")
 
     monkeypatch.setattr(flight, "_fetch", fail)
     assert client.get("/flight/BA117").status_code == 502
+
+
+def test_a_genuinely_unknown_flight_is_a_404_not_a_502(client, monkeypatch):
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: [])
+    assert client.get("/flight/ZZ999").status_code == 404
 
 
 def test_monthly_budget_stops_upstream_calls(client, monkeypatch):
@@ -533,7 +545,7 @@ def test_monthly_budget_stops_upstream_calls(client, monkeypatch):
         return ba117_set()
 
     monkeypatch.setattr(flight, "_fetch", fake)
-    flight.store._monthly_budget = 2
+    flight.store._budgets["aviationstack"] = 2
     for n in ("BA117", "BA118", "BA119", "BA120"):
         client.get(f"/flight/{n}")
     # A runaway client hits OUR ceiling, not the provider's — theirs gives no
@@ -545,13 +557,13 @@ def test_budget_exhausted_still_serves_a_stored_result(client, monkeypatch):
     monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
     assert client.get("/flight/BA117").status_code == 200
     flight.store.get("BA117").fetched_at -= 10_000
-    flight.store._calls = flight.store._monthly_budget
+    flight.store.spend_all("aviationstack")
     assert client.get("/flight/BA117").status_code == 200
 
 
 def test_budget_exhausted_with_nothing_stored_is_a_503(client, monkeypatch):
     monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
-    flight.store._calls = flight.store._monthly_budget
+    flight.store.spend_all("aviationstack")
     assert client.get("/flight/ZZ999").status_code == 503
 
 
@@ -562,33 +574,59 @@ def test_budget_is_counted_before_the_call_not_after_it_succeeds(client, monkeyp
 
     monkeypatch.setattr(flight, "_fetch", fail)
     client.get("/flight/BA117")
-    assert flight.store.usage()["used"] == 1
+    assert flight.store.usage()["providers"]["aviationstack"]["used"] == 1
 
 
 def test_budget_survives_a_restart(tmp_path):
     path = str(tmp_path / "flights.json")
-    store = flight_store.FlightStore(path, monthly_budget=3)
-    assert store.reserve() and store.reserve()
-    reloaded = flight_store.FlightStore(path, monthly_budget=3)
-    assert reloaded.usage()["used"] == 2
-    assert reloaded.reserve() is True
-    assert reloaded.reserve() is False
+    store = flight_store.FlightStore(path, budgets={"aviationstack": 3})
+    assert store.reserve("aviationstack") and store.reserve("aviationstack")
+    reloaded = flight_store.FlightStore(path, budgets={"aviationstack": 3})
+    assert reloaded.usage()["providers"]["aviationstack"]["used"] == 2
+    assert reloaded.reserve("aviationstack") is True
+    assert reloaded.reserve("aviationstack") is False
+
+
+def test_budgets_are_tracked_per_provider(tmp_path):
+    """One shared counter would either waste AirLabs headroom or blow through
+    aviationstack's much smaller ceiling."""
+    store = flight_store.FlightStore(
+        str(tmp_path / "f.json"), budgets={"airlabs": 5, "aviationstack": 1}
+    )
+    assert store.reserve("aviationstack") is True
+    assert store.reserve("aviationstack") is False
+    # aviationstack exhausted; AirLabs untouched.
+    assert store.reserve("airlabs") is True
+    assert store.usage()["providers"]["airlabs"]["remaining"] == 4
+
+
+def test_a_pre_multi_provider_store_file_keeps_its_count(tmp_path, monkeypatch):
+    """The counter used to be one flat integer. Discarding it on upgrade would
+    silently hand back a month of already-spent aviationstack quota."""
+    # Pin "now" to the file's month, or the rollover legitimately zeroes it.
+    monkeypatch.setattr(flight_store, "_month_key", lambda at=None: "2099-01")
+    path = tmp_path / "flights.json"
+    path.write_text(json.dumps({"entries": {}, "usage": {"month": "2099-01", "calls": 42}}))
+    store = flight_store.FlightStore(str(path), budgets={"airlabs": 10, "aviationstack": 90})
+    assert store.usage()["providers"]["aviationstack"]["used"] == 42
+    # And the new provider starts clean rather than inheriting the old count.
+    assert store.usage()["providers"]["airlabs"]["used"] == 0
 
 
 def test_budget_rolls_over_on_a_new_month(tmp_path, monkeypatch):
     path = str(tmp_path / "flights.json")
-    store = flight_store.FlightStore(path, monthly_budget=1)
-    assert store.reserve() is True
-    assert store.reserve() is False
+    store = flight_store.FlightStore(path, budgets={"aviationstack": 1})
+    assert store.reserve("aviationstack") is True
+    assert store.reserve("aviationstack") is False
     monkeypatch.setattr(flight_store, "_month_key", lambda at=None: "2099-01")
-    assert store.reserve() is True
+    assert store.reserve("aviationstack") is True
 
 
 def test_corrupt_store_is_quarantined_not_fatal(tmp_path):
     path = tmp_path / "flights.json"
     path.write_text("{not json")
     store = flight_store.FlightStore(str(path))
-    assert store.usage()["used"] == 0
+    assert store.usage()["providers"]["aviationstack"]["used"] == 0
     assert (tmp_path / "flights.json.corrupt").exists()
 
 
@@ -613,8 +651,8 @@ def test_boot_status_is_visible_even_though_the_store_is_built_pre_logging(tmp_p
     store = flight_store.FlightStore(str(tmp_path / "flights.json"))
     line = store.log_status()
     assert "ACTIVE" in line
-    assert "upstream calls used in" in line
-    assert "remaining" in line
+    assert "calls used in" in line
+    assert "airlabs" in line and "aviationstack" in line
 
 
 def test_boot_status_announces_degradation_loudly(tmp_path):
@@ -633,7 +671,7 @@ def test_a_stored_payload_missing_a_newer_field_still_loads(client, monkeypatch)
     client.get("/flight/BA117")
     entry = flight.store.get("BA117")
     entry.payload.pop("airline", None)
-    flight.store._calls = flight.store._monthly_budget  # force the stored path
+    flight.store.spend_all("aviationstack")  # force the stored path
     entry.fetched_at -= 10_000
     body = client.get("/flight/BA117").json()
     assert body["airline"] is None
@@ -644,8 +682,9 @@ def test_usage_endpoint_reports_headroom(client, monkeypatch):
     monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
     client.get("/flight/BA117")
     usage = client.get("/flight-usage").json()
-    assert usage["used"] == 1
-    assert usage["remaining"] == usage["budget"] - 1
+    av = usage["providers"]["aviationstack"]
+    assert av["used"] == 1
+    assert av["remaining"] == av["budget"] - 1
     assert "BA117" in usage["stored_flights"]
 
 

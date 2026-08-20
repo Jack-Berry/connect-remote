@@ -48,10 +48,14 @@ logger = logging.getLogger(__name__)
 # watching for a gate costs one upstream call per flight per window.
 DEFAULT_FRESH_SECONDS = 300
 
-# Upstream calls allowed per calendar month. Deliberately under the plan's
-# real 100 so a runaway loop hits our ceiling, not the provider's — the
-# provider's gives no warning and takes a month to clear.
+# Upstream calls allowed per calendar month, PER PROVIDER. Two providers with
+# very different ceilings — AirLabs is generous, aviationstack's free tier is
+# 100 — so one shared counter would either waste AirLabs headroom or blow
+# through aviationstack's. Each is deliberately under its provider's real
+# ceiling so a runaway loop hits ours, which we can see and reset, rather than
+# theirs, which gives no warning and takes a month to clear.
 DEFAULT_MONTHLY_BUDGET = 90
+DEFAULT_BUDGETS: dict[str, int] = {"airlabs": 1000, "aviationstack": 90}
 
 
 def _now() -> float:
@@ -114,15 +118,15 @@ class FlightStore:
         path: str | None = None,
         *,
         fresh_seconds: float = DEFAULT_FRESH_SECONDS,
-        monthly_budget: int = DEFAULT_MONTHLY_BUDGET,
+        budgets: dict[str, int] | None = None,
     ) -> None:
         self._path = path
         self._fresh_seconds = fresh_seconds
-        self._monthly_budget = monthly_budget
+        self._budgets = dict(budgets if budgets is not None else DEFAULT_BUDGETS)
         self._lock = threading.RLock()
         self._entries: dict[str, Entry] = {}
         self._month = _month_key()
-        self._calls = 0
+        self._calls: dict[str, int] = {name: 0 for name in self._budgets}
         self._load()
         self._check_persistence()
 
@@ -149,14 +153,23 @@ class FlightStore:
             usage = loaded.get("usage")
             if isinstance(usage, dict):
                 month = usage.get("month")
+                if isinstance(month, str):
+                    self._month = month
                 calls = usage.get("calls")
-                if isinstance(month, str) and isinstance(calls, int):
-                    self._month, self._calls = month, max(0, calls)
+                if isinstance(calls, dict):
+                    for name, count in calls.items():
+                        if isinstance(count, int):
+                            self._calls[str(name)] = max(0, count)
+                elif isinstance(calls, int):
+                    # Pre-multi-provider file: one flat counter, which was
+                    # aviationstack's. Migrated rather than discarded — losing
+                    # it would silently hand back a month's already-spent quota.
+                    self._calls["aviationstack"] = max(0, calls)
 
             self._roll_month_locked()
             logger.info(
-                "flight store: loaded %d entries from %s; %d/%d upstream calls used in %s",
-                len(self._entries), self._path, self._calls, self._monthly_budget, self._month,
+                "flight store: loaded %d entries from %s; %s used in %s",
+                len(self._entries), self._path, self._usage_summary(), self._month,
             )
         except ValueError as exc:
             quarantine = self._path + ".corrupt"
@@ -211,12 +224,17 @@ class FlightStore:
         test can assert on it without capturing logs."""
         usage = self.usage()
         line = (
-            f"{self._status} | {usage['used']}/{usage['budget']} upstream calls "
-            f"used in {usage['month']}, {usage['remaining']} remaining, "
-            f"{len(usage['stored_flights'])} flights stored"
+            f"{self._status} | {self._usage_summary()} calls used in "
+            f"{usage['month']}, {len(usage['stored_flights'])} flights stored"
         )
         logger.log(self._status_level, "%s", line)
         return line
+
+    def _usage_summary(self) -> str:
+        return ", ".join(
+            f"{name} {self._calls.get(name, 0)}/{budget}"
+            for name, budget in sorted(self._budgets.items())
+        )
 
     def _dump_locked(self) -> None:
         if not self._path:
@@ -245,44 +263,53 @@ class FlightStore:
         current = _month_key()
         if current != self._month:
             logger.info(
-                "flight store: new month %s (was %s, %d calls) — budget reset",
-                current, self._month, self._calls,
+                "flight store: new month %s (was %s, %s) — budgets reset",
+                current, self._month, self._usage_summary(),
             )
-            self._month, self._calls = current, 0
+            self._month = current
+            self._calls = {name: 0 for name in self._budgets}
 
-    def reserve(self) -> bool:
-        """Claim one upstream call. False means the budget is spent.
+    def reserve(self, provider: str) -> bool:
+        """Claim one upstream call from `provider`'s budget. False means spent.
 
         Counted BEFORE the request goes out, not after it succeeds: a call that
-        times out still consumed quota upstream, and a counter that only
+        times out still consumed the provider's quota, and a counter that only
         incremented on success would drift under exactly the conditions that
         make drift dangerous.
         """
         with self._lock:
             self._roll_month_locked()
-            if self._calls >= self._monthly_budget:
+            budget = self._budgets.get(provider, 0)
+            used = self._calls.get(provider, 0)
+            if used >= budget:
                 logger.warning(
-                    "flight store: monthly budget spent (%d/%d in %s) — "
-                    "serving stored results only",
-                    self._calls, self._monthly_budget, self._month,
+                    "flight store: %s budget spent (%d/%d in %s) — "
+                    "no more calls to it this month",
+                    provider, used, budget, self._month,
                 )
                 return False
-            self._calls += 1
+            self._calls[provider] = used + 1
             self._dump_locked()
             logger.info(
-                "flight store: upstream call %d/%d this month (%s)",
-                self._calls, self._monthly_budget, self._month,
+                "flight store: %s call %d/%d this month (%s)",
+                provider, used + 1, budget, self._month,
             )
             return True
 
     def usage(self) -> dict:
         with self._lock:
             self._roll_month_locked()
+            providers = {
+                name: {
+                    "used": self._calls.get(name, 0),
+                    "budget": budget,
+                    "remaining": max(0, budget - self._calls.get(name, 0)),
+                }
+                for name, budget in sorted(self._budgets.items())
+            }
             return {
                 "month": self._month,
-                "used": self._calls,
-                "budget": self._monthly_budget,
-                "remaining": max(0, self._monthly_budget - self._calls),
+                "providers": providers,
                 "stored_flights": sorted(self._entries),
                 "persistent": bool(self._path),
             }
@@ -307,11 +334,16 @@ class FlightStore:
     def fresh_seconds(self) -> float:
         return self._fresh_seconds
 
+    def spend_all(self, provider: str) -> None:
+        """Tests only: mark `provider`'s budget as exhausted."""
+        with self._lock:
+            self._calls[provider] = self._budgets.get(provider, 0)
+
     def clear(self) -> None:
         """Tests only."""
         with self._lock:
             self._entries.clear()
-            self._calls = 0
+            self._calls = {name: 0 for name in self._budgets}
             self._month = _month_key()
             self._dump_locked()
 
@@ -326,5 +358,10 @@ def build_store() -> FlightStore:
     return FlightStore(
         os.environ.get("FLIGHT_STORE_PATH") or None,
         fresh_seconds=_int("FLIGHT_FRESH_SECONDS", DEFAULT_FRESH_SECONDS),
-        monthly_budget=_int("AVIATIONSTACK_MONTHLY_BUDGET", DEFAULT_MONTHLY_BUDGET),
+        budgets={
+            "airlabs": _int("AIRLABS_MONTHLY_BUDGET", DEFAULT_BUDGETS["airlabs"]),
+            "aviationstack": _int(
+                "AVIATIONSTACK_MONTHLY_BUDGET", DEFAULT_BUDGETS["aviationstack"]
+            ),
+        },
     )

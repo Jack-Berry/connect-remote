@@ -42,6 +42,12 @@ services:
       # Comes from .env, which is gitignored — see .env.example. Deliberately
       # not `:?required`: an unset key makes only the flight endpoint answer
       # 503, and the car endpoints must never fail to boot over it.
+      # AirLabs is the PRIMARY flight source: it returns a departure gate for
+      # a live flight, which aviationstack's free tier does not (measured —
+      # see backend/app/airlabs.py). aviationstack stays behind it as a
+      # fallback because its coverage differs.
+      AIRLABS_KEY: ${AIRLABS_KEY:-}
+      AIRLABS_MONTHLY_BUDGET: ${AIRLABS_MONTHLY_BUDGET:-1000}
       AVIATIONSTACK_KEY: ${AVIATIONSTACK_KEY:-}
       # Flight results and the month's call count, on the same volume as the
       # shapes file. Without this the cache dies with the container and every
@@ -50,7 +56,7 @@ services:
       # Our own ceiling, deliberately under the provider's 100: a runaway loop
       # then hits ours, which we can see and reset, rather than theirs, which
       # gives no warning and takes a month to clear.
-      AVIATIONSTACK_MONTHLY_BUDGET: ${AVIATIONSTACK_MONTHLY_BUDGET:-95}
+      AVIATIONSTACK_MONTHLY_BUDGET: ${AVIATIONSTACK_MONTHLY_BUDGET:-90}
     volumes:
       - proxy-shapes:/data
 
