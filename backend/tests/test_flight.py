@@ -190,6 +190,7 @@ def test_real_response_shapes_into_the_wire_payload():
     record, stale = flight.select_record(real_ba117(), "BA117")
     payload = flight.shape(record, stale)
     assert payload.flight_iata == "BA117"
+    assert payload.airline == "British Airways"
     assert payload.status == "landed"
     assert payload.departure.iata == "LHR"
     assert payload.departure.terminal == "5"
@@ -623,6 +624,20 @@ def test_boot_status_announces_degradation_loudly(tmp_path):
     # This is the line that distinguishes "working" from "quietly costing you
     # an upstream call on every restart".
     assert "DEGRADED" in line
+
+
+def test_a_stored_payload_missing_a_newer_field_still_loads(client, monkeypatch):
+    """Fields get added to FlightStatus; entries already on disk predate them.
+    A stored payload must degrade to None, not blow up the endpoint."""
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
+    client.get("/flight/BA117")
+    entry = flight.store.get("BA117")
+    entry.payload.pop("airline", None)
+    flight.store._calls = flight.store._monthly_budget  # force the stored path
+    entry.fetched_at -= 10_000
+    body = client.get("/flight/BA117").json()
+    assert body["airline"] is None
+    assert body["flight_iata"] == "BA117"
 
 
 def test_usage_endpoint_reports_headroom(client, monkeypatch):

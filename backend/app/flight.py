@@ -146,6 +146,9 @@ class FlightStatus(BaseModel):
     flight_iata: str | None = None
     flight_date: str | None = None
     status: str | None = None
+    # Operating airline, for the display's header line. Name only — the IATA
+    # code is already the first two characters of flight_iata.
+    airline: str | None = None
     departure: Endpoint
     arrival: Endpoint
     # True when no record matched today in the departure timezone and this is
@@ -375,6 +378,7 @@ def shape(record: dict, stale: bool) -> FlightStatus:
         flight_iata=(record.get("flight") or {}).get("iata"),
         flight_date=record.get("flight_date"),
         status=record.get("flight_status"),
+        airline=(record.get("airline") or {}).get("name"),
         departure=_endpoint(record.get("departure"), include_baggage=False),
         arrival=_endpoint(record.get("arrival"), include_baggage=True),
         stale=stale,
