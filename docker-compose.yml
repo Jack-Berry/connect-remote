@@ -44,6 +44,12 @@ services:
       # Gate for GET /debug/shapes (X-Debug-Token header). Unset = endpoint
       # answers 404 for everyone.
       SHAPES_DEBUG_TOKEN: ${SHAPES_DEBUG_TOKEN:-}
+      # aviationstack key for GET /flight/{flight_iata} (backend/app/flight.py),
+      # served to the Flight Tracker glasses app on flight.berrydev.co.uk.
+      # Comes from .env, which is gitignored — see .env.example. Deliberately
+      # not `:?required`: an unset key makes only the flight endpoint answer
+      # 503, and the car endpoints must never fail to boot over it.
+      AVIATIONSTACK_KEY: ${AVIATIONSTACK_KEY:-}
     volumes:
       - proxy-shapes:/data
 

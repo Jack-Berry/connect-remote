@@ -13,6 +13,7 @@ headers, or query strings — bodies carry car-unlocking credentials.
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -34,7 +35,7 @@ from .providers.base import (
     UpstreamError,
     VehicleStatus,
 )
-from . import shape_capture, warning_counts
+from . import flight, shape_capture, warning_counts
 from .rate_limit import FailedAuthLimiter, ThrottleRegistry
 from .redact import redact
 from .session_cache import Session, SessionCache
@@ -293,6 +294,43 @@ def healthz() -> dict:
     commit (GIT_COMMIT baked in at image build) so a deploy can be confirmed
     live."""
     return {"ok": True, "commit": os.environ.get("GIT_COMMIT")}
+
+
+@app.get("/flight/{flight_iata}", response_model=flight.FlightStatus)
+def get_flight(flight_iata: str) -> flight.FlightStatus:
+    """Flight status for an IATA flight number, e.g. /flight/BA117.
+
+    Unrelated to the car endpoints — it shares this process only to reuse the
+    deployment (see app/flight.py). No credentials, no session, no upstream
+    car call; the per-IP rate limiter still applies via SlowAPIMiddleware.
+
+    Answers on flight.berrydev.co.uk as well as car-proxy.berrydev.co.uk —
+    same container, two Caddy site blocks. The glasses app whitelists only the
+    flight hostname, so its network permission cannot reach the car API.
+
+    Sync `def`, like every other route here: `flight.lookup` blocks on a socket
+    and on a per-flight lock, so it belongs in the threadpool, not the loop.
+    """
+    iata = flight_iata.strip().upper()
+    # An IATA designator is exactly two characters with at least one letter
+    # (BA, U2, 9W — three letters is ICAO, and this endpoint queries by IATA),
+    # then a 1-4 digit number and an optional operational suffix letter.
+    #
+    # Spelling the designator out as an alternation rather than `[A-Z0-9]{2}`
+    # is deliberate on both counts: the loose form accepts "12345" (all-digit
+    # designator) and, because `[A-Z0-9]{2,3}` can eat a digit, it also accepts
+    # "BA12345" as BA1 + 2345. A test caught the second one. Validation happens
+    # before the upstream call so a junk path segment costs nothing out of a
+    # 100-request MONTHLY budget — that is the whole point of validating here.
+    if not re.fullmatch(r"(?:[A-Z]{2}|[A-Z]\d|\d[A-Z])\d{1,4}[A-Z]?", iata):
+        raise HTTPException(
+            status_code=400,
+            detail="not a flight number — expected something like BA117 or U21234",
+        )
+    try:
+        return flight.lookup(iata)
+    except flight.FlightUnavailable as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
 
 
 @app.post("/status", response_model=VehicleStatus)
