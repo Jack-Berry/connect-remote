@@ -172,25 +172,51 @@ class FlightStore:
             logger.warning("flight store: could not load %s: %s", self._path, exc)
 
     def _check_persistence(self) -> None:
-        """One unmissable boot line. A store that silently degraded to
-        memory-only looks identical to a working one until the monthly bill
-        arrives — the same failure that bit shape capture in July."""
+        """Probe the path once and REMEMBER the verdict.
+
+        The verdict is stored rather than only logged because this runs at
+        import time — before `main.py` reaches `logging.basicConfig`, so the
+        record goes to an unconfigured root logger and is dropped. The first
+        deploy of this store proved it: `/data` was writable, the store was
+        working, and the boot line was nowhere in the logs. A safety
+        announcement nobody can see is not a safety announcement, so
+        `log_status()` replays it once logging is actually configured.
+        """
         if not self._path:
-            logger.info("flight store: memory-only (FLIGHT_STORE_PATH unset) — "
-                        "cached results will NOT survive a restart")
-            return
-        try:
-            probe = self._path + ".probe"
-            with open(probe, "w", encoding="utf-8"):
-                pass
-            os.remove(probe)
-            logger.info("flight store persistence ACTIVE: %s", self._path)
-        except OSError as exc:
-            logger.warning(
-                "flight store persistence DEGRADED (memory-only): cannot write %s: %s — "
-                "every restart will cost fresh upstream calls",
-                self._path, exc,
+            self._status_level = logging.INFO
+            self._status = (
+                "flight store: memory-only (FLIGHT_STORE_PATH unset) — "
+                "cached results will NOT survive a restart"
             )
+        else:
+            try:
+                probe = self._path + ".probe"
+                with open(probe, "w", encoding="utf-8"):
+                    pass
+                os.remove(probe)
+                self._status_level = logging.INFO
+                self._status = f"flight store persistence ACTIVE: {self._path}"
+            except OSError as exc:
+                self._status_level = logging.WARNING
+                self._status = (
+                    f"flight store persistence DEGRADED (memory-only): "
+                    f"cannot write {self._path}: {exc} — "
+                    "every restart will cost fresh upstream calls"
+                )
+        logger.log(self._status_level, "%s", self._status)
+
+    def log_status(self) -> str:
+        """Replay the persistence verdict and the month's usage. Call this from
+        application startup, once logging is configured. Returns the line so a
+        test can assert on it without capturing logs."""
+        usage = self.usage()
+        line = (
+            f"{self._status} | {usage['used']}/{usage['budget']} upstream calls "
+            f"used in {usage['month']}, {usage['remaining']} remaining, "
+            f"{len(usage['stored_flights'])} flights stored"
+        )
+        logger.log(self._status_level, "%s", line)
+        return line
 
     def _dump_locked(self) -> None:
         if not self._path:

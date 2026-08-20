@@ -605,6 +605,26 @@ def test_one_unreadable_entry_does_not_cost_the_others(tmp_path):
     assert store.get("JUNK1") is None
 
 
+def test_boot_status_is_visible_even_though_the_store_is_built_pre_logging(tmp_path):
+    """The store is constructed while `from . import flight` runs, one line
+    ABOVE logging.basicConfig, so its own boot record is dropped. log_status()
+    replays it. The first deploy shipped without this and the line vanished."""
+    store = flight_store.FlightStore(str(tmp_path / "flights.json"))
+    line = store.log_status()
+    assert "ACTIVE" in line
+    assert "upstream calls used in" in line
+    assert "remaining" in line
+
+
+def test_boot_status_announces_degradation_loudly(tmp_path):
+    unwritable = tmp_path / "nope" / "flights.json"  # parent does not exist
+    store = flight_store.FlightStore(str(unwritable))
+    line = store.log_status()
+    # This is the line that distinguishes "working" from "quietly costing you
+    # an upstream call on every restart".
+    assert "DEGRADED" in line
+
+
 def test_usage_endpoint_reports_headroom(client, monkeypatch):
     monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
     client.get("/flight/BA117")

@@ -43,6 +43,13 @@ from .session_cache import Session, SessionCache
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Replayed here, not left to import time: the flight store is built while
+# `from . import flight` runs — one line ABOVE basicConfig — so its own boot
+# record goes to an unconfigured root logger and vanishes. This is the line
+# that says whether cached flight results will survive a restart, and whether
+# the monthly upstream budget is being tracked, so it has to be visible.
+flight.store.log_status()
+
 # Session cache TTL — how long a live upstream login is reused. Short enough
 # that a stolen-credential session dies quickly, long enough that a normal
 # glasses session (poll + a couple of commands) logs in once.
