@@ -64,15 +64,15 @@ import logging
 import os
 import re
 import threading
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel
+
+from . import flight_store
 
 logger = logging.getLogger(__name__)
 
@@ -96,16 +96,8 @@ def is_flight_number(value: str) -> bool:
 # Free plan: HTTP only. See the module docstring before "fixing" this to https.
 API_URL = "http://api.aviationstack.com/v1/flights"
 
-# How long a successful lookup is served from memory. The glasses app has no
-# poll timer — it calls on launch, on save and on tap — so this is what bounds
-# a user tapping repeatedly while watching for a gate: one upstream call per
-# flight per 5 minutes, however fast they tap.
-CACHE_TTL_SECONDS = 300
-
-# Failures are cached far more briefly: long enough to stop a retry loop from
-# spending the monthly quota on a broken key, short enough that a transient
-# upstream blip clears on the user's next tap.
-ERROR_CACHE_TTL_SECONDS = 60
+# Freshness window and monthly budget both live in flight_store.py, tunable by
+# environment variable — they are storage policy, not lookup logic.
 
 # Upstream socket timeout. The endpoint runs in FastAPI's threadpool, so a hung
 # connection ties up a worker thread; the glasses give up long before 10s anyway.
@@ -159,54 +151,37 @@ class FlightStatus(BaseModel):
     # True when no record matched today in the departure timezone and this is
     # the most recent one we have. The client MUST label it; see module docs.
     stale: bool = False
+    # When the proxy last actually spoke to the upstream, ISO-8601 UTC. Set on
+    # the way out, including on a cache hit, so the glasses can print an honest
+    # "Updated 14:02" for data retrieved at 14:02 and served from disk at
+    # 18:30. Without it the client stamps its own receive time and every cache
+    # hit becomes a quiet lie about how current the gate number is.
+    fetched_at: str | None = None
+    # Seconds since that fetch. Same information, pre-computed, because the
+    # glasses have no clock of their own worth trusting.
+    age_seconds: int | None = None
 
 
 # --------------------------------------------------------------------------
-# Cache
+# Storage
 #
-# One process, one dict. The Dockerfile pins uvicorn to a single worker (the
-# session cache and throttles already depend on that), so there is no second
-# copy of this to disagree with.
+# Results live on the server volume, not just in process memory — see
+# flight_store.py for why (short version: every redeploy used to throw the
+# cache away and pay for it out of a 100-request MONTHLY budget).
+#
+# The per-flight lock stays, and is still about quota rather than dict safety:
+# two taps landing in the same second on a cold flight would otherwise both
+# miss and both call upstream, spending two requests to learn one thing.
+
+store = flight_store.build_store()
+
+_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
 
 
-class _Cache:
-    """Per-flight TTL cache with a per-key lock.
-
-    The lock is not about dict safety — it is about QUOTA. Two taps landing in
-    the same second on a cold key would otherwise both miss and both call
-    upstream, spending two of the month's hundred requests to learn one thing.
-    The second caller blocks on the first and then reads its result.
-    """
-
-    def __init__(self) -> None:
-        self._entries: dict[str, tuple[float, Any]] = {}
-        self._locks: dict[str, threading.Lock] = {}
-        self._guard = threading.Lock()
-
-    def lock_for(self, key: str) -> threading.Lock:
-        with self._guard:
-            return self._locks.setdefault(key, threading.Lock())
-
-    def get(self, key: str) -> Any | None:
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        expires_at, value = entry
-        if time.monotonic() >= expires_at:
-            # Lazy eviction. The key space is flight numbers people actually
-            # look up, so it stays tiny; a sweeper would be ceremony.
-            self._entries.pop(key, None)
-            return None
-        return value
-
-    def put(self, key: str, value: Any, ttl: float) -> None:
-        self._entries[key] = (time.monotonic() + ttl, value)
-
-    def clear(self) -> None:
-        self._entries.clear()
-
-
-_cache = _Cache()
+def _lock_for(number: str) -> threading.Lock:
+    with _locks_guard:
+        return _locks.setdefault(number, threading.Lock())
 
 
 # --------------------------------------------------------------------------
@@ -471,35 +446,66 @@ def _fetch(flight_number: str, *, key: str) -> list[dict]:
     return data
 
 
+def _from_entry(entry: flight_store.Entry) -> FlightStatus:
+    """Rebuild the response from a stored payload, re-stamping its real age."""
+    payload = dict(entry.payload)
+    payload["fetched_at"] = flight_store.iso(entry.fetched_at)
+    payload["age_seconds"] = int(entry.age_seconds())
+    return FlightStatus.model_validate(payload)
+
+
 def lookup(flight_number: str) -> FlightStatus:
-    """Cached, deduped flight lookup. The only entry point main.py uses."""
-    key = flight_number.strip().upper()
+    """Flight status, from storage where possible and upstream only when not.
 
-    cached = _cache.get(key)
-    if cached is not None:
-        if isinstance(cached, FlightUnavailable):
-            raise cached
-        return cached
+    The order here IS the quota policy:
 
-    # Serialise cold misses for this flight so concurrent callers spend one
-    # upstream request between them, not one each.
-    with _cache.lock_for(key):
-        cached = _cache.get(key)
-        if cached is not None:
-            if isinstance(cached, FlightUnavailable):
-                raise cached
-            return cached
+      1. A stored result inside the freshness window is returned as-is. No
+         network, no budget spent, however many times it is asked for.
+      2. Past the window we want a refresh — but only if the month's budget
+         allows one. Exhausted budget serves the stored copy rather than an
+         error, because old gate information beats none.
+      3. A refresh that fails falls back to the stored copy for the same
+         reason. Only a flight we have never successfully fetched can produce
+         an error.
+    """
+    number = flight_number.strip().upper()
+    entry = store.get(number)
+    if entry is not None and store.is_fresh(entry):
+        return _from_entry(entry)
+
+    # Serialise cold misses per flight so concurrent callers spend one upstream
+    # request between them, not one each.
+    with _lock_for(number):
+        # Re-read: another thread may have refreshed while we waited.
+        entry = store.get(number)
+        if entry is not None and store.is_fresh(entry):
+            return _from_entry(entry)
+
+        if not store.reserve():
+            if entry is not None:
+                logger.warning(
+                    "flight %s: monthly budget spent — serving stored result from %s",
+                    number, flight_store.iso(entry.fetched_at),
+                )
+                return _from_entry(entry)
+            raise FlightUnavailable(
+                "flight lookups are over their monthly quota", status=503
+            )
 
         try:
-            records = _fetch(key, key=_api_key())
-            record, stale = select_record(records, key)
+            records = _fetch(number, key=_api_key())
+            record, stale = select_record(records, number)
         except FlightUnavailable as exc:
-            # A missing key is a deployment fault, not an upstream one — caching
-            # it would keep answering 503 for a minute after the fix lands.
-            if exc.status != 503 or "quota" in str(exc):
-                _cache.put(key, exc, ERROR_CACHE_TTL_SECONDS)
+            if entry is not None:
+                # The traveller had good data a moment ago; an error screen
+                # would take it away and give nothing back.
+                logger.warning(
+                    "flight %s: refresh failed (%s) — serving stored result from %s",
+                    number, exc, flight_store.iso(entry.fetched_at),
+                )
+                return _from_entry(entry)
             raise
 
-        result = shape(record, stale)
-        _cache.put(key, result, CACHE_TTL_SECONDS)
-        return result
+        payload = shape(record, stale).model_dump()
+        stored = store.put(number, payload)
+        return _from_entry(stored)

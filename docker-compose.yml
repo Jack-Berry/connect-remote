@@ -13,13 +13,6 @@ services:
       - "443:443"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      # London Transit HUD static app (see transit.berrydev.co.uk site block)
-      - /home/deploy/london-transit-hud-site:/srv/transit:ro
-      # AbleShow landing page webroot (static files, rsynced by Jack/Claude).
-      - /home/deploy/ableshow-site:/srv/ableshow:ro
-      # Beriscope site webroot (see beriscope.co.uk site block). Static build
-      # output, rsynced from the beriscope-website repo's dist/.
-      - /home/deploy/beriscope-site:/srv/beriscope:ro
       # Certificates and ACME account state — must persist across restarts
       # or Let's Encrypt gets re-asked for certs (and will rate-limit).
       - caddy-data:/data
@@ -50,6 +43,14 @@ services:
       # not `:?required`: an unset key makes only the flight endpoint answer
       # 503, and the car endpoints must never fail to boot over it.
       AVIATIONSTACK_KEY: ${AVIATIONSTACK_KEY:-}
+      # Flight results and the month's call count, on the same volume as the
+      # shapes file. Without this the cache dies with the container and every
+      # redeploy costs fresh upstream calls out of a 100-request MONTHLY plan.
+      FLIGHT_STORE_PATH: /data/flights.json
+      # Our own ceiling, deliberately under the provider's 100: a runaway loop
+      # then hits ours, which we can see and reset, rather than theirs, which
+      # gives no warning and takes a month to clear.
+      AVIATIONSTACK_MONTHLY_BUDGET: ${AVIATIONSTACK_MONTHLY_BUDGET:-95}
     volumes:
       - proxy-shapes:/data
 

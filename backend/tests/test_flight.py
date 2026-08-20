@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 
-from app import flight
+from app import flight, flight_store
 from app.main import app
 
 LONDON = ZoneInfo("Europe/London")
@@ -143,10 +143,13 @@ def real_ba117() -> list[dict]:
 
 
 @pytest.fixture(autouse=True)
-def clear_cache():
-    flight._cache.clear()
-    yield
-    flight._cache.clear()
+def fresh_store(tmp_path):
+    """Every test gets its own on-disk store, so nothing leaks between them
+    and the persistence path is exercised rather than mocked away."""
+    previous = flight.store
+    flight.store = flight_store.FlightStore(str(tmp_path / "flights.json"))
+    yield flight.store
+    flight.store = previous
 
 
 # --------------------------------------------------------------------------
@@ -408,7 +411,7 @@ def test_icao_numbers_go_to_the_icao_upstream_filter():
     assert flight._query_field("9W123") == "flight_iata"
 
 
-def test_cache_serves_the_second_request_without_a_second_upstream_call(client, monkeypatch):
+def test_stored_result_is_served_without_a_second_upstream_call(client, monkeypatch):
     calls = []
 
     def fake(number, *, key):
@@ -422,7 +425,7 @@ def test_cache_serves_the_second_request_without_a_second_upstream_call(client, 
     assert len(calls) == 1
 
 
-def test_cache_is_keyed_per_flight(client, monkeypatch):
+def test_storage_is_keyed_per_flight(client, monkeypatch):
     calls = []
 
     def fake(number, *, key):
@@ -435,7 +438,7 @@ def test_cache_is_keyed_per_flight(client, monkeypatch):
     assert calls == ["BA117", "BA118"]
 
 
-def test_cache_expires(client, monkeypatch):
+def test_a_stale_entry_triggers_exactly_one_refresh(client, monkeypatch):
     calls = []
 
     def fake(number, *, key):
@@ -443,42 +446,172 @@ def test_cache_expires(client, monkeypatch):
         return ba117_set()
 
     monkeypatch.setattr(flight, "_fetch", fake)
-    monkeypatch.setattr(flight, "CACHE_TTL_SECONDS", 0)
     client.get("/flight/BA117")
+    # Age the stored entry past the freshness window.
+    flight.store.get("BA117").fetched_at -= 10_000
     client.get("/flight/BA117")
     assert len(calls) == 2
 
 
-def test_upstream_failure_is_a_502(client, monkeypatch):
+def test_results_survive_a_restart(tmp_path, monkeypatch):
+    """THE REASON THIS STORE EXISTS. A redeploy used to throw the cache away
+    and pay for it out of the monthly budget."""
+    path = str(tmp_path / "flights.json")
+    monkeypatch.setenv("AVIATIONSTACK_KEY", "test-key")
+
+    calls = []
+
+    def fake(number, *, key):
+        calls.append(number)
+        return ba117_set()
+
+    monkeypatch.setattr(flight, "_fetch", fake)
+
+    flight.store = flight_store.FlightStore(path)
+    assert flight.lookup("BA117").flight_iata == "BA117"
+    assert len(calls) == 1
+
+    # A new process, same volume — exactly what `docker compose up -d` does.
+    flight.store = flight_store.FlightStore(path)
+    assert flight.lookup("BA117").flight_iata == "BA117"
+    assert len(calls) == 1, "a restart must not cost an upstream call"
+
+
+def test_fetched_at_reports_the_real_retrieval_time_not_the_serve_time(client, monkeypatch):
+    """A cache hit must not claim to be fresh. The glasses print this."""
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
+    first = client.get("/flight/BA117").json()
+    assert first["age_seconds"] < 5
+
+    # Age the stored entry by an hour and exhaust the budget, so the stored
+    # copy is served rather than refreshed.
+    entry = flight.store.get("BA117")
+    entry.fetched_at -= 3600
+    aged_to = flight_store.iso(entry.fetched_at)
+    flight.store._calls = flight.store._monthly_budget
+
+    second = client.get("/flight/BA117").json()
+    # The served payload reports the hour-old retrieval time, NOT now. This is
+    # the field the glasses print as "Updated"; getting it wrong makes every
+    # cache hit a quiet lie about how current the gate number is.
+    assert second["age_seconds"] >= 3600
+    assert second["fetched_at"] == aged_to
+    assert second["fetched_at"] != first["fetched_at"]
+
+
+def test_upstream_failure_falls_back_to_the_stored_result(client, monkeypatch):
+    """Old gate information beats an error screen."""
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
+    assert client.get("/flight/BA117").status_code == 200
+
+    flight.store.get("BA117").fetched_at -= 10_000
+
     def fail(number, *, key):
         raise flight.FlightUnavailable("flight service unreachable")
 
     monkeypatch.setattr(flight, "_fetch", fail)
     response = client.get("/flight/BA117")
-    assert response.status_code == 502
+    assert response.status_code == 200
+    assert response.json()["flight_iata"] == "BA117"
+    assert response.json()["age_seconds"] >= 10_000
 
 
-def test_upstream_failure_is_cached_so_retries_do_not_burn_quota(client, monkeypatch):
-    calls = []
-
+def test_upstream_failure_with_nothing_stored_is_a_502(client, monkeypatch):
     def fail(number, *, key):
-        calls.append(number)
         raise flight.FlightUnavailable("flight service unreachable")
 
     monkeypatch.setattr(flight, "_fetch", fail)
     assert client.get("/flight/BA117").status_code == 502
-    assert client.get("/flight/BA117").status_code == 502
-    assert len(calls) == 1
 
 
-def test_missing_api_key_is_a_503_and_is_not_cached(monkeypatch):
-    monkeypatch.delenv("AVIATIONSTACK_KEY", raising=False)
-    client = TestClient(app)
-    assert client.get("/flight/BA117").status_code == 503
-    # A deployment fix must take effect on the very next request, not in 60s.
-    monkeypatch.setenv("AVIATIONSTACK_KEY", "now-configured")
+def test_monthly_budget_stops_upstream_calls(client, monkeypatch):
+    calls = []
+
+    def fake(number, *, key):
+        calls.append(number)
+        return ba117_set()
+
+    monkeypatch.setattr(flight, "_fetch", fake)
+    flight.store._monthly_budget = 2
+    for n in ("BA117", "BA118", "BA119", "BA120"):
+        client.get(f"/flight/{n}")
+    # A runaway client hits OUR ceiling, not the provider's — theirs gives no
+    # warning and takes a month to clear.
+    assert len(calls) == 2
+
+
+def test_budget_exhausted_still_serves_a_stored_result(client, monkeypatch):
     monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
     assert client.get("/flight/BA117").status_code == 200
+    flight.store.get("BA117").fetched_at -= 10_000
+    flight.store._calls = flight.store._monthly_budget
+    assert client.get("/flight/BA117").status_code == 200
+
+
+def test_budget_exhausted_with_nothing_stored_is_a_503(client, monkeypatch):
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
+    flight.store._calls = flight.store._monthly_budget
+    assert client.get("/flight/ZZ999").status_code == 503
+
+
+def test_budget_is_counted_before_the_call_not_after_it_succeeds(client, monkeypatch):
+    """A call that times out still consumed the provider's quota."""
+    def fail(number, *, key):
+        raise flight.FlightUnavailable("flight service unreachable")
+
+    monkeypatch.setattr(flight, "_fetch", fail)
+    client.get("/flight/BA117")
+    assert flight.store.usage()["used"] == 1
+
+
+def test_budget_survives_a_restart(tmp_path):
+    path = str(tmp_path / "flights.json")
+    store = flight_store.FlightStore(path, monthly_budget=3)
+    assert store.reserve() and store.reserve()
+    reloaded = flight_store.FlightStore(path, monthly_budget=3)
+    assert reloaded.usage()["used"] == 2
+    assert reloaded.reserve() is True
+    assert reloaded.reserve() is False
+
+
+def test_budget_rolls_over_on_a_new_month(tmp_path, monkeypatch):
+    path = str(tmp_path / "flights.json")
+    store = flight_store.FlightStore(path, monthly_budget=1)
+    assert store.reserve() is True
+    assert store.reserve() is False
+    monkeypatch.setattr(flight_store, "_month_key", lambda at=None: "2099-01")
+    assert store.reserve() is True
+
+
+def test_corrupt_store_is_quarantined_not_fatal(tmp_path):
+    path = tmp_path / "flights.json"
+    path.write_text("{not json")
+    store = flight_store.FlightStore(str(path))
+    assert store.usage()["used"] == 0
+    assert (tmp_path / "flights.json.corrupt").exists()
+
+
+def test_one_unreadable_entry_does_not_cost_the_others(tmp_path):
+    path = tmp_path / "flights.json"
+    path.write_text(json.dumps({
+        "entries": {
+            "BA117": {"payload": {"flight_iata": "BA117"}, "fetched_at": 1_000_000.0},
+            "JUNK1": {"payload": "not a dict", "fetched_at": "not a number"},
+        },
+        "usage": {"month": "2099-01", "calls": 4},
+    }))
+    store = flight_store.FlightStore(str(path))
+    assert store.get("BA117") is not None
+    assert store.get("JUNK1") is None
+
+
+def test_usage_endpoint_reports_headroom(client, monkeypatch):
+    monkeypatch.setattr(flight, "_fetch", lambda number, *, key: ba117_set())
+    client.get("/flight/BA117")
+    usage = client.get("/flight-usage").json()
+    assert usage["used"] == 1
+    assert usage["remaining"] == usage["budget"] - 1
+    assert "BA117" in usage["stored_flights"]
 
 
 def test_stale_records_are_flagged_on_the_wire(client, monkeypatch):

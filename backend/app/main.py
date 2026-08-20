@@ -296,6 +296,19 @@ def healthz() -> dict:
     return {"ok": True, "commit": os.environ.get("GIT_COMMIT")}
 
 
+@app.get("/flight-usage", include_in_schema=False)
+def flight_usage() -> dict:
+    """How much of the month's upstream flight-lookup budget is left.
+
+    Its own path, not /flight/_usage: that would be parsed as a flight number
+    and rejected by the validator. Unauthenticated and harmless — it exposes a
+    call count and the flight numbers already cached, no key and no personal
+    data — and it is the only way to see quota headroom without spending one
+    of the requests to find out.
+    """
+    return flight.store.usage()
+
+
 @app.get("/flight/{flight_iata}", response_model=flight.FlightStatus)
 def get_flight(flight_iata: str) -> flight.FlightStatus:
     """Flight status for a flight number, e.g. /flight/BA117 or /flight/EZY2229.
