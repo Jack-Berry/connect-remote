@@ -22,6 +22,9 @@ services:
       - /home/deploy/beriscope-site:/srv/beriscope:ro
       - /home/deploy/ableshow-site:/srv/ableshow:ro
       - /home/deploy/london-transit-hud-site:/srv/transit:ro
+      # Caddy config fragments holding credentials, kept OUT of this repo
+      # (this repo is public). Currently the ableshow /stats basic_auth block.
+      - /home/deploy/caddy-secrets:/etc/caddy/secrets:ro
       # Certificates and ACME account state — must persist across restarts
       # or Let's Encrypt gets re-asked for certs (and will rate-limit).
       - caddy-data:/data

@@ -46,9 +46,9 @@ ableshow.app, www.ableshow.app {
 	# the webroot at stats/index.html by cron (ableshow-stats/gen-stats.sh); this
 	# matcher is the only thing keeping the numbers non-public.
 	@stats path /stats /stats/*
-	basic_auth @stats {
-		jack HASH-REDACTED-ROTATED-20260917
-	}
+	# Credentials live outside this repo -- see docker-compose.yml. The file
+	# is mounted read-only from /home/deploy/caddy-secrets on the host.
+	import /etc/caddy/secrets/ableshow-stats.caddy
 
 	# Scan-tracked QR target. Every printed/embedded QR encodes /qr, so scans
 	# are countable in the access log below — one total across all QR variants
