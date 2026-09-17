@@ -14,6 +14,20 @@ car-proxy.berrydev.co.uk {
 	reverse_proxy proxy:8000
 }
 
+flight.berrydev.co.uk {
+	# Flight Tracker (G2 glasses app) — GET /flight/{iata}, served by the SAME
+	# container as car-proxy above. A second hostname rather than a second
+	# service, for one reason: the glasses app's app.json whitelists exactly the
+	# hosts it may reach, so shipping it `flight.berrydev.co.uk` means a bug (or
+	# a tampered build) in that app cannot address the car API at all. Sharing
+	# the origin would have handed it the whole surface.
+	#
+	# The flight endpoint holds no credentials and reads public timetable data,
+	# so — unlike the car-proxy block — an access log here would leak nothing.
+	# It still isn't enabled: nobody has asked a question that needs one.
+	reverse_proxy proxy:8000
+}
+
 matchhud.berrydev.co.uk {
 	# MatchHUD droplet API — a separate compose project (matchhud), reachable by
 	# container name because it joined this same docker network. Port 8090; the
@@ -59,8 +73,8 @@ ableshow.app, www.ableshow.app {
 	#   docker compose exec -T caddy grep -c '"uri":"/qr"' /data/logs/ableshow-access.log
 	log {
 		output file /data/logs/ableshow-access.log {
-			roll_size 10MiB
-			roll_keep 10
+			roll_size 100MiB
+			roll_keep 100
 		}
 		format json
 	}
@@ -109,4 +123,11 @@ beriscope.co.uk, www.beriscope.co.uk {
 	# reason to turn them on.
 	root * /srv/beriscope
 	file_server
+}
+
+chatlink.berrydev.co.uk {
+	# Even G2 custom-agent Phase 1 logging shim. The container is a separate
+	# compose project on connect-remote_default and publishes no host port.
+	# No Caddy access log: the application persists the full diagnostic request.
+	reverse_proxy even-agent-shim:8000
 }
