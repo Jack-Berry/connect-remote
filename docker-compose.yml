@@ -13,6 +13,15 @@ services:
       - "443:443"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Static site webroots, served by the site blocks in deploy/Caddyfile
+      # (beriscope.co.uk, ableshow.app, transit.berrydev.co.uk). Content is
+      # rsynced into these host directories; only a mount change needs a
+      # container recreate. COMMITTED DELIBERATELY: these lived as local-only
+      # edits until 2026-08-20, when a compose edit for the flight work
+      # silently dropped them and took all three sites down for four weeks.
+      - /home/deploy/beriscope-site:/srv/beriscope:ro
+      - /home/deploy/ableshow-site:/srv/ableshow:ro
+      - /home/deploy/london-transit-hud-site:/srv/transit:ro
       # Certificates and ACME account state — must persist across restarts
       # or Let's Encrypt gets re-asked for certs (and will rate-limit).
       - caddy-data:/data
